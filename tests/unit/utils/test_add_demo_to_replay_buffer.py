@@ -120,8 +120,12 @@ def test_add_demo_to_replay_buffer(frame_stack, action_sequence, execution_step)
         sample = replay_buffer.sample_single(idx)
         print(sample["action"])
         num_pad_pos = max(idx - (eps_len - action_sequence), 0)
+        assert sample["action_pad_mask"].shape == (action_sequence,)
         if num_pad_pos > 0:
             assert sample["action"][-num_pad_pos:].sum() == 0
+            assert sample["action_pad_mask"][-num_pad_pos:].all()
+        if num_pad_pos < action_sequence:
+            assert not sample["action_pad_mask"][: action_sequence - num_pad_pos].any()
 
 
 if __name__ == "__main__":

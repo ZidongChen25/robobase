@@ -3,6 +3,7 @@ from typing import Tuple, Optional, List
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from robobase.method.utils import sequence_loss_mean
 from robobase.models.fusion import FusionModule
 from robobase.models.act.utils.misc import kl_divergence
 from robobase.models.act.transformer import (
@@ -319,7 +320,7 @@ class MultiViewTransformerEncoderDecoderACT(FusionModule):
         total_kld, dim_wise_kld, mean_kld = kl_divergence(mu, logvar)
         loss_dict = dict()
         all_l1 = F.l1_loss(actions, a_hat, reduction="none")
-        l1 = (all_l1 * ~is_pad.unsqueeze(-1)).mean()
+        l1 = sequence_loss_mean(all_l1, is_pad).mean()
 
         loss_dict["l1"] = l1
         loss_dict["kl"] = total_kld[0]

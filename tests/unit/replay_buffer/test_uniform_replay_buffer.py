@@ -5,7 +5,10 @@ import pytest
 from gymnasium import spaces
 from torch.utils.data import DataLoader
 
-from robobase.replay_buffer.uniform_replay_buffer import UniformReplayBuffer
+from robobase.replay_buffer.uniform_replay_buffer import (
+    ACTION_PAD_MASK,
+    UniformReplayBuffer,
+)
 
 # Default parameters used when creating the replay self._memory.
 FRAME_STACKS = 4
@@ -179,6 +182,32 @@ class TestUniformReplayBuffer:
         assert np.all(batch["rgb"][0, 0] == batch["rgb"][0, 2])
         assert np.all(batch["rgb"][0, 1] == batch["rgb"][0, 2])
         assert np.all(batch["rgb"][0, 3] != batch["rgb"][0, 2])
+
+    def test_action_sequence_returns_explicit_padding_mask(self):
+        action_shape = (4, 2)
+        self._memory = UniformReplayBuffer(
+            observation_elements=self._test_single_obs_space,
+            replay_capacity=50,
+            nstep=1,
+            action_shape=action_shape,
+            batch_size=BATCH_SIZE,
+        )
+        episode_length = 5
+        for i in range(episode_length):
+            self._memory.add(
+                {"rgb": self._test_single_obs * i},
+                np.full(action_shape[1:], i + 1, dtype=np.float32),
+                self._test_reward,
+                self._test_terminal + float(i == (episode_length - 1)),
+                self._test_truncated,
+            )
+        self._memory.add_final({"rgb": self._test_single_obs * episode_length})
+
+        sample = self._memory.sample_single(episode_length - 1)
+        assert sample["action"].shape == action_shape
+        assert sample[ACTION_PAD_MASK].dtype == np.bool_
+        assert sample[ACTION_PAD_MASK].tolist() == [False, True, True, True]
+        assert np.all(sample["action"][1:] == 0)
 
     def test_pytorch_dataloader_single_worker(self):
         num_workers = 0

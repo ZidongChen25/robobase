@@ -231,6 +231,24 @@ def test_multi_view_transformer_encoder_decoder_act_lang_tokens(input_shape):
         assert out[2][1].shape == expected_shape[2]
 
 
+def test_multi_view_transformer_act_loss_ignores_padded_tokens():
+    net = MultiViewTransformerEncoderDecoderACT(
+        input_shape=SINGLE_CAM,
+        state_dim=2,
+        action_dim=2,
+        num_queries=2,
+    )
+    a_hat = torch.zeros((1, 2, 2))
+    mu = torch.zeros((1, net.latent_dim))
+    logvar = torch.zeros((1, net.latent_dim))
+    actions = torch.tensor([[[1.0, -1.0], [100.0, 100.0]]])
+    is_pad = torch.tensor([[False, True]])
+
+    _, loss_dict = net.calculate_loss((a_hat, None, [mu, logvar]), actions, is_pad)
+
+    assert torch.isclose(loss_dict["l1"], torch.tensor(1.0))
+
+
 def test_fully_connected_mlp_with_bottleneck_features():
     in0 = torch.rand((BATCH_SIZE, 2))
     in1 = torch.rand((BATCH_SIZE, 4))

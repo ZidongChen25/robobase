@@ -167,6 +167,32 @@ def loss_weights(replay_sample, beta=1.0):
         )
 
 
+def sequence_loss_mean(
+    loss: torch.Tensor, action_pad_mask: torch.Tensor | None = None
+) -> torch.Tensor:
+    """Average a per-token loss while ignoring padded action-chunk positions.
+
+    Args:
+        loss: Per-element loss tensor shaped like [B, T, ...].
+        action_pad_mask: Optional [B, T] boolean mask where True marks padding.
+
+    Returns:
+        torch.Tensor: Per-sample mean loss with shape [B].
+    """
+    reduce_dims = tuple(range(1, loss.ndim))
+    if action_pad_mask is None:
+        return loss.mean(dim=reduce_dims)
+
+    valid_mask = ~action_pad_mask.to(dtype=torch.bool, device=loss.device)
+    while valid_mask.ndim < loss.ndim:
+        valid_mask = valid_mask.unsqueeze(-1)
+    valid_mask = valid_mask.expand_as(loss)
+
+    masked_loss = loss * valid_mask
+    denom = valid_mask.sum(dim=reduce_dims).clamp_min(1)
+    return masked_loss.sum(dim=reduce_dims) / denom
+
+
 def random_action_if_within_delta(qs, delta=0.0001):
     q_diff = qs.max(-1).values - qs.min(-1).values
     random_action_mask = q_diff < delta

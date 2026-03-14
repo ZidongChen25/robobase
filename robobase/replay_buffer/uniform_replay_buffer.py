@@ -39,6 +39,7 @@ TRUNCATED = "truncated"
 INDICES = "indices"
 IS_FIRST = "is_first"
 DISCOUNT = "discount"
+ACTION_PAD_MASK = "action_pad_mask"
 
 
 def episode_len(episode):
@@ -765,19 +766,23 @@ class UniformReplayBuffer(ReplayBuffer):
         # - action_idxs contains indices of all action, considering action sequences.
         action_idxs = list(range(action_start_idx, action_end_idx))
         action_seq = episode[ACTION][action_idxs]
+        action_pad_mask = np.zeros(self._action_seq_len, dtype=np.bool_)
         # - Pad zeros to the end if action_sequences exceeds eps_len
         if len(action_seq) < self._action_seq_len:
             num_action_to_pad = self._action_seq_len - len(action_seq)
+            action_pad_mask[-num_action_to_pad:] = True
             action_seq = np.concatenate(
                 [
                     action_seq,
                     np.zeros(
-                        (num_action_to_pad, *action_seq.shape[1:]), dtype=np.float32
+                        (num_action_to_pad, *action_seq.shape[1:]),
+                        dtype=action_seq.dtype,
                     ),
                 ],
                 axis=0,
             )
         replay_sample[ACTION] = action_seq
+        replay_sample[ACTION_PAD_MASK] = action_pad_mask
 
         # Add the rest
         discount_slice_len = next_idx - idx

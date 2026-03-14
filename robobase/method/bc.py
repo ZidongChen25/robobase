@@ -24,6 +24,7 @@ from robobase.method.utils import (
     flatten_time_dim_into_channel_dim,
     stack_tensor_dictionary,
     loss_weights,
+    sequence_loss_mean,
 )
 
 from typing import Optional, Iterator
@@ -225,15 +226,18 @@ class BC(Method):
         )
         return rgb_obs, next_rgb_obs, metrics
 
-    def update_actor(self, low_dim_obs, fused_view_feats, action, loss_coeff):
+    def update_actor(
+        self,
+        low_dim_obs,
+        fused_view_feats,
+        action,
+        loss_coeff,
+        action_pad_mask: torch.Tensor | None = None,
+    ):
         metrics = dict()
         action_pred = self.actor(low_dim_obs, fused_view_feats)
-        # TOOD check trajectory horrizon
-        mse_loss = (
-            F.mse_loss(action_pred, action, reduction="none")
-            .mean(-1)
-            .mean(-1, keepdims=True)
-        )
+        per_token_mse = F.mse_loss(action_pred, action, reduction="none")
+        mse_loss = sequence_loss_mean(per_token_mse, action_pad_mask).unsqueeze(1)
         actor_loss = (mse_loss * loss_coeff.unsqueeze(1)).mean()
 
         new_pri = torch.sqrt(mse_loss + 1e-10)
@@ -352,6 +356,7 @@ class BC(Method):
         batch = next(replay_iter)
         batch = {k: v.to(self.device) for k, v in batch.items()}
         action = batch["action"]
+        action_pad_mask = extract_from_batch(batch, "action_pad_mask", missing_ok=True)
         loss_coeff = loss_weights(batch, self.replay_beta)
         low_dim_obs = None
         fused_view_feats = None
@@ -372,7 +377,13 @@ class BC(Method):
         if fused_view_feats is not None:
             fused_view_feats = fused_view_feats.detach()
         metrics.update(
-            self.update_actor(low_dim_obs, fused_view_feats, action, loss_coeff)
+            self.update_actor(
+                low_dim_obs,
+                fused_view_feats,
+                action,
+                loss_coeff,
+                action_pad_mask=action_pad_mask,
+            )
         )
 
         if isinstance(replay_buffer, PrioritizedReplayBuffer):

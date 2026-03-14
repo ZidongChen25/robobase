@@ -18,6 +18,7 @@ from robobase.method.utils import (
     extract_from_spec,
     extract_many_from_spec,
     flatten_time_dim_into_channel_dim,
+    sequence_loss_mean,
     stack_tensor_dictionary,
 )
 
@@ -64,7 +65,11 @@ class Actor(nn.Module):
         return obs_features
 
     def forward(
-        self, low_dim_obs, fused_view_feats, action
+        self,
+        low_dim_obs,
+        fused_view_feats,
+        action,
+        action_pad_mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         obs_features = self._combine(low_dim_obs, fused_view_feats)
 
@@ -84,6 +89,12 @@ class Actor(nn.Module):
         # according to the noise magnitude at each diffusion iteration
         # (this is the forward diffusion process)
         noisy_actions = self.noise_scheduler.add_noise(action, noise, timesteps)
+        if action_pad_mask is not None:
+            action_pad_mask = action_pad_mask.to(
+                dtype=torch.bool, device=noisy_actions.device
+            )
+            noisy_actions = noisy_actions.masked_fill(action_pad_mask.unsqueeze(-1), 0.0)
+            noise = noise.masked_fill(action_pad_mask.unsqueeze(-1), 0.0)
 
         net_ins = {
             "actions": noisy_actions,
@@ -206,14 +217,25 @@ class Diffusion(BC):
         _, noisy_action = self.actor.infer(low_dim_obs, fused_rgb_feats)
         return noisy_action.detach()
 
-    def update_actor(self, low_dim_obs, fused_view_feats, action, loss_coeff):
+    def update_actor(
+        self,
+        low_dim_obs,
+        fused_view_feats,
+        action,
+        loss_coeff,
+        action_pad_mask: torch.Tensor | None = None,
+    ):
         metrics = dict()
-        noise_pred, noise = self.actor(low_dim_obs, fused_view_feats, action)
-        mse_loss = (
-            F.mse_loss(noise_pred, noise, reduction="none")
-            .mean(-1)
-            .mean(-1, keepdims=True)
+        noise_pred, noise = self.actor(
+            low_dim_obs,
+            fused_view_feats,
+            action,
+            action_pad_mask=action_pad_mask,
         )
+        mse_loss = sequence_loss_mean(
+            F.mse_loss(noise_pred, noise, reduction="none"),
+            action_pad_mask,
+        ).unsqueeze(1)
         actor_loss = (mse_loss * loss_coeff.unsqueeze(1)).mean()
 
         new_pri = torch.sqrt(mse_loss + 1e-10)

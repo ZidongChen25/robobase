@@ -409,8 +409,13 @@ class ActBCAgent(BC):
             )
             task_emb, _ = self.encode_clip_text(lang_tokens)
 
-        # If action contains all zeros, it is padded.
-        is_pad = actions.sum(axis=-1) == 0
+        is_pad = extract_from_batch(batch, "action_pad_mask", missing_ok=True)
+        if is_pad is None:
+            is_pad = torch.zeros(
+                actions.shape[:2], dtype=torch.bool, device=actions.device
+            )
+        else:
+            is_pad = is_pad.to(dtype=torch.bool)
         loss_dict = self.actor(
             qpos, image, actions=actions, is_pad=is_pad, task_emb=task_emb
         )
