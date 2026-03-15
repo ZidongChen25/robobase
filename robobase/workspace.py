@@ -30,6 +30,15 @@ from torch.utils.data import DataLoader
 torch.backends.cudnn.benchmark = True
 
 
+def _normalize_demos_count(value):
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"inf", "+inf", ".inf", "+.inf"}:
+            return np.inf
+        return float(normalized)
+    return value
+
+
 def _worker_init_fn(worker_id):
     seed = np.random.get_state()[1][0] + worker_id
     np.random.seed(seed)
@@ -88,6 +97,10 @@ def _create_default_envs(cfg: DictConfig) -> EnvFactory:
         from robobase.envs.d4rl import D4RLEnvFactory
 
         factory = D4RLEnvFactory()
+    elif cfg.env.env_name == "robomimic":
+        from robobase.envs.robomimic import RobomimicEnvFactory
+
+        factory = RobomimicEnvFactory()
     else:
         ValueError()
     return factory
@@ -499,6 +512,7 @@ class Workspace:
                 )
 
         if self.cfg.replay_size_before_train > 0:
+            num_demos = _normalize_demos_count(num_demos)
             diff = self.cfg.replay_size_before_train - len(self.replay_buffer)
             if num_demos > 0 and diff > 0:
                 logging.warning(
@@ -610,7 +624,9 @@ class Workspace:
                         pretrain_metrics, self.pretrain_steps, prefix="pretrain"
                     )
 
-                if should_pretrain_eval(self.pretrain_steps):
+                if self.pretrain_steps > 0 and should_pretrain_eval(
+                    self.pretrain_steps
+                ):
                     eval_metrics = self._eval()
                     eval_metrics.update(self._get_common_metrics())
                     self.logger.log_metrics(
@@ -677,7 +693,9 @@ class Workspace:
                     )
                 self.logger.log_metrics(metrics, self.global_env_steps, prefix="train")
 
-            if should_eval(self.main_loop_iterations):
+            if self.main_loop_iterations > 0 and should_eval(
+                self.main_loop_iterations
+            ):
                 eval_metrics = self._eval()
                 eval_metrics.update(self._get_common_metrics())
                 self.logger.log_metrics(

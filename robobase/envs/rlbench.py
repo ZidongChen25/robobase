@@ -731,7 +731,9 @@ class RLBenchEnvFactory(EnvFactory):
             self._rescale_demo_action_helper, self._raw_demos, cfg
         )
 
-    def load_demos_into_replay(self, cfg: DictConfig, buffer):
+    def load_demos_into_replay(
+        self, cfg: DictConfig, buffer, is_demo_buffer: bool = False
+    ):
         """See base class for documentation."""
         assert hasattr(self, "_demos"), (
             "There's no _demo attribute inside the factory, "

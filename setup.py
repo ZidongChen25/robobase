@@ -29,7 +29,7 @@ core_requirements = [
     "hydra-joblib-launcher",
     # Fix for solver_iter before 1.0.0
     "gymnasium @ git+https://git@github.com/stepjam/Gymnasium.git@0.29.2",
-    "wandb<=0.15.12",
+    "wandb==0.22.3",
     "termcolor",
     "opencv-python-headless",
     "numpy<2",
@@ -54,6 +54,11 @@ setuptools.setup(
         "dev": ["pre-commit", "pytest", "mvp @ git+https://github.com/ir413/mvp"],
         "dmc": [
             "dm_control",
+        ],
+        "robomimic": [
+            # egl-probe currently fails with cmake>=4 during robomimic install.
+            "cmake<4",
+            "robomimic",
         ],
         "rlbench": [
             "rlbench @ git+https://git@github.com/stepjam/RLBench.git@b80e51feb3694d9959cb8c0408cd385001b01382",

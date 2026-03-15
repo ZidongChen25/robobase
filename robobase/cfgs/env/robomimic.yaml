@@ -1,0 +1,11 @@
+# @package _global_
+
+env:
+  env_name: robomimic
+  task_name: ""
+  dataset_path: ""
+  episode_length: 0  # inferred from the selected dataset if left as 0
+  filter_key: train
+  random_traj: false
+  use_live_env: false
+  cameras: ["agentview"]
