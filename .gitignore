@@ -38,3 +38,5 @@ eval_video/
 events.out.*
 .DS_Store
 third_party_datasets/
+
+robomimic.md
