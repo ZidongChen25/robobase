@@ -167,16 +167,24 @@ class Logger(object):
                 "We will assume this is a mistake."
             )
         self._wandb_logs = {}
+        self._wandb_run_id = None
         if self._use_wandb:
             import wandb
 
             cfg_dict = OmegaConf.to_container(cfg, resolve=False)
-
-            wandb.init(
+            wandb_init_kwargs = dict(
                 project=cfg.wandb.project,
                 name=cfg.wandb.name,
                 config=cfg_dict,
             )
+            if cfg.wandb.get("entity", None) is not None:
+                wandb_init_kwargs["entity"] = cfg.wandb.entity
+            if cfg.wandb.get("id", None) is not None:
+                wandb_init_kwargs["id"] = cfg.wandb.id
+            if cfg.wandb.get("resume", None) is not None:
+                wandb_init_kwargs["resume"] = cfg.wandb.resume
+            wandb_run = wandb.init(**wandb_init_kwargs)
+            self._wandb_run_id = wandb_run.id
         elif self._use_tb:
             try:
                 from torch.utils.tensorboard import SummaryWriter
@@ -190,6 +198,10 @@ class Logger(object):
                 else cfg.tb.name
             )
             self._sw = SummaryWriter(str(Path(cfg.tb.log_dir) / logdir))
+
+    @property
+    def wandb_run_id(self):
+        return self._wandb_run_id
 
     def _try_log(self, key, value, step, is_video=False):
         if self._use_wandb:

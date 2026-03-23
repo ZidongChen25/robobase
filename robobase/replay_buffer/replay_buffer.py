@@ -79,3 +79,9 @@ class ReplayBuffer(IterableDataset):
 
     def shutdown(self):
         pass
+
+    def state_dict(self) -> dict:
+        return {}
+
+    def load_state_dict(self, state_dict: dict):
+        del state_dict

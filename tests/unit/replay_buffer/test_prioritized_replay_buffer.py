@@ -149,6 +149,50 @@ class TestPrioritizedReplayBuffer:
         )
         assert self._memory.get_priority(np.array([0], dtype=np.int32))[0] == 1.0
 
+    def test_state_dict_restores_sum_tree(self, tmp_path):
+        save_dir = tmp_path / "prioritized_replay"
+        self._memory = PrioritizedReplayBuffer(
+            observation_elements=self._test_single_obs_space,
+            replay_capacity=20,
+            action_shape=ACTION_SHAPE,
+            batch_size=BATCH_SIZE,
+            save_dir=str(save_dir),
+            purge_replay_on_shutdown=False,
+            save_snapshot=True,
+        )
+
+        episode_length = 4
+        for idx in range(episode_length):
+            self._memory.add(
+                {"rgb": self._test_single_obs * idx},
+                self._test_action,
+                self._test_reward,
+                self._test_terminal + float(idx == (episode_length - 1)),
+                self._test_truncated,
+            )
+        self._memory.add_final({"rgb": self._test_single_obs * episode_length})
+
+        indices = np.arange(episode_length, dtype=np.int32)
+        priorities = np.asarray([0.25, 0.5, 0.75, 1.0], dtype=np.float32)
+        self._memory.set_priority(indices, priorities)
+        state_dict = self._memory.state_dict()
+
+        restored_memory = PrioritizedReplayBuffer(
+            observation_elements=self._test_single_obs_space,
+            replay_capacity=20,
+            action_shape=ACTION_SHAPE,
+            batch_size=BATCH_SIZE,
+            save_dir=str(save_dir),
+            purge_replay_on_shutdown=False,
+            save_snapshot=True,
+        )
+        try:
+            restored_memory.load_state_dict(state_dict)
+            assert restored_memory.add_count == self._memory.add_count
+            assert np.allclose(restored_memory.get_priority(indices), priorities)
+        finally:
+            restored_memory.shutdown()
+
     def test_low_priority_element_not_frequently_sampled(self):
         self._memory = PrioritizedReplayBuffer(
             observation_elements=self._test_single_obs_space,

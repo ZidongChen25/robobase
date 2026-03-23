@@ -130,6 +130,25 @@ class PrioritizedReplayBuffer(UniformReplayBuffer):
         for index, priority in zip(indices, priorities):
             self._sum_tree.set(index, priority)
 
+    @override
+    def state_dict(self) -> dict:
+        state = super().state_dict()
+        state["sum_tree_nodes"] = [
+            np.array(nodes[:], dtype=np.float64) for nodes in self._sum_tree.nodes
+        ]
+        state["sum_tree_max_recorded_priority"] = self._sum_tree.max_recorded_priority
+        return state
+
+    @override
+    def load_state_dict(self, state_dict: dict):
+        super().load_state_dict(state_dict)
+        for nodes, saved_nodes in zip(self._sum_tree.nodes, state_dict["sum_tree_nodes"]):
+            for idx, value in enumerate(saved_nodes):
+                nodes[idx] = float(value)
+        self._sum_tree._max_recorded_priority.value = float(
+            state_dict["sum_tree_max_recorded_priority"]
+        )
+
     def __iter__(self):
         while True:
             # Because not globally sampling, we can get repeat samples in a batch.

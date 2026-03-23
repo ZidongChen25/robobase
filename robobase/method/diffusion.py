@@ -1,4 +1,6 @@
+from collections import OrderedDict
 from functools import partial
+import logging
 
 import torch
 import torch.nn as nn
@@ -32,6 +34,7 @@ class Actor(nn.Module):
         actor_model: FullyConnectedModule,
         noise_scheduler: SchedulerMixin,
         num_diffusion_iters: int,
+        use_ema: bool,
     ):
         super().__init__()
         assert len(action_space.shape) == 2
@@ -39,20 +42,24 @@ class Actor(nn.Module):
         self.actor = actor_model
         self.noise_scheduler = noise_scheduler
         self.num_diffusion_iters = num_diffusion_iters
+        self.use_ema = use_ema
         self.sequence_length = action_space.shape[0]
         self.action_dim = action_space.shape[1]
-        self.ema = EMAModel(
-            parameters=self.actor.parameters(),
-            power=0.75,
-        )
-        self.ema_actor = copy.deepcopy(self.actor)
+        self.ema = None
+        self.ema_actor = None
+        if self.use_ema:
+            self.ema = EMAModel(
+                parameters=self.actor.parameters(),
+                power=0.75,
+            )
+            self.ema_actor = copy.deepcopy(self.actor)
 
     @property
     def preferred_optimiser(self) -> callable:
         return getattr(
             self.actor,
             "preferred_optimiser",
-            partial(torch.optim.Adam, self.parameters()),
+            partial(torch.optim.Adam, self.actor.parameters()),
         )
 
     def _combine(self, low_dim_obs, fused_view_feats):
@@ -104,15 +111,20 @@ class Actor(nn.Module):
         noise_pred = self.actor(net_ins)
         return noise_pred, noise
 
-    def infer(self, low_dim_obs, fused_view_feats) -> tuple[torch.Tensor, torch.Tensor]:
+    def infer(
+        self, low_dim_obs, fused_view_feats, use_ema: bool
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Inverse process for inference.
         """
         obs_features = self._combine(low_dim_obs, fused_view_feats)
         with torch.no_grad():
-            # ema averaged model
-            actor = self.ema_actor
-            self.ema.copy_to(actor.parameters())
+            actor = self.actor
+            if use_ema:
+                if self.ema is None or self.ema_actor is None:
+                    raise RuntimeError("EMA inference requested but EMA is disabled.")
+                actor = self.ema_actor
+                self.ema.copy_to(actor.parameters())
 
             # initialize action from Gaussian noise
             b = 1
@@ -141,12 +153,31 @@ class Actor(nn.Module):
 
 
 class Diffusion(BC):
-    def __init__(self, num_diffusion_iters: int, *args, **kwargs):
+    _EMA_STATE_PREFIX = "_actor_ema_state."
+    _EMA_SCALAR_FIELDS = {
+        "decay": float,
+        "min_decay": float,
+        "optimization_step": int,
+        "update_after_step": int,
+        "use_ema_warmup": bool,
+        "inv_gamma": float,
+        "power": float,
+    }
+
+    def __init__(
+        self,
+        num_diffusion_iters: int,
+        use_ema: bool = True,
+        *args,
+        **kwargs,
+    ):
         if not kwargs["frame_stack_on_channel"]:
             raise NotImplementedError(
                 "frame_stack_on_channel must be true for diffusion policies."
             )
         self.num_diffusion_iters = num_diffusion_iters
+        self.use_ema = use_ema
+        kwargs["use_ema"] = use_ema
         self.noise_scheduler = DDIMScheduler(
             num_train_timesteps=num_diffusion_iters,
             # the choise of beta schedule has big impact on performance
@@ -158,6 +189,126 @@ class Diffusion(BC):
             prediction_type="epsilon",
         )
         super().__init__(*args, **kwargs)
+
+    @classmethod
+    def _ema_state_key(cls, suffix: str) -> str:
+        return f"{cls._EMA_STATE_PREFIX}{suffix}"
+
+    @staticmethod
+    def _has_ema_actor_state(state_dict: OrderedDict) -> bool:
+        return any(k.startswith("actor.ema_actor.") for k in state_dict)
+
+    @staticmethod
+    def _drop_ema_actor_state(state_dict: OrderedDict):
+        for key in [k for k in list(state_dict.keys()) if k.startswith("actor.ema_actor.")]:
+            state_dict.pop(key)
+
+    @classmethod
+    def _serialize_ema_scalar(cls, value):
+        return torch.tensor(float(value), dtype=torch.float64)
+
+    @classmethod
+    def _deserialize_ema_scalar(cls, field: str, value: torch.Tensor):
+        scalar = value.item()
+        caster = cls._EMA_SCALAR_FIELDS[field]
+        if caster is bool:
+            return bool(int(scalar))
+        return caster(scalar)
+
+    @classmethod
+    def _pop_ema_state(cls, state_dict: OrderedDict) -> dict | None:
+        ema_keys = [k for k in list(state_dict.keys()) if k.startswith(cls._EMA_STATE_PREFIX)]
+        if not ema_keys:
+            return None
+
+        ema_state = {}
+        for field in cls._EMA_SCALAR_FIELDS:
+            key = cls._ema_state_key(field)
+            value = state_dict.pop(key, None)
+            if value is not None:
+                ema_state[field] = cls._deserialize_ema_scalar(field, value)
+
+        shadow_prefix = cls._ema_state_key("shadow_params.")
+        shadow_param_keys = sorted(
+            [k for k in ema_keys if k.startswith(shadow_prefix)],
+            key=lambda k: int(k.rsplit(".", 1)[-1]),
+        )
+        ema_state["shadow_params"] = [state_dict.pop(k) for k in shadow_param_keys]
+        return ema_state
+
+    def _sync_ema_actor(self):
+        if self.actor.ema is None or self.actor.ema_actor is None:
+            return
+        self.actor.ema.copy_to(self.actor.ema_actor.parameters())
+
+    def state_dict(self, *args, destination=None, prefix="", keep_vars=False):
+        state = super().state_dict(
+            *args,
+            destination=destination,
+            prefix=prefix,
+            keep_vars=keep_vars,
+        )
+        if not self.use_ema or self.actor.ema is None:
+            return state
+
+        self._sync_ema_actor()
+        ema_actor_prefix = f"{prefix}actor.ema_actor."
+        for key in [k for k in list(state.keys()) if k.startswith(ema_actor_prefix)]:
+            del state[key]
+        ema_state = self.actor.ema.state_dict()
+        for field in self._EMA_SCALAR_FIELDS:
+            state[f"{prefix}{self._ema_state_key(field)}"] = self._serialize_ema_scalar(
+                ema_state[field]
+            )
+        for idx, shadow_param in enumerate(ema_state["shadow_params"]):
+            key = f"{prefix}{self._ema_state_key(f'shadow_params.{idx}')}"
+            tensor = shadow_param.clone() if keep_vars else shadow_param.detach().clone()
+            state[key] = tensor
+        return state
+
+    def load_state_dict(self, state_dict, strict=True):
+        state_dict = OrderedDict(state_dict)
+        ema_state = self._pop_ema_state(state_dict)
+        has_ema_actor_state = self._has_ema_actor_state(state_dict)
+        if not self.use_ema:
+            self._drop_ema_actor_state(state_dict)
+            return super().load_state_dict(state_dict, strict=strict)
+
+        incompatible_keys = super().load_state_dict(state_dict, strict=False)
+        missing_keys = [
+            key
+            for key in incompatible_keys.missing_keys
+            if not key.startswith("actor.ema_actor.")
+        ]
+        unexpected_keys = incompatible_keys.unexpected_keys
+        if strict and (missing_keys or unexpected_keys):
+            error_messages = []
+            if missing_keys:
+                error_messages.append(f"Missing key(s): {missing_keys}")
+            if unexpected_keys:
+                error_messages.append(f"Unexpected key(s): {unexpected_keys}")
+            raise RuntimeError(
+                "Error(s) in loading state_dict for Diffusion:\n\t"
+                + "\n\t".join(error_messages)
+            )
+
+        if ema_state is not None and ema_state["shadow_params"]:
+            self.actor.ema.load_state_dict(ema_state)
+        else:
+            logging.warning(
+                "Diffusion snapshot is missing EMA state; rebuilding EMA weights "
+                "from the stored %s parameters.",
+                "ema_actor" if has_ema_actor_state else "actor",
+            )
+            params = (
+                self.actor.ema_actor.parameters()
+                if has_ema_actor_state
+                else self.actor.actor.parameters()
+            )
+            self.actor.ema.shadow_params = [param.detach().clone() for param in params]
+
+        self._sync_ema_actor()
+        return incompatible_keys
 
     def build_actor(self):
         # TODO: remove this limitation
@@ -174,6 +325,7 @@ class Diffusion(BC):
             self.actor_model,
             self.noise_scheduler,
             self.num_diffusion_iters,
+            self.use_ema,
         ).to(self.device)
         self.actor_opt = (self.actor.preferred_optimiser)(lr=self.lr)
 
@@ -214,7 +366,11 @@ class Diffusion(BC):
             with torch.no_grad():
                 multi_view_rgb_feats = self.encoder(rgb_obs.float())
                 fused_rgb_feats = self.view_fusion(multi_view_rgb_feats)
-        _, noisy_action = self.actor.infer(low_dim_obs, fused_rgb_feats)
+        _, noisy_action = self.actor.infer(
+            low_dim_obs,
+            fused_rgb_feats,
+            use_ema=self.use_ema and eval_mode,
+        )
         return noisy_action.detach()
 
     def update_actor(
@@ -265,7 +421,8 @@ class Diffusion(BC):
             self.lr_scheduler.step()
 
         # update Exponential Moving Average of the model weights
-        self.actor.ema.step(self.actor)
+        if self.use_ema and self.actor.ema is not None:
+            self.actor.ema.step(self.actor.actor.parameters())
 
         if self.logging:
             metrics["actor_loss"] = actor_loss.item()

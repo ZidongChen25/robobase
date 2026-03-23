@@ -124,6 +124,7 @@ class UniformReplayBuffer(ReplayBuffer):
         extra_replay_elements: spaces.Dict = None,
         save_dir: str = None,
         purge_replay_on_shutdown: bool = True,
+        save_snapshot: bool = False,
         preprocessing_fn: list[Callable[[list[spaces.Dict]], list[spaces.Dict]]] = None,
         preprocess_every_sample: bool = False,
         num_workers: int = 0,
@@ -261,7 +262,6 @@ class UniformReplayBuffer(ReplayBuffer):
         self._num_workers = num_workers
         self._fetch_every = fetch_every
         self._samples_since_last_fetch = self._fetch_every
-        save_snapshot = False
         self._save_snapshot = save_snapshot
 
         logging.info(
@@ -554,8 +554,48 @@ class UniformReplayBuffer(ReplayBuffer):
             logging.info("Clearing disk replay buffer.")
             if self._tmpdir is not None:
                 self._tmpdir.cleanup()
-            for f in self._replay_dir.glob(".npz"):
+            for f in self._replay_dir.glob("*.npz"):
                 f.unlink(missing_ok=True)
+
+    @override
+    def state_dict(self) -> dict:
+        return {
+            "add_count": self.add_count,
+            "num_episodes": self._num_episodes,
+            "num_transitions": self._num_transitions,
+            "is_first": self._is_first,
+            "save_snapshot": self._save_snapshot,
+            "replay_dir": str(self._replay_dir),
+        }
+
+    @override
+    def load_state_dict(self, state_dict: dict):
+        replay_dir = state_dict.get("replay_dir")
+        if replay_dir is not None and Path(replay_dir) != self._replay_dir:
+            logging.warning(
+                "Restoring replay state from snapshot created with replay_dir=%s "
+                "into replay_dir=%s.",
+                replay_dir,
+                self._replay_dir,
+            )
+
+        self.add_count = int(state_dict["add_count"])
+        self._num_episodes = int(state_dict["num_episodes"])
+        self._num_transitions = int(state_dict["num_transitions"])
+        self._is_first = bool(state_dict["is_first"])
+        self._save_snapshot = bool(state_dict.get("save_snapshot", self._save_snapshot))
+
+        self._episode_files = []
+        self._episodes = {}
+        self._global_idxs_to_episode_and_transition_idx = defaultdict(list)
+        self._size = 0
+        self._samples_since_last_fetch = self._fetch_every
+
+        if self.add_count > 0 and not any(self._replay_dir.glob("*.npz")):
+            raise ValueError(
+                f"Replay checkpoint expects episode files in '{self._replay_dir}', "
+                "but none were found."
+            )
 
     ### Below are the Dataset functions ###
 
