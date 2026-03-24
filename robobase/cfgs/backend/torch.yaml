@@ -1,0 +1,6 @@
+# @package _global_
+
+backend:
+  name: torch
+  compile: false
+  mixed_precision: false

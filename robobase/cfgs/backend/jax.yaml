@@ -1,0 +1,6 @@
+# @package _global_
+
+backend:
+  name: jax
+  platform: cuda
+  jit: true
