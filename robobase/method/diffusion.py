@@ -7,7 +7,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from gymnasium import spaces
 
-from robobase.method.bc import BC
+from robobase.backends.torch.method.bc import BC
 
 from robobase.models.fully_connected import FullyConnectedModule
 

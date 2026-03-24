@@ -10,7 +10,7 @@ except Exception:
     import torchvision.transforms as tvf  # Bamboo server use torchvision==0.14.1
 
 from robobase.models import RoboBaseModule
-from robobase.method.bc import BC
+from robobase.backends.torch.method.bc import BC
 from robobase.replay_buffer.replay_buffer import ReplayBuffer
 from robobase.method.utils import (
     extract_from_spec,
@@ -381,7 +381,9 @@ class ActBCAgent(BC):
 
         metrics = dict()
         batch = next(replay_iter)
-        batch = {k: v.float().to(self.device) for k, v in batch.items()}
+        batch = {
+            k: v.float().to(self.device, non_blocking=True) for k, v in batch.items()
+        }
 
         actions = batch["action"]
         reward = batch["reward"]
