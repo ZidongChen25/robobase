@@ -52,6 +52,12 @@ setuptools.setup(
     },
     extras_require={
         "dev": ["pre-commit", "pytest", "mvp @ git+https://github.com/ir413/mvp"],
+        "jax": [
+            "jax",
+            "flax",
+            "optax",
+            "jax-resnet @ git+https://github.com/n2cholas/jax-resnet.git@5b00735aa0a68ec239af4a728ad4a596c1b551f6",
+        ],
         "dmc": [
             "dm_control",
         ],
