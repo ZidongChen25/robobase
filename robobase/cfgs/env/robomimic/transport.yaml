@@ -1,0 +1,9 @@
+# @package _global_
+
+defaults:
+  - robomimic
+  - _self_
+
+env:
+  task_name: TwoArmTransport
+  dataset_path: third_party_datasets/robomimic/transport/ph/low_dim_v141.hdf5
