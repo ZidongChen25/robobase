@@ -85,3 +85,7 @@ class ReplayBuffer(IterableDataset):
 
     def load_state_dict(self, state_dict: dict):
         del state_dict
+
+    @property
+    def reused_existing(self) -> bool:
+        return False

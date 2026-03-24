@@ -632,7 +632,7 @@ class ValueBased(OffPolicyMethod, ABC):
     ]:
         metrics = dict()
         batch = next(replay_iter)
-        batch = {k: v.to(self.device) for k, v in batch.items()}
+        batch = {k: v.to(self.device, non_blocking=True) for k, v in batch.items()}
         action = batch["action"]
         reward = batch["reward"].unsqueeze(1)
         discount = batch["discount"].to(reward.dtype).unsqueeze(1)

@@ -609,6 +609,16 @@ class DemoMergedIterator:
             demo_batch.keys()
         ), f"Keys in demo batch are different: {batch.keys()}, {demo_batch.keys()}"
 
+    def _ones_like(self, value):
+        if torch.is_tensor(value):
+            return torch.ones_like(value)
+        return np.ones_like(value)
+
+    def _cat(self, lhs, rhs):
+        if torch.is_tensor(lhs):
+            return torch.cat([lhs, rhs], 0)
+        return np.concatenate([lhs, rhs], axis=0)
+
     def __next__(self):
         batch = next(self.replay_iter)
         demo_batch = next(self.demo_replay_iter)
@@ -616,5 +626,11 @@ class DemoMergedIterator:
             self._check_keys(batch, demo_batch)
             self._is_safe = True
         # Override demo to be 1 for demo_batch
-        demo_batch["demo"] = torch.ones_like(demo_batch["demo"])
-        return {k: torch.cat([batch[k], demo_batch[k]], 0) for k in batch.keys()}
+        demo_batch["demo"] = self._ones_like(demo_batch["demo"])
+        return {k: self._cat(batch[k], demo_batch[k]) for k in batch.keys()}
+
+    def close(self):
+        for iterator in (self.replay_iter, self.demo_replay_iter):
+            close = getattr(iterator, "close", None)
+            if callable(close):
+                close()

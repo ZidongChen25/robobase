@@ -572,7 +572,7 @@ class ActorCritic(OffPolicyMethod, ABC):
         if self.logging:
             start_time = time.time()
         batch = next(replay_iter)
-        batch = {k: v.to(self.device) for k, v in batch.items()}
+        batch = {k: v.to(self.device, non_blocking=True) for k, v in batch.items()}
         if self.logging:
             metrics["buffer_sample_time"] = time.time() - start_time
         action = batch["action"]

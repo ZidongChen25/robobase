@@ -656,7 +656,7 @@ class DreamerV3(ModelBasedMethod, ABC):
         """
         metrics = dict()
         batch = next(replay_iter)
-        batch = {k: v.to(self.device) for k, v in batch.items()}
+        batch = {k: v.to(self.device, non_blocking=True) for k, v in batch.items()}
         prev_action = batch["action"].flatten(-len(self.action_space.shape))
         reward = batch["reward"]
         is_first = batch["is_first"].to(reward.dtype)
