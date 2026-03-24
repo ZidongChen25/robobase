@@ -7,6 +7,10 @@ import hydra
     config_path="robobase/cfgs", config_name="robobase_config", version_base=None
 )
 def main(cfg):
+    from robobase.gpu import apply_requested_gpu
+
+    apply_requested_gpu(cfg)
+
     from robobase.workspace import Workspace
 
     root_dir = Path.cwd()

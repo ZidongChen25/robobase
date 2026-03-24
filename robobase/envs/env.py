@@ -15,6 +15,18 @@ class EnvFactory:
     def make_eval_env(self, cfg: DictConfig) -> gym.Env:
         pass
 
+    def get_spaces(self, cfg: DictConfig) -> tuple[gym.Space, gym.Space]:
+        env = self.make_eval_env(cfg)
+        try:
+            return env.observation_space, env.action_space
+        finally:
+            close = getattr(env, "close", None)
+            if callable(close):
+                close()
+
+    def make_eval_envs(self, cfg: DictConfig) -> gym.vector.VectorEnv:
+        raise NotImplementedError("This env does not support vectorized evaluation.")
+
     def collect_or_fetch_demos(self, cfg: DictConfig, num_demos: int):
         """Collect demonstrations or fetch stored demonstrations.
 
