@@ -16,6 +16,7 @@ from robobase.models.fully_connected import (
     MLPWithBottleneckFeaturesAndWithoutHead,
     MLPWithBottleneckFeaturesAndSequenceOutput,
 )
+from robobase.backends.torch.models.fully_connected import GRU, jax_style_weight_init
 from robobase.models.decoder import DecoderCNNMultiView
 from robobase.method.act import ImageEncoderACT
 from robobase.models.multi_view_transformer import MultiViewTransformerEncoderDecoderACT
@@ -389,6 +390,43 @@ def test_fully_connected_mlp_with_bottleneck_features_and_seq_output(
     )
     out = net({"in0": in0, "in1": in1})
     assert out.shape == (BATCH_SIZE, output_sequence_length, output_shape)
+
+
+def test_fully_connected_sequence_gru_uses_single_recurrent_layer():
+    net = MLPWithBottleneckFeaturesAndSequenceOutput(
+        input_shapes={"in0": (2,), "in1": (4,)},
+        output_shape=1,
+        num_envs=1,
+        rnn_hidden_size=1,
+        num_rnn_layers=1,
+        keys_to_bottleneck=["in0"],
+        bottleneck_size=5,
+        norm_after_bottleneck=True,
+        tanh_after_bottleneck=True,
+        mlp_nodes=[16, 16],
+        output_sequence_network_type="rnn",
+        output_sequence_length=5,
+    )
+
+    assert isinstance(net.out_mlp[0], GRU)
+    assert net.out_mlp[0]._rnn.num_layers == 1
+
+
+def test_jax_style_weight_init_matches_dense_defaults():
+    linear = torch.nn.Linear(4, 8)
+    jax_style_weight_init(linear)
+
+    limit = np.sqrt(6.0 / float(4 + 8))
+    assert torch.all(linear.weight.abs() <= limit + 1e-6)
+    assert torch.all(linear.bias == 0)
+
+
+def test_jax_style_weight_init_zeroes_gru_biases():
+    gru = torch.nn.GRU(8, 8, num_layers=1, batch_first=True)
+    jax_style_weight_init(gru)
+
+    assert torch.all(gru.bias_ih_l0 == 0)
+    assert torch.all(gru.bias_hh_l0 == 0)
 
 
 @pytest.mark.parametrize(
