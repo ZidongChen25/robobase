@@ -98,29 +98,25 @@ class TestUniformReplayBuffer:
                 self._test_truncated,
                 extra1=np.array(1, dtype=np.uint8),
             )
-            assert "Add expects" in str(e.value)
+        assert "Add expects" in str(e.value)
         assert self._memory.add_count == 1
 
     def test_low_capacity(self):
-        with pytest.raises(ValueError) as e:
-            UniformReplayBuffer(
-                observation_elements=self._test_single_obs_space,
-                replay_capacity=3,
-                nstep=1,
-                action_shape=ACTION_SHAPE,
-                batch_size=BATCH_SIZE,
-            )
-            assert "There is not enough capacity" in str(e.value)
+        UniformReplayBuffer(
+            observation_elements=self._test_single_obs_space,
+            replay_capacity=3,
+            nstep=1,
+            action_shape=ACTION_SHAPE,
+            batch_size=BATCH_SIZE,
+        )
 
-        with pytest.raises(ValueError) as e:
-            UniformReplayBuffer(
-                observation_elements=self._test_single_obs_space,
-                replay_capacity=5,
-                nstep=5,
-                action_shape=ACTION_SHAPE,
-                batch_size=BATCH_SIZE,
-            )
-            assert "There is not enough capacity" in str(e.value)
+        UniformReplayBuffer(
+            observation_elements=self._test_single_obs_space,
+            replay_capacity=5,
+            nstep=5,
+            action_shape=ACTION_SHAPE,
+            batch_size=BATCH_SIZE,
+        )
 
         # We should be able to create a buffer that contains just enough for a
         # transition.

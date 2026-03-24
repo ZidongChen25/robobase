@@ -102,7 +102,7 @@ class TestSequentialReplayBuffer:
                 self._test_truncated,
                 extra1=np.array(1, dtype=np.uint8),
             )
-            assert "Add expects" in str(e.value)
+        assert "Add expects" in str(e.value)
         assert self._memory.add_count == 1
 
     def test_low_capacity(self):

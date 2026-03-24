@@ -12,8 +12,15 @@ from hydra.core.hydra_config import HydraConfig
 from omegaconf import DictConfig
 
 from robobase import utils
+from robobase.backends import backend_name_from_cfg, create_agent
 from robobase.envs.env import EnvFactory
 from robobase.logger import Logger
+from robobase.replay_buffer.iterator import (
+    create_jax_replay_iterator,
+    create_numpy_replay_iterator,
+    create_torch_replay_iterator,
+    normalize_replay_num_workers,
+)
 from robobase.replay_buffer.prioritized_replay_buffer import PrioritizedReplayBuffer
 from robobase.replay_buffer.replay_buffer import ReplayBuffer
 from robobase.replay_buffer.uniform_replay_buffer import UniformReplayBuffer
@@ -25,7 +32,6 @@ import hydra
 import numpy as np
 import torch
 import gymnasium as gym
-from torch.utils.data import DataLoader
 
 torch.backends.cudnn.benchmark = True
 
@@ -39,10 +45,21 @@ def _normalize_demos_count(value):
     return value
 
 
-def _worker_init_fn(worker_id):
-    seed = np.random.get_state()[1][0] + worker_id
-    np.random.seed(seed)
-    random.seed(int(seed))
+def _resolve_torch_device(cfg: DictConfig):
+    dev = "cpu"
+    if cfg.num_gpus > 0:
+        if sys.platform == "darwin":
+            dev = "mps"
+        else:
+            dev = 0
+            job_num = False
+            try:
+                job_num = HydraConfig.get().job.get("num", False)
+            except ValueError:
+                pass
+            if job_num:
+                dev = job_num % cfg.num_gpus
+    return torch.device(dev)
 
 
 def _create_default_replay_buffer(
@@ -53,6 +70,7 @@ def _create_default_replay_buffer(
     save_dir: str | None = None,
     purge_replay_on_shutdown: bool = True,
     save_snapshot: bool = False,
+    reuse_saved: bool = False,
 ) -> ReplayBuffer:
     extra_replay_elements = spaces.Dict({})
     if cfg.demos != 0:
@@ -71,6 +89,7 @@ def _create_default_replay_buffer(
         save_dir=save_dir if save_dir is not None else cfg.replay.save_dir,
         purge_replay_on_shutdown=purge_replay_on_shutdown,
         save_snapshot=save_snapshot,
+        reuse_saved=reuse_saved,
         batch_size=cfg.batch_size if not demo_replay else cfg.demo_batch_size,
         replay_capacity=cfg.replay.size if not demo_replay else cfg.replay.demo_size,
         action_shape=action_space.shape,
@@ -175,21 +194,12 @@ class Workspace:
             raise ValueError("replay.nstep != 1 is not supported for IL methods")
 
         self.cfg = cfg
+        self.backend_name = backend_name_from_cfg(cfg)
+        self.using_torch_backend = self.backend_name == "torch"
         utils.set_seed_everywhere(cfg.seed)
-        dev = "cpu"
-        if cfg.num_gpus > 0:
-            if sys.platform == "darwin":
-                dev = "mps"
-            else:
-                dev = 0
-                job_num = False
-                try:
-                    job_num = HydraConfig.get().job.get("num", False)
-                except ValueError:
-                    pass
-                if job_num:
-                    dev = job_num % cfg.num_gpus
-        self.device = torch.device(dev)
+        self.device = _resolve_torch_device(cfg) if self.using_torch_backend else None
+        self.use_demo_replay = cfg.demo_batch_size is not None
+        self._skip_demo_loading_from_dataset = False
 
         # create logger
         self.logger = Logger(self.work_dir, cfg=self.cfg)
@@ -198,31 +208,41 @@ class Workspace:
         if (num_demos := cfg.demos) != 0:
             # Collect demos or fetch saved demos before making environments
             # to consider demo-based action space (e.g., standardization)
-            self.env_factory.collect_or_fetch_demos(cfg, num_demos)
+            if self._should_collect_demos_from_dataset():
+                self.env_factory.collect_or_fetch_demos(cfg, num_demos)
+            else:
+                self._skip_demo_loading_from_dataset = True
+
+        self.train_envs = None
+        self.eval_env = None
+        self.eval_envs = None
+        self._defer_live_eval_env_creation = self._should_defer_live_eval_env_creation()
 
         # Make training environment
-        if cfg.num_train_envs > 0:
+        if self._should_create_train_env():
             self.train_envs = self.env_factory.make_train_env(cfg)
-        else:
-            self.train_envs = None
-            logging.warning("Train env is not created. Training will not be supported ")
-
-        # Create evaluation environment
-        self.eval_env = self.env_factory.make_eval_env(cfg)
-        self.eval_envs = None
-        if cfg.num_eval_envs > 1:
-            self.eval_envs = self.env_factory.make_eval_envs(cfg)
+        elif cfg.num_train_envs > 0:
+            logging.warning(
+                "Train env is not created. Offline pretraining can still run, "
+                "but online rollouts are disabled."
+            )
 
         if num_demos != 0:
             # Post-process demos using the information from environments
-            self.env_factory.post_collect_or_fetch_demos(cfg)
+            if not self._skip_demo_loading_from_dataset:
+                self.env_factory.post_collect_or_fetch_demos(cfg)
 
-        # Create the RL Agent
-        observation_space = self.eval_env.observation_space
-        action_space = self.eval_env.action_space
+        observation_space, action_space = self.env_factory.get_spaces(cfg)
+        if self.cfg.num_eval_episodes > 0 and not self._defer_live_eval_env_creation:
+            self._ensure_eval_envs_created()
 
         intrinsic_reward_module = None
         if cfg.get("intrinsic_reward_module", None):
+            if not self.using_torch_backend:
+                raise NotImplementedError(
+                    "The minimal JAX backend does not support intrinsic reward "
+                    "modules yet."
+                )
             intrinsic_reward_module = hydra.utils.instantiate(
                 cfg.intrinsic_reward_module,
                 device=self.device,
@@ -230,16 +250,11 @@ class Workspace:
                 action_space=action_space,
             )
 
-        self.agent = hydra.utils.instantiate(
-            cfg.method,
-            device=self.device,
+        self.agent = create_agent(
+            cfg,
             observation_space=observation_space,
             action_space=action_space,
-            num_train_envs=cfg.num_train_envs,
-            num_eval_envs=cfg.num_eval_envs,
-            replay_alpha=cfg.replay.alpha,
-            replay_beta=cfg.replay.beta,
-            frame_stack_on_channel=cfg.frame_stack_on_channel,
+            device=self.device,
             intrinsic_reward_module=intrinsic_reward_module,
         )
         self.agent.train(False)
@@ -249,18 +264,14 @@ class Workspace:
             observation_space,
             action_space,
             save_dir=self._resolve_replay_save_dir(demo_replay=False),
-            purge_replay_on_shutdown=not cfg.save_snapshot,
-            save_snapshot=cfg.save_snapshot,
+            purge_replay_on_shutdown=not self._should_persist_replay_files(),
+            save_snapshot=self._should_persist_replay_files(),
+            reuse_saved=bool(cfg.replay.reuse_saved),
         )
         self.prioritized_replay = cfg.replay.prioritization
         self.extra_replay_elements = self.replay_buffer.extra_replay_elements
-
-        self.replay_loader = DataLoader(
-            self.replay_buffer,
-            batch_size=self.replay_buffer.batch_size,
-            num_workers=cfg.replay.num_workers,
-            pin_memory=cfg.replay.pin_memory,
-            worker_init_fn=_worker_init_fn,
+        self.replay_num_workers = normalize_replay_num_workers(
+            self.backend_name, cfg.replay.num_workers
         )
         self._replay_iter = None
 
@@ -269,7 +280,6 @@ class Workspace:
         # TODO: Change the name to `self_imitation_buffer` or other names
         # Note that original buffer also contains demos, but they are not protected
         # TODO: Support demo protection in a buffer
-        self.use_demo_replay = cfg.demo_batch_size is not None
         if self.use_demo_replay:
             self.demo_replay_buffer = create_replay_fn(
                 cfg,
@@ -277,16 +287,11 @@ class Workspace:
                 action_space,
                 demo_replay=True,
                 save_dir=self._resolve_replay_save_dir(demo_replay=True),
-                purge_replay_on_shutdown=not cfg.save_snapshot,
-                save_snapshot=cfg.save_snapshot,
+                purge_replay_on_shutdown=not self._should_persist_replay_files(),
+                save_snapshot=self._should_persist_replay_files(),
+                reuse_saved=bool(cfg.replay.reuse_saved),
             )
-            self.demo_replay_loader = DataLoader(
-                self.demo_replay_buffer,
-                batch_size=self.demo_replay_buffer.batch_size,
-                num_workers=cfg.replay.num_workers,
-                pin_memory=cfg.replay.pin_memory,
-                worker_init_fn=_worker_init_fn,
-            )
+            self.demo_replay_num_workers = self.replay_num_workers
 
         if self.prioritized_replay:
             if self.use_demo_replay:
@@ -306,25 +311,20 @@ class Workspace:
         self._pretrain_step = 0
         self._main_loop_iterations = 0
         self._global_env_episode = 0
-        self._act_dim = self.eval_env.action_space.shape[0]
+        self._act_dim = action_space.shape[0]
         if self.train_envs:
             self._episode_rollouts = [[] for _ in range(self.train_envs.num_envs)]
         else:
             self._episode_rollouts = []
 
-        if cfg.num_eval_episodes == 0:
-            # We no longer need the eval env
-            self.eval_env.close()
-            self.eval_env = None
-            if self.eval_envs is not None:
-                self.eval_envs.close()
-                self.eval_envs = None
-
         self._shutting_down = False
+        self._sigint_count = 0
+        self._previous_sigint_handler = None
         self._snapshot_loaded = False
         self._snapshot_cfg = None
+        train_agent_count = self.train_envs.num_envs if self.train_envs is not None else 0
         self._eval_agent_indices = list(
-            range(self.cfg.num_train_envs, self.cfg.num_train_envs + self.cfg.num_eval_envs)
+            range(train_agent_count, train_agent_count + self.cfg.num_eval_envs)
         )
 
     @property
@@ -346,9 +346,7 @@ class Workspace:
         pretrain_steps: int | None = None,
     ) -> int:
         if not self.train_envs:
-            # If train envs is not enabled, we are in pure evaluation mode.
-            # Return 0 as there is no global frame.
-            return 0
+            return pretrain_steps if pretrain_steps is not None else self.pretrain_steps
 
         if main_loop_iterations is None:
             main_loop_iterations = self._main_loop_iterations
@@ -373,22 +371,86 @@ class Workspace:
     @property
     def replay_iter(self):
         if self._replay_iter is None:
-            _replay_iter = iter(self.replay_loader)
+            if self.using_torch_backend:
+                _replay_iter = create_torch_replay_iterator(
+                    self.replay_buffer,
+                    num_workers=self.replay_num_workers,
+                    pin_memory=self.cfg.replay.pin_memory,
+                )
+            elif self.backend_name == "jax":
+                _replay_iter = create_jax_replay_iterator(
+                    self.replay_buffer,
+                    num_workers=self.replay_num_workers,
+                )
+            else:
+                _replay_iter = create_numpy_replay_iterator(
+                    self.replay_buffer,
+                    num_workers=self.replay_num_workers,
+                )
             if self.use_demo_replay:
-                _demo_replay_iter = iter(self.demo_replay_loader)
+                if self.using_torch_backend:
+                    _demo_replay_iter = create_torch_replay_iterator(
+                        self.demo_replay_buffer,
+                        num_workers=self.demo_replay_num_workers,
+                        pin_memory=self.cfg.replay.pin_memory,
+                    )
+                elif self.backend_name == "jax":
+                    _demo_replay_iter = create_jax_replay_iterator(
+                        self.demo_replay_buffer,
+                        num_workers=self.demo_replay_num_workers,
+                    )
+                else:
+                    _demo_replay_iter = create_numpy_replay_iterator(
+                        self.demo_replay_buffer,
+                        num_workers=self.demo_replay_num_workers,
+                    )
                 _replay_iter = utils.merge_replay_demo_iter(
                     _replay_iter, _demo_replay_iter
                 )
             self._replay_iter = _replay_iter
         return self._replay_iter
 
+    def _close_replay_iter(self):
+        if self._replay_iter is None:
+            return
+        close = getattr(self._replay_iter, "close", None)
+        if callable(close):
+            close()
+        self._replay_iter = None
+
     def _resolve_replay_save_dir(self, demo_replay: bool) -> str | None:
         if self.cfg.replay.save_dir is not None:
             base_dir = Path(self.cfg.replay.save_dir)
             return str(base_dir / "demo" if demo_replay else base_dir)
-        if not self.cfg.save_snapshot:
+        if not self._should_persist_replay_files():
             return None
         return str(self.work_dir / ("demo_replay" if demo_replay else "replay"))
+
+    def _should_persist_replay_files(self) -> bool:
+        return bool(self.cfg.save_snapshot or self.cfg.replay.persist)
+
+    def _requires_demo_stats(self) -> bool:
+        return bool(
+            self.cfg.use_standardization
+            or self.cfg.use_min_max_normalization
+            or self.cfg.norm_obs
+        )
+
+    def _saved_replay_exists(self, demo_replay: bool = False) -> bool:
+        replay_dir = self._resolve_replay_save_dir(demo_replay=demo_replay)
+        if replay_dir is None:
+            return False
+        replay_path = Path(replay_dir)
+        return replay_path.exists() and any(replay_path.glob("*.npz"))
+
+    def _should_collect_demos_from_dataset(self) -> bool:
+        if self.use_demo_replay:
+            return True
+        if not bool(self.cfg.replay.reuse_saved):
+            return True
+        if self._requires_demo_stats():
+            return True
+        return not self._saved_replay_exists(demo_replay=False)
 
     def _timer_state_dict(self) -> dict[str, float]:
         return {"elapsed_total": self._timer.total_time()}
@@ -418,14 +480,23 @@ class Workspace:
             torch.cuda.set_rng_state_all(state_dict["torch_cuda"])
 
     def train(self):
+        self._previous_sigint_handler = signal.getsignal(signal.SIGINT)
         signal.signal(signal.SIGINT, self._signal_handler)
-        if not self.train_envs:
+        if self.cfg.num_train_frames > 0 and not self.train_envs:
             raise Exception("Train envs not created! Train can't be called!")
         try:
             self._train()
+        except KeyboardInterrupt:
+            logging.warning("Interrupted by Ctrl+C. Shutting down...")
+            self.shutdown()
+            raise SystemExit(130)
         except Exception as e:
             self.shutdown()
             raise e
+        finally:
+            if self._previous_sigint_handler is not None:
+                signal.signal(signal.SIGINT, self._previous_sigint_handler)
+                self._previous_sigint_handler = None
 
     def _train(self):
         # Load Demo
@@ -591,6 +662,9 @@ class Workspace:
 
     def _eval(self, eval_record_all_episode: bool = False) -> dict[str, Any]:
         # TODO: In future, this func could do with a further refactor
+        self._ensure_eval_envs_created()
+        if self.eval_env is None:
+            raise ValueError("Evaluation requested but no evaluation environment is configured.")
         self.agent.set_eval_env_running(True)
         try:
             if self.eval_envs is not None:
@@ -602,6 +676,8 @@ class Workspace:
             )
         finally:
             self.agent.set_eval_env_running(False)
+            if self._defer_live_eval_env_creation:
+                self._close_eval_envs()
 
     def _add_to_replay(
         self,
@@ -699,11 +775,19 @@ class Workspace:
         self.agent.reset(self.main_loop_iterations, agents_reset)  # clear hidden dim
 
     def _signal_handler(self, sig, frame):
+        del sig, frame
+        self._sigint_count += 1
         print("\nCtrl+C detected. Preparing to shutdown...")
         self._shutting_down = True
+        if self._sigint_count == 1:
+            raise KeyboardInterrupt
+        raise KeyboardInterrupt
 
     def _load_demos(self):
         if self._snapshot_loaded:
+            return
+        if self.replay_buffer.reused_existing and not self.use_demo_replay:
+            logging.info("Reusing saved replay episodes from disk. Skipping demo import.")
             return
         if (num_demos := self.cfg.demos) != 0:
             # NOTE: Currently we do not protect demos from being evicted from replay
@@ -732,8 +816,9 @@ class Workspace:
         if self.agent.logging:
             start_time = time.time()
         metrics = {}
+        update_slots = self._num_update_slots()
         self.agent.train(True)
-        for i in range(self.train_envs.num_envs):
+        for i in range(update_slots):
             if (self.main_loop_iterations + i) % self.cfg.update_every_steps != 0:
                 # Skip update
                 continue
@@ -746,10 +831,10 @@ class Workspace:
         if self.agent.logging:
             execution_time_for_update = time.time() - start_time
             metrics["agent_batched_updates_per_second"] = (
-                self.train_envs.num_envs / execution_time_for_update
+                update_slots / execution_time_for_update
             )
             metrics["agent_updates_per_second"] = (
-                self.train_envs.num_envs * self.cfg.batch_size
+                update_slots * self.cfg.batch_size
             ) / execution_time_for_update
         return metrics
 
@@ -759,32 +844,48 @@ class Workspace:
         if self.agent.logging:
             start_time = time.time()
         env_batch_size = env.num_envs if getattr(env, "is_vector_env", False) else 1
-        with torch.no_grad(), utils.eval_mode(self.agent):
-            torch_observations = {
-                k: torch.from_numpy(v).to(self.device) for k, v in observations.items()
-            }
+        metrics = {}
+        if self.using_torch_backend:
+            with torch.no_grad(), utils.eval_mode(self.agent):
+                backend_observations = {
+                    k: torch.from_numpy(v).to(self.device, non_blocking=True)
+                    for k, v in observations.items()
+                }
+                if eval_mode and not getattr(env, "is_vector_env", False):
+                    backend_observations = {
+                        k: v.unsqueeze(0) for k, v in backend_observations.items()
+                    }
+                action = self.agent.act(
+                    backend_observations, self.main_loop_iterations, eval_mode=eval_mode
+                )
+                # Below is testing a feature which can be enforced in v6.
+                # The ability will allow agent info to be passed to environments.
+                # This will be handy for rendering any auxiliary outputs.
+                if isinstance(action, tuple):
+                    action, act_info = action
+                    metrics["agent_act_info"] = act_info
+                action = action.cpu().detach().numpy()
+        else:
+            backend_observations = observations
             if eval_mode and not getattr(env, "is_vector_env", False):
-                torch_observations = {
-                    k: v.unsqueeze(0) for k, v in torch_observations.items()
+                backend_observations = {
+                    k: np.expand_dims(v, axis=0) for k, v in observations.items()
                 }
             action = self.agent.act(
-                torch_observations, self.main_loop_iterations, eval_mode=eval_mode
+                backend_observations, self.main_loop_iterations, eval_mode=eval_mode
             )
-            metrics = {}
-            # Below is testing a feature which can be enforced in v6.
-            # The ability will allow agent info to be passed to environments.
-            # This will be handy for rendering any auxiliary outputs.
             if isinstance(action, tuple):
                 action, act_info = action
                 metrics["agent_act_info"] = act_info
-            action = action.cpu().detach().numpy()
-            if action.ndim != 3:
-                raise ValueError(
-                    "Expected actions from `agent.act` to have shape "
-                    "(Batch, Timesteps, Action Dim)."
-                )
-            if eval_mode and not getattr(env, "is_vector_env", False):
-                action = action[0]  # we expect batch of 1 for eval
+            action = np.asarray(action)
+
+        if action.ndim != 3:
+            raise ValueError(
+                "Expected actions from `agent.act` to have shape "
+                "(Batch, Timesteps, Action Dim)."
+            )
+        if eval_mode and not getattr(env, "is_vector_env", False):
+            action = action[0]  # we expect batch of 1 for eval
 
         if self.agent.logging:
             execution_time_for_act = time.time() - start_time
@@ -828,6 +929,8 @@ class Workspace:
                 )
 
             while pre_train_until_step(self.pretrain_steps):
+                if self._shutting_down:
+                    break
                 self.agent.logging = False
 
                 if should_pretrain_log(self.pretrain_steps):
@@ -859,6 +962,8 @@ class Workspace:
                 self._pretrain_step += 1
 
     def _online_rl(self):
+        if self.train_envs is None or self.cfg.num_train_frames <= 0:
+            return
         train_until_frame = utils.Until(self.cfg.num_train_frames)
         seed_until_size = utils.Until(self.cfg.replay_size_before_train)
         should_log = utils.Every(self.cfg.log_every)
@@ -970,16 +1075,50 @@ class Workspace:
         return metrics
 
     def shutdown(self):
-        if self.eval_envs is not None:
-            self.eval_envs.close()
-        if self.eval_env:
-            self.eval_env.close()
+        self._close_replay_iter()
+        self._close_eval_envs()
 
         if self.train_envs is not None:
             self.train_envs.close()
         self.replay_buffer.shutdown()
         if self.use_demo_replay:
             self.demo_replay_buffer.shutdown()
+
+    def _should_create_train_env(self) -> bool:
+        return (
+            bool(self.cfg.create_train_env)
+            and self.cfg.num_train_envs > 0
+            and self.cfg.num_train_frames > 0
+        )
+
+    def _should_defer_live_eval_env_creation(self) -> bool:
+        return (
+            self.cfg.num_eval_episodes > 0
+            and self.cfg.num_train_frames == 0
+            and getattr(self.cfg.env, "env_name", None) == "robomimic"
+            and bool(getattr(self.cfg.env, "use_live_env", False))
+        )
+
+    def _num_update_slots(self) -> int:
+        if self.train_envs is not None:
+            return self.train_envs.num_envs
+        return max(int(self.cfg.num_train_envs), 1)
+
+    def _ensure_eval_envs_created(self):
+        if self.cfg.num_eval_episodes <= 0:
+            return
+        if self.eval_env is None:
+            self.eval_env = self.env_factory.make_eval_env(self.cfg)
+        if self.cfg.num_eval_envs > 1 and self.eval_envs is None:
+            self.eval_envs = self.env_factory.make_eval_envs(self.cfg)
+
+    def _close_eval_envs(self):
+        if self.eval_envs is not None:
+            self.eval_envs.close()
+            self.eval_envs = None
+        if self.eval_env is not None:
+            self.eval_env.close()
+            self.eval_env = None
 
     def save_snapshot(self, counter_increments: dict[str, int] | None = None):
         keys_to_save = [
@@ -1051,5 +1190,5 @@ class Workspace:
             self._restore_timer_state(timer_state)
         if rng_state is not None:
             self._restore_rng_state(rng_state)
-        self._replay_iter = None
+        self._close_replay_iter()
         self._snapshot_loaded = True

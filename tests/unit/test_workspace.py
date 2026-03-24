@@ -1,4 +1,5 @@
 import json
+import os
 from pathlib import Path
 
 import gymnasium as gym
@@ -8,8 +9,11 @@ import torch
 from hydra import compose, initialize_config_dir
 from hydra.core.global_hydra import GlobalHydra
 from gymnasium import spaces
+from omegaconf import OmegaConf
 
 from robobase.envs.env import EnvFactory
+from robobase.envs.robomimic import RobomimicEnvFactory
+from robobase.gpu import apply_requested_gpu
 from robobase.workspace import Workspace
 
 h5py = pytest.importorskip("h5py")
@@ -127,6 +131,239 @@ def test_robomimic_pretrain_eval_uses_vector_eval_envs(tmp_path):
     assert set(recorded_eval_batch_sizes) == {4}
 
 
+@pytest.mark.parametrize(
+    ("backend_override", "expected_type"),
+    [
+        ("backend=torch", torch.Tensor),
+        ("backend=jax", np.ndarray),
+    ],
+)
+def test_replay_iter_batch_type_matches_backend(
+    tmp_path, backend_override, expected_type
+):
+    backend_name = backend_override.split("=")[-1]
+    dataset_path = tmp_path / f"robomimic_replay_backend_{backend_name}.hdf5"
+    _write_robomimic_dataset(dataset_path)
+
+    if backend_override == "backend=jax":
+        pytest.importorskip("jax")
+        pytest.importorskip("optax")
+
+    GlobalHydra.instance().clear()
+    with initialize_config_dir(
+        version_base=None,
+        config_dir=str(Path(__file__).resolve().parents[2] / "robobase/cfgs"),
+        job_name="test_replay_iter_backend_type",
+    ):
+        cfg = compose(
+            config_name="robobase_config",
+            overrides=[
+                backend_override,
+                "method=bc",
+                "env=robomimic",
+                "pixels=false",
+                "demos=1",
+                f"env.dataset_path={dataset_path}",
+                "env.use_live_env=false",
+                "env.filter_key=train",
+                "num_train_envs=1",
+                "num_eval_envs=1",
+                "num_eval_episodes=0",
+                "num_pretrain_steps=0",
+                "num_train_frames=0",
+                "replay_size_before_train=0",
+                "num_gpus=0",
+                "batch_size=2",
+                "replay.size=128",
+                "replay.nstep=1",
+                "replay.num_workers=0",
+                "replay.pin_memory=false",
+                "log_eval_video=false",
+                "save_snapshot=false",
+                "wandb.use=false",
+            ],
+        )
+
+    workspace = Workspace(cfg, work_dir=tmp_path)
+    try:
+        workspace._load_demos()
+        batch = next(workspace.replay_iter)
+    finally:
+        workspace.shutdown()
+        GlobalHydra.instance().clear()
+
+    assert isinstance(batch["action"], expected_type)
+
+
+def test_jax_replay_iter_supports_prefetch_workers(tmp_path):
+    pytest.importorskip("jax")
+    pytest.importorskip("optax")
+
+    dataset_path = tmp_path / "robomimic_replay_backend_jax_prefetch.hdf5"
+    _write_robomimic_dataset(dataset_path)
+
+    GlobalHydra.instance().clear()
+    with initialize_config_dir(
+        version_base=None,
+        config_dir=str(Path(__file__).resolve().parents[2] / "robobase/cfgs"),
+        job_name="test_jax_replay_prefetch",
+    ):
+        cfg = compose(
+            config_name="robobase_config",
+            overrides=[
+                "backend=jax",
+                "method=bc",
+                "env=robomimic",
+                "pixels=false",
+                "demos=1",
+                f"env.dataset_path={dataset_path}",
+                "env.use_live_env=false",
+                "env.filter_key=train",
+                "num_train_envs=1",
+                "num_eval_envs=1",
+                "num_eval_episodes=0",
+                "num_pretrain_steps=0",
+                "num_train_frames=0",
+                "replay_size_before_train=0",
+                "num_gpus=0",
+                "batch_size=2",
+                "replay.size=128",
+                "replay.nstep=1",
+                "replay.num_workers=2",
+                "replay.pin_memory=false",
+                "log_eval_video=false",
+                "save_snapshot=false",
+                "wandb.use=false",
+            ],
+        )
+
+    workspace = Workspace(cfg, work_dir=tmp_path)
+    try:
+        workspace._load_demos()
+        batch = next(workspace.replay_iter)
+    finally:
+        workspace.shutdown()
+        GlobalHydra.instance().clear()
+
+    assert workspace.replay_num_workers == 2
+    assert isinstance(batch["action"], np.ndarray)
+
+
+class _CountingRobomimicFactory(RobomimicEnvFactory):
+    def __init__(self):
+        super().__init__()
+        self.collect_calls = 0
+        self.post_collect_calls = 0
+
+    def collect_or_fetch_demos(self, cfg, num_demos):
+        self.collect_calls += 1
+        return super().collect_or_fetch_demos(cfg, num_demos)
+
+    def post_collect_or_fetch_demos(self, cfg):
+        self.post_collect_calls += 1
+        return super().post_collect_or_fetch_demos(cfg)
+
+
+def test_apply_requested_gpu_sets_training_and_render_gpu(monkeypatch):
+    monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
+    monkeypatch.delenv("JAX_CUDA_VISIBLE_DEVICES", raising=False)
+    monkeypatch.delenv("MUJOCO_EGL_DEVICE_ID", raising=False)
+
+    cfg = OmegaConf.create(
+        {
+            "gpu_id": 4,
+            "num_gpus": 8,
+            "env": {"render_gpu_device_id": -1},
+        }
+    )
+
+    apply_requested_gpu(cfg)
+
+    assert os.environ["CUDA_VISIBLE_DEVICES"] == "4"
+    assert os.environ["JAX_CUDA_VISIBLE_DEVICES"] == "4"
+    assert os.environ["MUJOCO_EGL_DEVICE_ID"] == "0"
+    assert cfg.num_gpus == 1
+    assert cfg.env.render_gpu_device_id == 0
+
+
+def test_workspace_can_reuse_saved_replay_without_reloading_demos(tmp_path):
+    dataset_path = tmp_path / "robomimic_reuse_cache.hdf5"
+    replay_cache_dir = tmp_path / "replay_cache"
+    _write_robomimic_dataset(dataset_path)
+
+    overrides = [
+        "method=bc",
+        "env=robomimic",
+        "pixels=false",
+        "demos=1",
+        f"env.dataset_path={dataset_path}",
+        "env.use_live_env=false",
+        "env.filter_key=train",
+        "num_train_envs=1",
+        "num_eval_envs=1",
+        "num_eval_episodes=0",
+        "num_pretrain_steps=0",
+        "num_train_frames=0",
+        "replay_size_before_train=0",
+        "num_gpus=0",
+        "batch_size=2",
+        "replay.size=128",
+        "replay.nstep=1",
+        "replay.num_workers=0",
+        "replay.pin_memory=false",
+        f"replay.save_dir={replay_cache_dir}",
+        "replay.persist=true",
+        "log_eval_video=false",
+        "save_snapshot=false",
+        "wandb.use=false",
+    ]
+
+    config_dir = str(Path(__file__).resolve().parents[2] / "robobase/cfgs")
+
+    GlobalHydra.instance().clear()
+    with initialize_config_dir(
+        version_base=None,
+        config_dir=config_dir,
+        job_name="test_replay_cache_seed",
+    ):
+        cfg = compose(config_name="robobase_config", overrides=overrides)
+    seed_factory = _CountingRobomimicFactory()
+    workspace = Workspace(cfg, env_factory=seed_factory, work_dir=tmp_path / "seed")
+    try:
+        workspace._load_demos()
+        assert len(list(replay_cache_dir.glob("*.npz"))) > 0
+    finally:
+        workspace.shutdown()
+        GlobalHydra.instance().clear()
+
+    GlobalHydra.instance().clear()
+    with initialize_config_dir(
+        version_base=None,
+        config_dir=config_dir,
+        job_name="test_replay_cache_reuse",
+    ):
+        reuse_cfg = compose(
+            config_name="robobase_config",
+            overrides=overrides + ["replay.reuse_saved=true"],
+        )
+    reuse_factory = _CountingRobomimicFactory()
+    reuse_workspace = Workspace(
+        reuse_cfg,
+        env_factory=reuse_factory,
+        work_dir=tmp_path / "reuse",
+    )
+    try:
+        assert reuse_factory.collect_calls == 0
+        assert reuse_factory.post_collect_calls == 0
+        assert reuse_workspace.replay_buffer.reused_existing
+        existing_size = len(reuse_workspace.replay_buffer)
+        reuse_workspace._load_demos()
+        assert len(reuse_workspace.replay_buffer) == existing_size
+    finally:
+        reuse_workspace.shutdown()
+        GlobalHydra.instance().clear()
+
+
 class _TinyEvalEnv(gym.Env):
     def __init__(self, episode_len: int = 2):
         super().__init__()
@@ -225,6 +462,107 @@ class _TinyTrainAndEvalFactory(EnvFactory):
         return gym.vector.SyncVectorEnv(
             [lambda: _TinyEvalEnv() for _ in range(cfg.num_eval_envs)]
         )
+
+
+class _CountingEvalFactory(EnvFactory):
+    def __init__(self):
+        self.train_env_calls = 0
+        self.eval_env_calls = 0
+        self.eval_envs_calls = 0
+        self._observation_space = spaces.Dict(
+            {
+                "low_dim_state": spaces.Box(
+                    low=-1.0,
+                    high=1.0,
+                    shape=(1, 4),
+                    dtype=np.float32,
+                )
+            }
+        )
+        self._action_space = spaces.Box(
+            low=-1.0,
+            high=1.0,
+            shape=(1, 2),
+            dtype=np.float32,
+        )
+
+    def get_spaces(self, cfg):
+        del cfg
+        return self._observation_space, self._action_space
+
+    def make_train_env(self, cfg):
+        del cfg
+        self.train_env_calls += 1
+        raise AssertionError("train env should not be created for pure offline BC")
+
+    def make_eval_env(self, cfg):
+        del cfg
+        self.eval_env_calls += 1
+        return _TinyEvalEnv()
+
+    def make_eval_envs(self, cfg):
+        self.eval_envs_calls += 1
+        return gym.vector.SyncVectorEnv(
+            [lambda: _TinyEvalEnv() for _ in range(cfg.num_eval_envs)]
+        )
+
+
+def test_pure_offline_bc_defers_live_eval_env_creation(tmp_path):
+    GlobalHydra.instance().clear()
+    with initialize_config_dir(
+        version_base=None,
+        config_dir=str(Path(__file__).resolve().parents[2] / "robobase/cfgs"),
+        job_name="test_offline_bc_deferred_eval_envs",
+    ):
+        cfg = compose(
+            config_name="robobase_config",
+            overrides=[
+                "method=bc",
+                "env=robomimic",
+                "pixels=true",
+                "demos=0",
+                "num_train_envs=1",
+                "num_eval_envs=2",
+                "num_eval_episodes=2",
+                "num_pretrain_steps=0",
+                "num_train_frames=0",
+                "replay_size_before_train=0",
+                "num_gpus=0",
+                "batch_size=2",
+                "replay.size=16",
+                "replay.nstep=1",
+                "replay.num_workers=0",
+                "replay.pin_memory=false",
+                "action_sequence=1",
+                "execution_length=1",
+                "method.adaptive_lr=false",
+                "env.use_live_env=true",
+                "log_eval_video=false",
+                "save_snapshot=false",
+                "wandb.use=false",
+            ],
+        )
+
+    env_factory = _CountingEvalFactory()
+    workspace = Workspace(cfg, env_factory=env_factory, work_dir=tmp_path)
+    try:
+        assert workspace.train_envs is None
+        assert workspace.eval_env is None
+        assert workspace.eval_envs is None
+        assert env_factory.train_env_calls == 0
+        assert env_factory.eval_env_calls == 0
+        assert env_factory.eval_envs_calls == 0
+
+        metrics = workspace.eval()
+
+        assert metrics["episode_success"] == 1.0
+        assert env_factory.eval_env_calls == 1
+        assert env_factory.eval_envs_calls == 1
+        assert workspace.eval_env is None
+        assert workspace.eval_envs is None
+    finally:
+        workspace.shutdown()
+        GlobalHydra.instance().clear()
 
 
 def test_generic_env_factory_can_use_vector_eval_envs(tmp_path):
