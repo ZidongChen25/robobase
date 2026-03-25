@@ -9,13 +9,13 @@ off-policy corrections.
 
 from __future__ import annotations
 import io
+import multiprocessing as mp
 import os
 import tempfile
 from datetime import datetime
 from pathlib import Path
 from typing import Callable, Type
 import math
-from multiprocessing import Value
 from collections import defaultdict
 import logging
 from typing_extensions import override
@@ -132,6 +132,7 @@ class UniformReplayBuffer(ReplayBuffer):
         fetch_every: int = 100,
         sequential: bool = False,
         transition_seq_len: int = 1,
+        multiprocessing_context: str = "fork",
     ):
         """Initializes OutOfGraphReplayBuffer.
 
@@ -234,7 +235,8 @@ class UniformReplayBuffer(ReplayBuffer):
         self.extra_replay_elements = extra_replay_elements
 
         self._storage_signature, self._obs_signature = self.get_storage_signature()
-        self._add_count = Value("i", 0)
+        self._multiprocessing_context = multiprocessing_context
+        self._add_count = mp.get_context(multiprocessing_context).Value("i", 0)
         self._replay_capacity = replay_capacity
 
         self._preprocessing_fn = preprocessing_fn
@@ -413,6 +415,7 @@ class UniformReplayBuffer(ReplayBuffer):
         # Info and observation are stored key by key
         transition.update(kwargs)
         transition.update(observation)
+        transition = self._apply_preprocessing(transition)
 
         # Check transition shape is correct
         self._check_add_types(transition, self._storage_signature)
@@ -431,6 +434,7 @@ class UniformReplayBuffer(ReplayBuffer):
 
         transition = {}
         transition.update(final_observation)
+        transition = self._apply_preprocessing(transition)
         self._check_add_types(transition, self._obs_signature)
 
         # Construct final transition with values from final_obs and final_info, with
@@ -523,12 +527,15 @@ class UniformReplayBuffer(ReplayBuffer):
         Args:
           transition: All the elements in a transition.
         """
-        if self._preprocessing_fn is not None and not self._preprocess_every_sample:
-            for fn in self._preprocessing_fn:
-                transition = fn([transition])[0]
-
         for name, data in transition.items():
             self._current_episode[name].append(data)
+
+    def _apply_preprocessing(self, transition: dict) -> dict:
+        if self._preprocessing_fn is None or self._preprocess_every_sample:
+            return transition
+        for fn in self._preprocessing_fn:
+            transition = fn([transition])[0]
+        return transition
 
     def _check_add_types(self, transition: dict, signature: dict):
         """Checks if args passed to the add method match those of the storage.

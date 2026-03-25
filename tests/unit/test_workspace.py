@@ -14,6 +14,7 @@ from omegaconf import OmegaConf
 from robobase.envs.env import EnvFactory
 from robobase.envs.robomimic import RobomimicEnvFactory
 from robobase.gpu import apply_requested_gpu
+from robobase.replay_buffer.iterator import MultiProcessReplayBatchIterator
 from robobase.workspace import Workspace
 
 h5py = pytest.importorskip("h5py")
@@ -181,6 +182,11 @@ def test_replay_iter_batch_type_matches_backend(
                 "log_eval_video=false",
                 "save_snapshot=false",
                 "wandb.use=false",
+                *(
+                    ["backend.platform=cpu"]
+                    if backend_override == "backend=jax"
+                    else []
+                ),
             ],
         )
 
@@ -195,7 +201,7 @@ def test_replay_iter_batch_type_matches_backend(
     assert isinstance(batch["action"], expected_type)
 
 
-def test_jax_replay_iter_supports_prefetch_workers(tmp_path):
+def test_jax_replay_iter_supports_multi_process_workers(tmp_path):
     pytest.importorskip("jax")
     pytest.importorskip("optax")
 
@@ -234,18 +240,21 @@ def test_jax_replay_iter_supports_prefetch_workers(tmp_path):
                 "log_eval_video=false",
                 "save_snapshot=false",
                 "wandb.use=false",
+                "backend.platform=cpu",
             ],
         )
 
     workspace = Workspace(cfg, work_dir=tmp_path)
     try:
         workspace._load_demos()
-        batch = next(workspace.replay_iter)
+        replay_iter = workspace.replay_iter
+        batch = next(replay_iter)
     finally:
         workspace.shutdown()
         GlobalHydra.instance().clear()
 
     assert workspace.replay_num_workers == 2
+    assert isinstance(replay_iter, MultiProcessReplayBatchIterator)
     assert isinstance(batch["action"], np.ndarray)
 
 

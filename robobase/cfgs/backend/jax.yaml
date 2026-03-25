@@ -4,3 +4,4 @@ backend:
   name: jax
   platform: cuda
   jit: true
+  suppress_cpp_logs: true

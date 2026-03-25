@@ -4,6 +4,7 @@ import hydra
 from omegaconf import DictConfig, open_dict
 
 from robobase.method.bc import BCSpec
+from robobase.method.diffusion import DiffusionSpec
 
 
 def _instantiate_method_cfg(
@@ -39,14 +40,16 @@ def create_torch_agent(
     device,
     common_kwargs: dict,
 ):
-    if method_name != "bc":
+    if method_name not in {"bc", "diffusion"}:
         return _instantiate_method_cfg(
             cfg.method,
             device=device,
             common_kwargs=common_kwargs,
         )
 
-    raise AssertionError("BC should be created through the shared BC backend path.")
+    raise AssertionError(
+        f"{method_name.upper()} should be created through the shared backend path."
+    )
 
 
 def create_torch_bc_agent(
@@ -67,3 +70,23 @@ def create_torch_bc_agent(
         device=device,
         **common_kwargs,
     )
+
+
+def create_torch_diffusion_agent(
+    cfg: DictConfig,
+    *,
+    spec: DiffusionSpec,
+    device,
+    common_kwargs: dict,
+):
+    from robobase.backends.torch.method.diffusion import Diffusion
+
+    return Diffusion(
+        lr=spec.lr,
+        adaptive_lr=spec.adaptive_lr,
+        num_train_steps=spec.num_train_steps,
+        actor_grad_clip=spec.actor_grad_clip,
+        num_diffusion_iters=spec.num_diffusion_iters,
+        use_ema=spec.use_ema,
+        model=spec.model,
+        device=device,

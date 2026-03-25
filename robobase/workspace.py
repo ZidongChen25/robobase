@@ -24,6 +24,9 @@ from robobase.replay_buffer.iterator import (
 from robobase.replay_buffer.prioritized_replay_buffer import PrioritizedReplayBuffer
 from robobase.replay_buffer.replay_buffer import ReplayBuffer
 from robobase.replay_buffer.uniform_replay_buffer import UniformReplayBuffer
+from robobase.replay_buffer.vision_feature_cache import (
+    build_vision_feature_cache_plan,
+)
 
 
 from pathlib import Path
@@ -72,6 +75,24 @@ def _create_default_replay_buffer(
     save_snapshot: bool = False,
     reuse_saved: bool = False,
 ) -> ReplayBuffer:
+    multiprocessing_context = (
+        "spawn" if backend_name_from_cfg(cfg) == "jax" else "fork"
+    )
+    cache_plan = build_vision_feature_cache_plan(
+        cfg=cfg,
+        observation_space=observation_space,
+        save_dir=save_dir if save_dir is not None else cfg.replay.save_dir,
+        reuse_saved=bool(reuse_saved),
+    )
+    replay_observation_space = (
+        cache_plan.observation_space if cache_plan is not None else observation_space
+    )
+    if cache_plan is not None:
+        logging.info(
+            "Replay image-feature cache enabled with keys=%s (feature_dim=%d).",
+            list(cache_plan.feature_keys),
+            cache_plan.feature_dim,
+        )
     extra_replay_elements = spaces.Dict({})
     if cfg.demos != 0:
         extra_replay_elements["demo"] = spaces.Box(0, 1, shape=(), dtype=np.uint8)
@@ -96,10 +117,12 @@ def _create_default_replay_buffer(
         action_dtype=action_space.dtype,
         reward_shape=(),
         reward_dtype=np.float32,
-        observation_elements=observation_space,
+        observation_elements=replay_observation_space,
         extra_replay_elements=extra_replay_elements,
+        preprocessing_fn=None if cache_plan is None else cache_plan.preprocessing_fn,
         num_workers=cfg.replay.num_workers,
         sequential=cfg.replay.sequential,
+        multiprocessing_context=multiprocessing_context,
     )
 
 

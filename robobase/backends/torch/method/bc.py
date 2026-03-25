@@ -23,11 +23,12 @@ from robobase.method.core import Method
 from diffusers.optimization import get_scheduler
 
 from robobase.replay_buffer.replay_buffer import ReplayBuffer
+from robobase.replay_buffer.vision_feature_cache import (
+    cached_feature_observation_key,
+)
 from robobase.method.utils import (
     extract_from_spec,
-    extract_many_from_spec,
     extract_from_batch,
-    extract_many_from_batch,
     flatten_time_dim_into_channel_dim,
     stack_tensor_dictionary,
     loss_weights,
@@ -102,6 +103,9 @@ class BC(Method):
         self.time_dim = self.obs_layout.time_dim
         self.use_pixels = self.obs_layout.use_pixels
         self.use_multicam_fusion = self.obs_layout.use_multicam_fusion
+        self._cached_pixel_feature_key = (
+            cached_feature_observation_key("bc", "torch") if self.use_pixels else None
+        )
         self.actor = self.encoder = self.view_fusion = None
         self.build_encoder()
         self.build_view_fusion()
@@ -233,8 +237,7 @@ class BC(Method):
         return low_dim_obs, next_low_dim_obs
 
     def extract_pixels(self, batch: dict[str, torch.Tensor]):
-        # dict of {"cam_name": (B, V, T, 3, H, W)}
-        rgb_obs_dict = extract_many_from_batch(batch, r"rgb(?!.*?tp1)")
+        rgb_obs_dict = {key: batch[key] for key in self.obs_layout.rgb_keys}
         # Convert to tensor of (B, VIEWS, ENC_DIM)
         rgb_obs = flatten_time_dim_into_channel_dim(
             stack_tensor_dictionary(rgb_obs_dict, 1),
@@ -246,10 +249,28 @@ class BC(Method):
             for k, v in rgb_obs_dict.items():
                 metrics[k] = v[0, -1]
         next_rgb_obs = flatten_time_dim_into_channel_dim(
-            stack_tensor_dictionary(extract_many_from_batch(batch, r"rgb.*tp1"), 1),
+            stack_tensor_dictionary(
+                {f"{key}_tp1": batch[f"{key}_tp1"] for key in self.obs_layout.rgb_keys},
+                1,
+            ),
             has_view_axis=True,
         )
         return rgb_obs, next_rgb_obs, metrics
+
+    def _has_cached_pixel_features(self, batch_or_obs: dict[str, torch.Tensor]) -> bool:
+        return (
+            self._cached_pixel_feature_key is not None
+            and self._cached_pixel_feature_key in batch_or_obs
+        )
+
+    def _extract_cached_pixel_features(
+        self, batch_or_obs: dict[str, torch.Tensor]
+    ) -> torch.Tensor | None:
+        if not self._has_cached_pixel_features(batch_or_obs):
+            return None
+        return flatten_time_dim_into_channel_dim(
+            batch_or_obs[self._cached_pixel_feature_key]
+        ).float()
 
     def update_actor(
         self,
@@ -258,6 +279,7 @@ class BC(Method):
         action,
         loss_coeff,
         action_pad_mask: torch.Tensor | None = None,
+        used_cached_pixel_features: bool = False,
     ):
         metrics = dict()
         action_pred = self.actor(low_dim_obs, fused_view_feats)
@@ -269,7 +291,7 @@ class BC(Method):
         self._new_priority = (new_pri / torch.max(new_pri)).cpu().detach().numpy()
 
         # calculate gradient
-        if self.use_pixels and self.encoder_opt is not None:
+        if self.use_pixels and self.encoder_opt is not None and not used_cached_pixel_features:
             self.encoder_opt.zero_grad(set_to_none=True)
             if self.use_multicam_fusion and self.view_fusion_opt is not None:
                 self.view_fusion_opt.zero_grad(set_to_none=True)
@@ -280,7 +302,7 @@ class BC(Method):
         if self.actor_grad_clip:
             nn.utils.clip_grad_norm_(self.actor.parameters(), self.actor_grad_clip)
         self.actor_opt.step()
-        if self.use_pixels and self.encoder is not None:
+        if self.use_pixels and self.encoder is not None and not used_cached_pixel_features:
             self.encoder_opt.step()
             if self.use_multicam_fusion and self.view_fusion_opt is not None:
                 self.view_fusion_opt.step()
@@ -355,15 +377,17 @@ class BC(Method):
                 extract_from_spec(observations, "low_dim_state")
             )
         if self.use_pixels:
-            rgb_obs = flatten_time_dim_into_channel_dim(
-                stack_tensor_dictionary(
-                    extract_many_from_spec(observations, r"rgb.*"), 1
-                ),
-                has_view_axis=True,
-            )
-            with torch.no_grad():
-                multi_view_rgb_feats = self.encoder(rgb_obs.float())
-                fused_rgb_feats = self.view_fusion(multi_view_rgb_feats)
+            fused_rgb_feats = self._extract_cached_pixel_features(observations)
+            if fused_rgb_feats is None:
+                rgb_obs = flatten_time_dim_into_channel_dim(
+                    stack_tensor_dictionary(
+                        {key: observations[key] for key in self.obs_layout.rgb_keys}, 1
+                    ),
+                    has_view_axis=True,
+                )
+                with torch.no_grad():
+                    multi_view_rgb_feats = self.encoder(rgb_obs.float())
+                    fused_rgb_feats = self.view_fusion(multi_view_rgb_feats)
         actions = self.actor(low_dim_obs, fused_rgb_feats)
         return actions.detach()
 
@@ -379,7 +403,16 @@ class BC(Method):
     ) -> dict[str, np.ndarray]:
         metrics = dict()
         batch = next(replay_iter)
-        batch = {k: v.to(self.device, non_blocking=True) for k, v in batch.items()}
+        cached_pixel_features = self.use_pixels and self._has_cached_pixel_features(batch)
+        keys_to_skip: set[str] = set()
+        if cached_pixel_features:
+            keys_to_skip.update(self.obs_layout.rgb_keys)
+            keys_to_skip.update(f"{key}_tp1" for key in self.obs_layout.rgb_keys)
+        batch = {
+            k: v.to(self.device, non_blocking=True)
+            for k, v in batch.items()
+            if k not in keys_to_skip
+        }
         action = batch["action"]
         action_pad_mask = extract_from_batch(batch, "action_pad_mask", missing_ok=True)
         loss_coeff = loss_weights(batch, self.replay_beta)
@@ -389,15 +422,17 @@ class BC(Method):
             low_dim_obs, next_low_dim_obs = self.extract_low_dim_state(batch)
 
         if self.use_pixels:
-            rgb_obs, _, ext_metrics = self.extract_pixels(batch)
-            metrics.update(ext_metrics)
-            enc_metrics, rgb_feats = self.encode(rgb_obs)
-            metrics.update(enc_metrics)
-            (
-                fusion_metrics,
-                fused_view_feats,
-            ) = self.multi_view_fusion(rgb_obs, rgb_feats)
-            metrics.update(fusion_metrics)
+            fused_view_feats = self._extract_cached_pixel_features(batch)
+            if fused_view_feats is None:
+                rgb_obs, _, ext_metrics = self.extract_pixels(batch)
+                metrics.update(ext_metrics)
+                enc_metrics, rgb_feats = self.encode(rgb_obs)
+                metrics.update(enc_metrics)
+                (
+                    fusion_metrics,
+                    fused_view_feats,
+                ) = self.multi_view_fusion(rgb_obs, rgb_feats)
+                metrics.update(fusion_metrics)
 
         if fused_view_feats is not None:
             fused_view_feats = fused_view_feats.detach()
@@ -408,6 +443,7 @@ class BC(Method):
                 action,
                 loss_coeff,
                 action_pad_mask=action_pad_mask,
+                used_cached_pixel_features=bool(cached_pixel_features),
             )
         )
 

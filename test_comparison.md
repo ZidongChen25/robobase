@@ -84,6 +84,151 @@ Notes:
 - `save_snapshot=true` and `snapshot_every_n=25000` save checkpoints during training.
 - `hydra.run.dir=...` keeps the run directory short. Without it, Hydra uses the full override string in the output path, which can exceed the filesystem filename limit.
 
+# RoboMimic Diffusion Backend Comparison
+
+Use these four commands to compare offline state-based Diffusion Policy training on
+robomimic `Transport` and `ToolHang` with `backend=torch` and `backend=jax`.
+
+The shared launch config is now `launch=dp_state_robomimic`, and the task comes
+from `env=robomimic/<task>`.
+
+Transport, PyTorch:
+
+```bash
+python train.py \
+  launch=dp_state_robomimic \
+  env=robomimic/transport \
+  backend=torch \
+  gpu_id=0 \
+  env.dataset_path=/home/zc1525/robobase/third_party_datasets/robomimic/transport/ph/low_dim_v141.hdf5 \
+  num_pretrain_steps=200000 \
+  num_train_envs=1 \
+  num_eval_envs=10 \
+  num_eval_episodes=50 \
+  batch_size=256 \
+  action_sequence=16 \
+  execution_length=8 \
+  eval_every_steps=25000 \
+  log_pretrain_every=100 \
+  env.use_live_env=true \
+  replay.num_workers=4 \
+  log_eval_video=false \
+  save_snapshot=true \
+  snapshot_every_n=25000 \
+  hydra.run.dir=./exp_local/transport_dp_torch \
+  wandb.use=true \
+  wandb.entity=tsztungchen25-imperial-college-london \
+  wandb.project=robobase_dp_backend_compare \
+  wandb.name=transport_dp_torch
+```
+
+Transport, JAX:
+
+```bash
+PATH=/home/zc1525/robobase/.venv/bin:$PATH python train.py \
+  launch=dp_state_robomimic \
+  env=robomimic/transport \
+  backend=jax \
+  gpu_id=1 \
+  env.dataset_path=/home/zc1525/robobase/third_party_datasets/robomimic/transport/ph/low_dim_v141.hdf5 \
+  num_pretrain_steps=200000 \
+  num_train_envs=1 \
+  num_eval_envs=10 \
+  num_eval_episodes=50 \
+  batch_size=256 \
+  action_sequence=16 \
+  execution_length=8 \
+  eval_every_steps=25000 \
+  log_pretrain_every=100 \
+  env.use_live_env=true \
+  replay.num_workers=4 \
+  log_eval_video=false \
+  save_snapshot=true \
+  snapshot_every_n=25000 \
+  hydra.run.dir=./exp_local/transport_dp_jax \
+  wandb.use=true \
+  wandb.entity=tsztungchen25-imperial-college-london \
+  wandb.project=robobase_dp_backend_compare \
+  wandb.name=transport_dp_jax
+```
+
+ToolHang, PyTorch:
+
+```bash
+PATH=/home/zc1525/robobase/.venv/bin:$PATH python train.py \
+  launch=dp_state_robomimic \
+  env=robomimic/tool_hang \
+  backend=torch \
+  gpu_id=0 \
+  env.dataset_path=/home/zc1525/robobase/third_party_datasets/robomimic/tool_hang/ph/low_dim_v141.hdf5 \
+  num_pretrain_steps=200000 \
+  num_train_envs=1 \
+  num_eval_envs=10 \
+  num_eval_episodes=50 \
+  batch_size=256 \
+  action_sequence=16 \
+  execution_length=8 \
+  eval_every_steps=25000 \
+  log_pretrain_every=100 \
+  env.use_live_env=true \
+  replay.num_workers=4 \
+  log_eval_video=false \
+  save_snapshot=true \
+  snapshot_every_n=25000 \
+  hydra.run.dir=./exp_local/toolhang_dp_torch \
+  wandb.use=true \
+  wandb.entity=tsztungchen25-imperial-college-london \
+  wandb.project=robobase_dp_backend_compare \
+  wandb.name=toolhang_dp_torch
+```
+
+ToolHang, JAX:
+
+```bash
+PATH=/home/zc1525/robobase/.venv/bin:$PATH python train.py \
+  launch=dp_state_robomimic \
+  env=robomimic/tool_hang \
+  backend=jax \
+  gpu_id=1 \
+  env.dataset_path=/home/zc1525/robobase/third_party_datasets/robomimic/tool_hang/ph/low_dim_v141.hdf5 \
+  num_pretrain_steps=200000 \
+  num_train_envs=1 \
+  num_eval_envs=10 \
+  num_eval_episodes=50 \
+  batch_size=256 \
+  action_sequence=16 \
+  execution_length=8 \
+  eval_every_steps=25000 \
+  log_pretrain_every=100 \
+  env.use_live_env=true \
+  replay.num_workers=0 \
+  log_eval_video=false \
+  save_snapshot=true \
+  snapshot_every_n=25000 \
+  hydra.run.dir=./exp_local/toolhang_dp_jax \
+  wandb.use=true \
+  wandb.entity=tsztungchen25-imperial-college-london \
+  wandb.project=robobase_dp_backend_compare \
+  wandb.name=toolhang_dp_jax
+```
+
+Metrics to compare in W&B:
+
+- training update speed: `pretrain/agent_batched_updates_per_second`
+- training sample throughput: `pretrain/agent_updates_per_second`
+- evaluation policy speed: `pretrain_eval/agent_act_steps_per_second`
+- evaluation env speed: `pretrain_eval/env_steps_per_second`
+- final eval result: `pretrain_eval/episode_reward`
+- final eval success: `pretrain_eval/episode_success`
+- training loss: `pretrain/actor_loss`
+
+Notes:
+
+- On this machine, the robomimic low-dimensional datasets live under `/home/zc1525/robobase/third_party_datasets/...`, so the commands above override `env.dataset_path` explicitly.
+- If the current repo later gains its own `third_party_datasets/robomimic/...` tree, that override can be removed.
+- `launch=dp_state_robomimic` keeps the algorithm defaults in one place and decouples the task from the backend implementation.
+- The short local smoke runs used during implementation only verified that both backends can load the real robomimic datasets and complete a couple of offline pretrain updates; they are not the final speed or quality comparison.
+
 # ToolHang Image Offline JAX Replay Comparison
 
 Use these two commands to compare real image-based offline BC training for robomimic `ToolHang`
@@ -97,22 +242,22 @@ PATH=/home/zc1525/robobase/.venv/bin:$PATH python train.py \
   launch=bc_pixel_robomimic \
   env=robomimic/tool_hang \
   backend=jax \
-  gpu_id=0 \
+  gpu_id=1 \
   pixels=true \
   env.dataset_path=third_party_datasets/robomimic/tool_hang/ph/image_v141.hdf5 \
   num_pretrain_steps=100000 \
   num_train_envs=1 \
-  num_eval_envs=10 \
+  num_eval_envs=50 \
   num_eval_episodes=50 \
   action_sequence=16 \
-  execution_length=1 \
+  execution_length=8 \
   eval_every_steps=25000 \
   log_pretrain_every=100 \
   env.use_live_env=true \
   replay.save_dir=/home/zc1525/robobase_backend/exp_local/toolhang_image_bc_jax_w0/replay \
   replay.persist=true \
   replay.reuse_saved=true \
-  replay.num_workers=0 \
+  replay.num_workers=4 \
   log_eval_video=false \
   save_snapshot=true \
   snapshot_every_n=25000 \
@@ -130,7 +275,7 @@ PATH=/home/zc1525/robobase/.venv/bin:$PATH python train.py \
   launch=bc_pixel_robomimic \
   env=robomimic/tool_hang \
   backend=jax \
-  gpu_id=1 \
+  gpu_id=2 \
   pixels=true \
   env.dataset_path=third_party_datasets/robomimic/tool_hang/ph/image_v141.hdf5 \
   num_pretrain_steps=200000 \

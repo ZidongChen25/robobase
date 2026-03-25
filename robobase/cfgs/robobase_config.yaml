@@ -59,6 +59,8 @@ replay:
   nstep: 3
   num_workers: 4
   pin_memory: true
+  cache_frozen_image_features: auto
+  cache_frozen_image_feature_backends: [torch, jax]
   alpha: 0.7  # prioritization
   beta: 0.5  # prioritization
   sequential: false

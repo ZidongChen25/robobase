@@ -85,11 +85,12 @@ class MultiProcessReplayBatchIterator(ReplayBatchIterator):
         replay_buffer: ReplayBuffer,
         num_workers: int,
         queue_size: int | None = None,
+        start_method: str = "fork",
     ):
         if num_workers < 1:
             raise ValueError("num_workers must be >= 1 for multi-process replay.")
 
-        ctx = mp.get_context("fork")
+        ctx = mp.get_context(start_method)
         self._queue = ctx.Queue(maxsize=queue_size or max(2, num_workers * 2))
         self._stop_event = ctx.Event()
         self._workers = []
@@ -226,11 +227,15 @@ class PrefetchReplayBatchIterator(ReplayBatchIterator):
 
 
 def create_numpy_replay_iterator(
-    replay_buffer: ReplayBuffer, *, num_workers: int
+    replay_buffer: ReplayBuffer, *, num_workers: int, start_method: str = "fork"
 ) -> ReplayBatchIterator:
     if num_workers <= 0:
         return SingleProcessReplayBatchIterator(replay_buffer)
-    return MultiProcessReplayBatchIterator(replay_buffer, num_workers=num_workers)
+    return MultiProcessReplayBatchIterator(
+        replay_buffer,
+        num_workers=num_workers,
+        start_method=start_method,
+    )
 
 
 def create_torch_replay_iterator(
@@ -240,7 +245,11 @@ def create_torch_replay_iterator(
     pin_memory: bool,
 ) -> ReplayBatchIterator:
     return TorchReplayBatchIterator(
-        create_numpy_replay_iterator(replay_buffer, num_workers=num_workers),
+        create_numpy_replay_iterator(
+            replay_buffer,
+            num_workers=num_workers,
+            start_method="fork",
+        ),
         pin_memory=pin_memory,
     )
 
@@ -250,13 +259,10 @@ def create_jax_replay_iterator(
     *,
     num_workers: int,
 ) -> ReplayBatchIterator:
-    replay_iter = SingleProcessReplayBatchIterator(replay_buffer)
-    if num_workers <= 0:
-        return replay_iter
-    return PrefetchReplayBatchIterator(
-        replay_iter,
-        queue_size=max(2, num_workers * 2),
-        worker_name="jax-prefetch",
+    return create_numpy_replay_iterator(
+        replay_buffer,
+        num_workers=num_workers,
+        start_method="spawn",
     )
 
 

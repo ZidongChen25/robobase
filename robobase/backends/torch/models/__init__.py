@@ -1,3 +1,9 @@
+from robobase.backends.torch.models.diffusion import (
+    ConditionalUnet1D,
+    MLPWithBottleneckFeaturesForDiffusion,
+    TransformerForDiffusion,
+    replace_bn_with_gn,
+)
 from robobase.backends.torch.models.encoder import (
     DINOv2Encoder,
     EncoderCNNMultiViewDownsampleWithStrides,
@@ -18,6 +24,7 @@ from robobase.backends.torch.models.fusion import (
 )
 
 __all__ = [
+    "ConditionalUnet1D",
     "DINOv2Encoder",
     "EncoderCNNMultiViewDownsampleWithStrides",
     "EncoderModule",
@@ -27,7 +34,10 @@ __all__ = [
     "FusionModule",
     "FusionMultiCamFeature",
     "FusionMultiCamFeatureAttention",
+    "MLPWithBottleneckFeaturesForDiffusion",
     "MLPWithBottleneckFeaturesAndSequenceOutput",
     "R3MEncoder",
     "ResNetEncoder",
+    "TransformerForDiffusion",
+    "replace_bn_with_gn",
 ]
