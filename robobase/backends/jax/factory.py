@@ -68,3 +68,7 @@ def create_jax_diffusion_agent(
         use_ema=spec.use_ema,
         model=spec.model,
         jit=bool(cfg.backend.get("jit", True)),
+        platform=cfg.backend.get("platform", None),
+        seed=int(cfg.seed),
+        **common_kwargs,
+    )
