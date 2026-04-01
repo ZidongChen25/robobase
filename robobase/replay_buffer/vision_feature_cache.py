@@ -10,34 +10,26 @@ from gymnasium import spaces
 from omegaconf import DictConfig
 
 from robobase.method.bc_runtime import bc_observation_layout
-from robobase.method.diffusion import diffusion_model_spec_from_cfg
-from robobase.method.bc import bc_model_spec_from_cfg
 
 
-TORCH_BC_FEATURE_KEY = "vision_features_torch_bc"
-TORCH_DIFFUSION_FEATURE_KEY = "vision_features_torch_diffusion"
 JAX_BC_FEATURE_KEY = "vision_features_jax_bc"
 JAX_DIFFUSION_FEATURE_KEY = "vision_features_jax_diffusion"
-DEFAULT_CACHE_BACKENDS = ("torch", "jax")
+DEFAULT_CACHE_BACKENDS = ("jax",)
 _SUPPORTED_FUSION_MODES = {"flatten", "average", "sum"}
 _SUPPORTED_RESNETS = {"resnet18": 512, "resnet34": 512}
 
 
-def cached_feature_observation_key(method_name: str, backend_name: str) -> str:
+def cached_feature_observation_key(method_name: str, backend_name: str = "jax") -> str:
     method_name = str(method_name).lower()
-    backend_name = str(backend_name).lower()
     mapping = {
-        ("bc", "torch"): TORCH_BC_FEATURE_KEY,
-        ("bc", "jax"): JAX_BC_FEATURE_KEY,
-        ("diffusion", "torch"): TORCH_DIFFUSION_FEATURE_KEY,
-        ("diffusion", "jax"): JAX_DIFFUSION_FEATURE_KEY,
+        "bc": JAX_BC_FEATURE_KEY,
+        "diffusion": JAX_DIFFUSION_FEATURE_KEY,
     }
     try:
-        return mapping[(method_name, backend_name)]
+        return mapping[method_name]
     except KeyError as exc:
         raise ValueError(
-            f"No cached feature observation key for method={method_name!r}, "
-            f"backend={backend_name!r}."
+            f"No cached feature observation key for method={method_name!r}."
         ) from exc
 
 
@@ -85,12 +77,7 @@ class FrozenVisionFeaturePreprocessor:
 
         cached_batches: dict[str, np.ndarray] = {}
         for feature_key in self.feature_keys:
-            if "torch" in feature_key:
-                cached_batches[feature_key] = self._encode_torch(rgb_batch)
-            elif "jax" in feature_key:
-                cached_batches[feature_key] = self._encode_jax(rgb_batch)
-            else:
-                raise ValueError(f"Unsupported cached feature key '{feature_key}'.")
+            cached_batches[feature_key] = self._encode_jax(rgb_batch)
 
         processed = []
         for index, transition in enumerate(transitions):
@@ -115,39 +102,19 @@ class FrozenVisionFeaturePreprocessor:
             return feats.sum(axis=1).astype(np.float32, copy=False)
         raise ValueError(f"Unsupported fusion mode '{self.fusion_mode}'.")
 
-    def _encode_torch(self, rgb_batch: np.ndarray) -> np.ndarray:
-        if self._torch_encoder is None:
-            import torch
-
-            from robobase.backends.torch.models.encoder import ResNetEncoder
-
-            encoder = ResNetEncoder(
-                input_shape=self.input_shape,
-                model=self.encoder_model,
-            )
-            if self.method_name == "diffusion":
-                from robobase.backends.torch.models.diffusion import replace_bn_with_gn
-
-                encoder = replace_bn_with_gn(encoder)
-            encoder.eval()
-            self._torch_encoder = encoder
-        import torch
-
-        with torch.inference_mode():
-            feats = self._torch_encoder(torch.from_numpy(rgb_batch).float())
-        return self._fuse_multi_view(feats.cpu().numpy())
-
     def _encode_jax(self, rgb_batch: np.ndarray) -> np.ndarray:
         if self._jax_encoder is None:
-            from robobase.backends.jax.models.encoder import JaxResNetEncoder
+            import jax
+            from robobase.models.encoder import JaxResNetEncoder
 
             self._jax_encoder = JaxResNetEncoder(
                 input_shape=self.input_shape,
                 model=self.encoder_model,
                 jit=True,
             )
+        import jax
         feats = self._jax_encoder.encode(rgb_batch)
-        return self._fuse_multi_view(np.asarray(self._jax_encoder.jax.device_get(feats)))
+        return self._fuse_multi_view(np.asarray(jax.device_get(feats)))
 
 
 def build_vision_feature_cache_plan(
@@ -200,8 +167,10 @@ def build_vision_feature_cache_plan(
         raise ValueError(message)
 
     if method_name == "bc":
+        from robobase.method.bc import bc_model_spec_from_cfg
         model_spec = bc_model_spec_from_cfg(cfg)
     else:
+        from robobase.method.diffusion import diffusion_model_spec_from_cfg
         model_spec = diffusion_model_spec_from_cfg(cfg)
 
     if model_spec.encoder_model is None or model_spec.encoder_model.type != "resnet":

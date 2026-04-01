@@ -9,14 +9,25 @@ import sys
 from gymnasium.spaces import Box
 from omegaconf import DictConfig
 import numpy as np
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from torch import distributions as pyd
-from torch.distributions.utils import _standard_normal
-from torch.autograd import Variable
 from typing import List, Callable
 from scipy.spatial.transform import Rotation as R
+
+try:
+    import torch
+    import torch.nn as nn
+    import torch.nn.functional as F
+    from torch import distributions as pyd
+    from torch.distributions.utils import _standard_normal
+    from torch.autograd import Variable
+    _TORCH_AVAILABLE = True
+except ImportError:
+    torch = None
+    nn = None
+    F = None
+    pyd = None
+    _standard_normal = None
+    Variable = None
+    _TORCH_AVAILABLE = False
 
 from robobase.envs.env import Demo, DemoEnv
 from robobase.replay_buffer.replay_buffer import ReplayBuffer
@@ -54,9 +65,10 @@ def check_for_kill_input(timeout: int = 0.0001):
 
 
 def set_seed_everywhere(seed):
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
+    if _TORCH_AVAILABLE:
+        torch.manual_seed(seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(seed)
     np.random.seed(seed)
     random.seed(seed)
 
@@ -153,150 +165,140 @@ class Timer:
         return time.time() - self._start_time
 
 
-class TanhTransform(pyd.transforms.Transform):
-    domain = pyd.constraints.real
-    codomain = pyd.constraints.interval(-1.0, 1.0)
-    bijective = True
-    sign = +1
+if _TORCH_AVAILABLE:
+    class TanhTransform(pyd.transforms.Transform):
+        domain = pyd.constraints.real
+        codomain = pyd.constraints.interval(-1.0, 1.0)
+        bijective = True
+        sign = +1
 
-    def __init__(self, cache_size=1):
-        super().__init__(cache_size=cache_size)
+        def __init__(self, cache_size=1):
+            super().__init__(cache_size=cache_size)
 
-    @staticmethod
-    def atanh(x):
-        return 0.5 * (x.log1p() - (-x).log1p())
+        @staticmethod
+        def atanh(x):
+            return 0.5 * (x.log1p() - (-x).log1p())
 
-    def __eq__(self, other):
-        return isinstance(other, TanhTransform)
+        def __eq__(self, other):
+            return isinstance(other, TanhTransform)
 
-    def _call(self, x):
-        return x.tanh()
+        def _call(self, x):
+            return x.tanh()
 
-    def _inverse(self, y):
-        return self.atanh(y)
+        def _inverse(self, y):
+            return self.atanh(y)
 
-    def log_abs_det_jacobian(self, x, y):
-        return 2.0 * (math.log(2.0) - x - F.softplus(-2.0 * x))
+        def log_abs_det_jacobian(self, x, y):
+            return 2.0 * (math.log(2.0) - x - F.softplus(-2.0 * x))
 
+    class SquashedNormal(pyd.transformed_distribution.TransformedDistribution):
+        def __init__(self, loc, scale, low=-1.0, high=1.0):
+            self.loc = loc
+            self.scale = scale
+            self.low = low
+            self.high = high
+            self.base_dist = pyd.Normal(loc, scale)
+            transforms = [TanhTransform()]
+            super().__init__(self.base_dist, transforms)
 
-class SquashedNormal(pyd.transformed_distribution.TransformedDistribution):
-    def __init__(self, loc, scale, low=-1.0, high=1.0):
-        self.loc = loc
-        self.scale = scale
-        self.low = low
-        self.high = high
-        self.base_dist = pyd.Normal(loc, scale)
-        transforms = [TanhTransform()]
-        super().__init__(self.base_dist, transforms)
+        @property
+        def mean(self):
+            mu = self.loc
+            for tr in self.transforms:
+                mu = tr(mu)
+            return mu
 
-    @property
-    def mean(self):
-        mu = self.loc
-        for tr in self.transforms:
-            mu = tr(mu)
-        return mu
+        def _clamp(self, x):
+            return torch.clamp(x, self.low, self.high)
 
-    def _clamp(self, x):
-        return torch.clamp(x, self.low, self.high)
+        def sample(self, clip=None):
+            return self._clamp(super().sample())
 
-    def sample(self, clip=None):
-        return self._clamp(super().sample())
+    class TruncatedNormal(pyd.Normal):
+        def __init__(self, loc, scale, low=-1.0, high=1.0, eps=1e-6):
+            super().__init__(loc, scale, validate_args=False)
+            self.low = low
+            self.high = high
+            self.eps = eps
 
+        def _clamp(self, x):
+            clamped_x = torch.clamp(x, self.low + self.eps, self.high - self.eps)
+            x = x - x.detach() + clamped_x.detach()
+            return x
 
-class TruncatedNormal(pyd.Normal):
-    def __init__(self, loc, scale, low=-1.0, high=1.0, eps=1e-6):
-        super().__init__(loc, scale, validate_args=False)
-        self.low = low
-        self.high = high
-        self.eps = eps
+        def sample(self, clip=None, sample_shape=torch.Size()):
+            shape = self._extended_shape(sample_shape)
+            eps = _standard_normal(shape, dtype=self.loc.dtype, device=self.loc.device)
+            eps *= self.scale
+            if clip is not None:
+                eps = torch.clamp(eps, -clip, clip)
+            x = self.loc + eps
+            return self._clamp(x)
 
-    def _clamp(self, x):
-        clamped_x = torch.clamp(x, self.low + self.eps, self.high - self.eps)
-        x = x - x.detach() + clamped_x.detach()
-        return x
+    def onehot_from_logits(logits, eps=0.0):
+        argmax_acs = (logits == logits.max(1, keepdim=True)[0]).float()
+        if eps == 0.0:
+            return argmax_acs
+        rand_acs = Variable(
+            torch.eye(logits.shape[1])[
+                [np.random.choice(range(logits.shape[1]), size=logits.shape[0])]
+            ],
+            requires_grad=False,
+        )
+        return torch.stack(
+            [
+                argmax_acs[i] if r > eps else rand_acs[i]
+                for i, r in enumerate(torch.rand(logits.shape[0]))
+            ]
+        )
 
-    def sample(self, clip=None, sample_shape=torch.Size()):
-        shape = self._extended_shape(sample_shape)
-        eps = _standard_normal(shape, dtype=self.loc.dtype, device=self.loc.device)
-        eps *= self.scale
-        if clip is not None:
-            eps = torch.clamp(eps, -clip, clip)
-        x = self.loc + eps
-        return self._clamp(x)
+    def sample_gumbel(logits, eps=1e-20, tens_type=torch.FloatTensor):
+        U = Variable(torch.zeros_like(logits).uniform_(), requires_grad=False)
+        return -torch.log(-torch.log(U + eps) + eps)
 
+    def gumbel_softmax_sample(logits, temperature):
+        y = logits + sample_gumbel(logits, tens_type=type(logits.data))
+        return F.softmax(y / temperature, dim=-1)
 
-def onehot_from_logits(logits, eps=0.0):
-    """
-    Given batch of logits, return one-hot sample using epsilon greedy strategy
-    (based on given epsilon)
-    """
-    # get best (according to current policy) actions in one-hot form
-    argmax_acs = (logits == logits.max(1, keepdim=True)[0]).float()
-    if eps == 0.0:
-        return argmax_acs
-    # get random actions in one-hot form
-    rand_acs = Variable(
-        torch.eye(logits.shape[1])[
-            [np.random.choice(range(logits.shape[1]), size=logits.shape[0])]
-        ],
-        requires_grad=False,
-    )
-    # chooses between best and random actions using epsilon greedy
-    return torch.stack(
-        [
-            argmax_acs[i] if r > eps else rand_acs[i]
-            for i, r in enumerate(torch.rand(logits.shape[0]))
-        ]
-    )
+    def gumbel_softmax(logits, temperature=1.0, hard=False):
+        y = gumbel_softmax_sample(logits, temperature)
+        if hard:
+            y_hard = onehot_from_logits(y)
+            y = (y_hard - y).detach() + y
+        return y
 
+    class GumbelSoftmax(pyd.Categorical):
+        @property
+        def mean(self):
+            init_shape = self.logits.shape
+            logits_2d = self.logits.reshape(-1, self._num_events)
+            return onehot_from_logits(logits_2d).view(init_shape)
 
-# modified for PyTorch from https://github.com/ericjang/gumbel-softmax/blob/master/Categorical%20VAE.ipynb
-def sample_gumbel(logits, eps=1e-20, tens_type=torch.FloatTensor):
-    """Sample from Gumbel(0, 1)"""
-    U = Variable(torch.zeros_like(logits).uniform_(), requires_grad=False)
-    return -torch.log(-torch.log(U + eps) + eps)
+        def log_prob(self, value):
+            return (self.logits * value).max(-1)[0]
 
+        def sample(self, temp=1.0, hard=True):
+            init_shape = self.logits.shape
+            logits_2d = self.logits.reshape(-1, self._num_events)
+            return gumbel_softmax(logits_2d, temp, hard=hard).view(init_shape)
 
-# modified for PyTorch from https://github.com/ericjang/gumbel-softmax/blob/master/Categorical%20VAE.ipynb
-def gumbel_softmax_sample(logits, temperature):
-    """Draw a sample from the Gumbel-Softmax distribution"""
-    y = logits + sample_gumbel(logits, tens_type=type(logits.data))
-    return F.softmax(y / temperature, dim=-1)
+    def torch_linspace(start, end, steps=10):
+        assert start.size() == end.size()
+        view_size = start.size() + (1,)
+        w_size = (1,) * start.dim() + (steps,)
+        out_size = start.size() + (steps,)
+        start_w = torch.linspace(1, 0, steps=steps).to(start)
+        start_w = start_w.view(w_size).expand(out_size)
+        end_w = torch.linspace(0, 1, steps=steps).to(start)
+        end_w = end_w.view(w_size).expand(out_size)
+        start = start.contiguous().view(view_size).expand(out_size)
+        end = end.contiguous().view(view_size).expand(out_size)
+        return start_w * start + end_w * end
 
-
-# modified for PyTorch from https://github.com/ericjang/gumbel-softmax/blob/master/Categorical%20VAE.ipynb
-def gumbel_softmax(logits, temperature=1.0, hard=False):
-    """Sample from the Gumbel-Softmax distribution and optionally discretize.
-    Args:
-      logits: [batch_size, n_class] unnormalized log-probs
-      temperature: non-negative scalar
-      hard: if True, take argmax, but differentiate w.r.t. soft sample y
-    Returns:
-      [batch_size, n_class] sample from the Gumbel-Softmax distribution.
-      If hard=True, then the returned sample will be one-hot, otherwise it will
-      be a probabilitiy distribution that sums to 1 across classes
-    """
-    y = gumbel_softmax_sample(logits, temperature)
-    if hard:
-        y_hard = onehot_from_logits(y)
-        y = (y_hard - y).detach() + y
-    return y
-
-
-class GumbelSoftmax(pyd.Categorical):
-    @property
-    def mean(self):
-        init_shape = self.logits.shape
-        logits_2d = self.logits.reshape(-1, self._num_events)
-        return onehot_from_logits(logits_2d).view(init_shape)
-
-    def log_prob(self, value):
-        return (self.logits * value).max(-1)[0]
-
-    def sample(self, temp=1.0, hard=True):
-        init_shape = self.logits.shape
-        logits_2d = self.logits.reshape(-1, self._num_events)
-        return gumbel_softmax(logits_2d, temp, hard=hard).view(init_shape)
+    def soft_argmax(onehot_actions, low, high, bins, alpha=10.0):
+        soft_max = torch.softmax(onehot_actions * alpha, dim=-1)
+        indices_kernel = torch_linspace(low, high, bins)
+        return (soft_max * indices_kernel).sum(-1)
 
 
 def schedule(schdl, step):
@@ -320,43 +322,6 @@ def schedule(schdl, step):
                 mix = np.clip((step - duration1) / duration2, 0.0, 1.0)
                 return (1.0 - mix) * final1 + mix * final2
     raise NotImplementedError(schdl)
-
-
-def torch_linspace(start, end, steps=10):
-    """
-    Vectorized version of torch.linspace.
-    Inputs:
-    - start: Tensor of any shape
-    - end: Tensor of the same shape as start
-    - steps: Integer
-    Returns:
-    - out: Tensor of shape start.size() + (steps,), such that
-      out.select(-1, 0) == start, out.select(-1, -1) == end,
-      and the other elements of out linearly interpolate between
-      start and end.
-    """
-    assert start.size() == end.size()
-    view_size = start.size() + (1,)
-    w_size = (1,) * start.dim() + (steps,)
-    out_size = start.size() + (steps,)
-
-    start_w = torch.linspace(1, 0, steps=steps).to(start)
-    start_w = start_w.view(w_size).expand(out_size)
-    end_w = torch.linspace(0, 1, steps=steps).to(start)
-    end_w = end_w.view(w_size).expand(out_size)
-
-    start = start.contiguous().view(view_size).expand(out_size)
-    end = end.contiguous().view(view_size).expand(out_size)
-
-    out = start_w * start + end_w * end
-    return out
-
-
-def soft_argmax(onehot_actions, low, high, bins, alpha=10.0):
-    soft_max = torch.softmax(onehot_actions * alpha, dim=-1)
-    indices_kernel = torch_linspace(low, high, bins)
-    values = (soft_max * indices_kernel).sum(-1)
-    return values
 
 
 class DemoStep(dict):

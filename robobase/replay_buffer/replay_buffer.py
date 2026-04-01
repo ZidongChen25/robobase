@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import numpy as np
-from torch.utils.data import IterableDataset
 
 
 class ReplayElement(object):
@@ -12,7 +11,7 @@ class ReplayElement(object):
         self.is_observation = is_observation
 
 
-class ReplayBuffer(IterableDataset):
+class ReplayBuffer:
     def replay_capacity(self):
         pass
 

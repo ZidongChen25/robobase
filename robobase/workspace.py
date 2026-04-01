@@ -11,14 +11,11 @@ from gymnasium import spaces
 from hydra.core.hydra_config import HydraConfig
 from omegaconf import DictConfig
 
-from robobase import utils
-from robobase.backends import backend_name_from_cfg, create_agent
+from robobase.factory import create_agent, method_name_from_cfg
 from robobase.envs.env import EnvFactory
 from robobase.logger import Logger
 from robobase.replay_buffer.iterator import (
     create_jax_replay_iterator,
-    create_numpy_replay_iterator,
-    create_torch_replay_iterator,
     normalize_replay_num_workers,
 )
 from robobase.replay_buffer.prioritized_replay_buffer import PrioritizedReplayBuffer
@@ -31,12 +28,83 @@ from robobase.replay_buffer.vision_feature_cache import (
 
 from pathlib import Path
 
+import pickle
+
 import hydra
 import numpy as np
-import torch
 import gymnasium as gym
 
-torch.backends.cudnn.benchmark = True
+
+def _set_seed_everywhere(seed: int):
+    np.random.seed(seed)
+    random.seed(seed)
+
+
+class _Until:
+    def __init__(self, until, action_repeat=1):
+        self._until = until
+        self._action_repeat = action_repeat
+
+    def __call__(self, step):
+        if self._until is None:
+            return True
+        return step < self._until // self._action_repeat
+
+
+class _Every:
+    def __init__(self, every, action_repeat=1):
+        self._every = every
+        self._action_repeat = action_repeat
+
+    def __call__(self, step):
+        if self._every is None or self._every == 0:
+            return False
+        every = self._every // self._action_repeat
+        return step % every == 0
+
+
+class _Timer:
+    def __init__(self):
+        self._start_time = time.time()
+        self._last_time = time.time()
+
+    def reset(self):
+        elapsed = time.time() - self._last_time
+        self._last_time = time.time()
+        total = time.time() - self._start_time
+        return elapsed, total
+
+    def total_time(self):
+        return time.time() - self._start_time
+
+
+class _DemoMergedIterator:
+    def __init__(self, replay_iter, demo_replay_iter):
+        self.replay_iter = replay_iter
+        self.demo_replay_iter = demo_replay_iter
+        self._is_safe = False
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        batch = next(self.replay_iter)
+        demo_batch = next(self.demo_replay_iter)
+        if not self._is_safe:
+            assert set(batch.keys()) == set(demo_batch.keys())
+            self._is_safe = True
+        demo_batch["demo"] = np.ones_like(demo_batch["demo"])
+        return {k: np.concatenate([batch[k], demo_batch[k]], axis=0) for k in batch.keys()}
+
+    def close(self):
+        for iterator in (self.replay_iter, self.demo_replay_iter):
+            close = getattr(iterator, "close", None)
+            if callable(close):
+                close()
+
+
+def _merge_replay_demo_iter(replay_iter, demo_replay_iter):
+    return iter(_DemoMergedIterator(replay_iter, demo_replay_iter))
 
 
 def _normalize_demos_count(value):
@@ -46,23 +114,6 @@ def _normalize_demos_count(value):
             return np.inf
         return float(normalized)
     return value
-
-
-def _resolve_torch_device(cfg: DictConfig):
-    dev = "cpu"
-    if cfg.num_gpus > 0:
-        if sys.platform == "darwin":
-            dev = "mps"
-        else:
-            dev = 0
-            job_num = False
-            try:
-                job_num = HydraConfig.get().job.get("num", False)
-            except ValueError:
-                pass
-            if job_num:
-                dev = job_num % cfg.num_gpus
-    return torch.device(dev)
 
 
 def _create_default_replay_buffer(
@@ -75,9 +126,7 @@ def _create_default_replay_buffer(
     save_snapshot: bool = False,
     reuse_saved: bool = False,
 ) -> ReplayBuffer:
-    multiprocessing_context = (
-        "spawn" if backend_name_from_cfg(cfg) == "jax" else "fork"
-    )
+    multiprocessing_context = "spawn"
     cache_plan = build_vision_feature_cache_plan(
         cfg=cfg,
         observation_space=observation_space,
@@ -217,10 +266,7 @@ class Workspace:
             raise ValueError("replay.nstep != 1 is not supported for IL methods")
 
         self.cfg = cfg
-        self.backend_name = backend_name_from_cfg(cfg)
-        self.using_torch_backend = self.backend_name == "torch"
-        utils.set_seed_everywhere(cfg.seed)
-        self.device = _resolve_torch_device(cfg) if self.using_torch_backend else None
+        _set_seed_everywhere(cfg.seed)
         self.use_demo_replay = cfg.demo_batch_size is not None
         self._skip_demo_loading_from_dataset = False
 
@@ -259,26 +305,15 @@ class Workspace:
         if self.cfg.num_eval_episodes > 0 and not self._defer_live_eval_env_creation:
             self._ensure_eval_envs_created()
 
-        intrinsic_reward_module = None
         if cfg.get("intrinsic_reward_module", None):
-            if not self.using_torch_backend:
-                raise NotImplementedError(
-                    "The minimal JAX backend does not support intrinsic reward "
-                    "modules yet."
-                )
-            intrinsic_reward_module = hydra.utils.instantiate(
-                cfg.intrinsic_reward_module,
-                device=self.device,
-                observation_space=observation_space,
-                action_space=action_space,
+            raise NotImplementedError(
+                "Intrinsic reward modules are not yet supported."
             )
 
         self.agent = create_agent(
             cfg,
             observation_space=observation_space,
             action_space=action_space,
-            device=self.device,
-            intrinsic_reward_module=intrinsic_reward_module,
         )
         self.agent.train(False)
 
@@ -294,7 +329,7 @@ class Workspace:
         self.prioritized_replay = cfg.replay.prioritization
         self.extra_replay_elements = self.replay_buffer.extra_replay_elements
         self.replay_num_workers = normalize_replay_num_workers(
-            self.backend_name, cfg.replay.num_workers
+            "jax", cfg.replay.num_workers
         )
         self._replay_iter = None
 
@@ -330,7 +365,7 @@ class Workspace:
             (self.work_dir / "eval_videos") if self.cfg.log_eval_video else None
         )
 
-        self._timer = utils.Timer()
+        self._timer = _Timer()
         self._pretrain_step = 0
         self._main_loop_iterations = 0
         self._global_env_episode = 0
@@ -394,40 +429,16 @@ class Workspace:
     @property
     def replay_iter(self):
         if self._replay_iter is None:
-            if self.using_torch_backend:
-                _replay_iter = create_torch_replay_iterator(
-                    self.replay_buffer,
-                    num_workers=self.replay_num_workers,
-                    pin_memory=self.cfg.replay.pin_memory,
-                )
-            elif self.backend_name == "jax":
-                _replay_iter = create_jax_replay_iterator(
-                    self.replay_buffer,
-                    num_workers=self.replay_num_workers,
-                )
-            else:
-                _replay_iter = create_numpy_replay_iterator(
-                    self.replay_buffer,
-                    num_workers=self.replay_num_workers,
-                )
+            _replay_iter = create_jax_replay_iterator(
+                self.replay_buffer,
+                num_workers=self.replay_num_workers,
+            )
             if self.use_demo_replay:
-                if self.using_torch_backend:
-                    _demo_replay_iter = create_torch_replay_iterator(
-                        self.demo_replay_buffer,
-                        num_workers=self.demo_replay_num_workers,
-                        pin_memory=self.cfg.replay.pin_memory,
-                    )
-                elif self.backend_name == "jax":
-                    _demo_replay_iter = create_jax_replay_iterator(
-                        self.demo_replay_buffer,
-                        num_workers=self.demo_replay_num_workers,
-                    )
-                else:
-                    _demo_replay_iter = create_numpy_replay_iterator(
-                        self.demo_replay_buffer,
-                        num_workers=self.demo_replay_num_workers,
-                    )
-                _replay_iter = utils.merge_replay_demo_iter(
+                _demo_replay_iter = create_jax_replay_iterator(
+                    self.demo_replay_buffer,
+                    num_workers=self.demo_replay_num_workers,
+                )
+                _replay_iter = _merge_replay_demo_iter(
                     _replay_iter, _demo_replay_iter
                 )
             self._replay_iter = _replay_iter
@@ -480,27 +491,20 @@ class Workspace:
 
     def _restore_timer_state(self, state_dict: dict[str, float]):
         elapsed_total = float(state_dict["elapsed_total"])
-        self._timer = utils.Timer()
+        self._timer = _Timer()
         now = time.time()
         self._timer._start_time = now - elapsed_total
         self._timer._last_time = now
 
     def _rng_state_dict(self) -> dict[str, Any]:
-        state = {
+        return {
             "python": random.getstate(),
             "numpy": np.random.get_state(),
-            "torch": torch.get_rng_state(),
         }
-        if torch.cuda.is_available():
-            state["torch_cuda"] = torch.cuda.get_rng_state_all()
-        return state
 
     def _restore_rng_state(self, state_dict: dict[str, Any]):
         random.setstate(state_dict["python"])
         np.random.set_state(state_dict["numpy"])
-        torch.set_rng_state(state_dict["torch"])
-        if torch.cuda.is_available() and "torch_cuda" in state_dict:
-            torch.cuda.set_rng_state_all(state_dict["torch_cuda"])
 
     def train(self):
         self._previous_sigint_handler = signal.getsignal(signal.SIGINT)
@@ -560,7 +564,7 @@ class Workspace:
 
     def _run_single_env_eval(self, eval_record_all_episode: bool = False) -> dict[str, Any]:
         step, episode, total_reward, successes = 0, 0, 0, 0
-        eval_until_episode = utils.Until(self.cfg.num_eval_episodes)
+        eval_until_episode = _Until(self.cfg.num_eval_episodes)
         first_rollout = []
         metrics = {}
         while eval_until_episode(episode):
@@ -868,39 +872,18 @@ class Workspace:
             start_time = time.time()
         env_batch_size = env.num_envs if getattr(env, "is_vector_env", False) else 1
         metrics = {}
-        if self.using_torch_backend:
-            with torch.no_grad(), utils.eval_mode(self.agent):
-                backend_observations = {
-                    k: torch.from_numpy(v).to(self.device, non_blocking=True)
-                    for k, v in observations.items()
-                }
-                if eval_mode and not getattr(env, "is_vector_env", False):
-                    backend_observations = {
-                        k: v.unsqueeze(0) for k, v in backend_observations.items()
-                    }
-                action = self.agent.act(
-                    backend_observations, self.main_loop_iterations, eval_mode=eval_mode
-                )
-                # Below is testing a feature which can be enforced in v6.
-                # The ability will allow agent info to be passed to environments.
-                # This will be handy for rendering any auxiliary outputs.
-                if isinstance(action, tuple):
-                    action, act_info = action
-                    metrics["agent_act_info"] = act_info
-                action = action.cpu().detach().numpy()
-        else:
-            backend_observations = observations
-            if eval_mode and not getattr(env, "is_vector_env", False):
-                backend_observations = {
-                    k: np.expand_dims(v, axis=0) for k, v in observations.items()
-                }
-            action = self.agent.act(
-                backend_observations, self.main_loop_iterations, eval_mode=eval_mode
-            )
-            if isinstance(action, tuple):
-                action, act_info = action
-                metrics["agent_act_info"] = act_info
-            action = np.asarray(action)
+        backend_observations = observations
+        if eval_mode and not getattr(env, "is_vector_env", False):
+            backend_observations = {
+                k: np.expand_dims(v, axis=0) for k, v in observations.items()
+            }
+        action = self.agent.act(
+            backend_observations, self.main_loop_iterations, eval_mode=eval_mode
+        )
+        if isinstance(action, tuple):
+            action, act_info = action
+            metrics["agent_act_info"] = act_info
+        action = np.asarray(action)
 
         if action.ndim != 3:
             raise ValueError(
@@ -935,13 +918,13 @@ class Workspace:
 
     def _pretrain_on_demos(self):
         if self.cfg.num_pretrain_steps > 0:
-            pre_train_until_step = utils.Until(self.cfg.num_pretrain_steps)
-            should_pretrain_log = utils.Every(self.cfg.log_pretrain_every)
-            should_pretrain_eval = utils.Every(self.cfg.eval_every_steps)
+            pre_train_until_step = _Until(self.cfg.num_pretrain_steps)
+            should_pretrain_log = _Every(self.cfg.log_pretrain_every)
+            should_pretrain_eval = _Every(self.cfg.eval_every_steps)
             snapshot_every_n = (
                 self.cfg.snapshot_every_n if self.cfg.save_snapshot else 0
             )
-            should_pretrain_save_snapshot = utils.Every(snapshot_every_n)
+            should_pretrain_save_snapshot = _Every(snapshot_every_n)
             snapshot_save_start_step = int(
                 self.cfg.get("snapshot_save_start_step", 0)
             )
@@ -987,13 +970,13 @@ class Workspace:
     def _online_rl(self):
         if self.train_envs is None or self.cfg.num_train_frames <= 0:
             return
-        train_until_frame = utils.Until(self.cfg.num_train_frames)
-        seed_until_size = utils.Until(self.cfg.replay_size_before_train)
-        should_log = utils.Every(self.cfg.log_every)
+        train_until_frame = _Until(self.cfg.num_train_frames)
+        seed_until_size = _Until(self.cfg.replay_size_before_train)
+        should_log = _Every(self.cfg.log_every)
         eval_every_n = self.cfg.eval_every_steps if self.eval_env is not None else 0
-        should_eval = utils.Every(eval_every_n)
+        should_eval = _Every(eval_every_n)
         snapshot_every_n = self.cfg.snapshot_every_n if self.cfg.save_snapshot else 0
-        should_save_snapshot = utils.Every(snapshot_every_n)
+        should_save_snapshot = _Every(snapshot_every_n)
         snapshot_save_start_step = int(self.cfg.get("snapshot_save_start_step", 0))
         observations, info = self.train_envs.reset()
         #  We use agent 0 to accumulate stats about how the training agents are doing
@@ -1158,7 +1141,7 @@ class Workspace:
             main_loop_iterations=payload["_main_loop_iterations"],
             pretrain_steps=payload["_pretrain_step"],
         )
-        snapshot = self.work_dir / "snapshots" / f"{snapshot_step}_snapshot.pt"
+        snapshot = self.work_dir / "snapshots" / f"{snapshot_step}_snapshot.pkl"
         snapshot.parent.mkdir(parents=True, exist_ok=True)
         payload["snapshot_version"] = 2
         payload["agent"] = self.agent.state_dict()
@@ -1171,8 +1154,8 @@ class Workspace:
         if self.use_demo_replay:
             payload["demo_replay_buffer"] = self.demo_replay_buffer.state_dict()
         with snapshot.open("wb") as f:
-            torch.save(payload, f)
-        latest_snapshot = self.work_dir / "snapshots" / "latest_snapshot.pt"
+            pickle.dump(payload, f)
+        latest_snapshot = self.work_dir / "snapshots" / "latest_snapshot.pkl"
         shutil.copy(snapshot, latest_snapshot)
 
     def load_snapshot(
@@ -1182,7 +1165,7 @@ class Workspace:
     ):
         if path_to_snapshot_to_load is None:
             path_to_snapshot_to_load = (
-                self.work_dir / "snapshots" / "latest_snapshot.pt"
+                self.work_dir / "snapshots" / "latest_snapshot.pkl"
             )
         else:
             path_to_snapshot_to_load = Path(path_to_snapshot_to_load)
@@ -1191,7 +1174,7 @@ class Workspace:
                 f"Provided file '{str(path_to_snapshot_to_load)}' is not a snapshot."
             )
         with path_to_snapshot_to_load.open("rb") as f:
-            payload = torch.load(f, map_location="cpu", weights_only=False)
+            payload = pickle.load(f)
         payload.pop("snapshot_version", None)
         self.agent.load_state_dict(payload.pop("agent"))
         self.agent.load_checkpoint_state_dict(payload.pop("agent_checkpoint_state", {}))

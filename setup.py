@@ -21,7 +21,7 @@ def get_version(rel_path):
 
 
 core_requirements = [
-    "torch>1.13",
+    # "torch>1.13",
     "moviepy",
     "natsort",
     "omegaconf",
@@ -34,10 +34,11 @@ core_requirements = [
     "opencv-python-headless",
     "numpy<2",
     "imageio",
-    "timm",
+    # "timm",
     "scipy",
     "einops",
-    "diffusers==0.29.0",
+    # "diffusers==0.29.0",
+    "pytest",
 ]
 
 setuptools.setup(
@@ -51,21 +52,21 @@ setuptools.setup(
         "": [str(p.resolve()) for p in Path("robobase/cfgs/").glob("**/*.yaml")]
     },
     extras_require={
-        "dev": ["pre-commit", "pytest", "mvp @ git+https://github.com/ir413/mvp"],
-        "jax": [
-            "jax",
-            "flax",
-            "optax",
-            "jax-resnet @ git+https://github.com/n2cholas/jax-resnet.git@5b00735aa0a68ec239af4a728ad4a596c1b551f6",
-        ],
+        # "dev": ["pre-commit", "pytest", "mvp @ git+https://github.com/ir413/mvp"],
+        # "jax": [
+        #     "jax",
+        #     "flax",
+        #     "optax",
+        #     "jax-resnet @ git+https://github.com/n2cholas/jax-resnet.git@5b00735aa0a68ec239af4a728ad4a596c1b551f6",
+        # ],
         "dmc": [
             "dm_control",
         ],
-        "robomimic": [
-            # egl-probe currently fails with cmake>=4 during robomimic install.
-            "cmake<4",
-            "robomimic",
-        ],
+        # "robomimic": [
+        #     # egl-probe currently fails with cmake>=4 during robomimic install.
+        #     "cmake<4",
+        #     "robomimic",
+        # ],
         "rlbench": [
             "rlbench @ git+https://git@github.com/stepjam/RLBench.git@b80e51feb3694d9959cb8c0408cd385001b01382",
         ],

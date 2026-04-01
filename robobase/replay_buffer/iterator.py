@@ -9,9 +9,15 @@ import traceback
 from typing import Any, Iterator
 
 import numpy as np
-import torch
 
 from robobase.replay_buffer.replay_buffer import ReplayBuffer
+
+try:
+    import torch as _torch
+    _TORCH_AVAILABLE = True
+except ImportError:
+    _torch = None
+    _TORCH_AVAILABLE = False
 
 
 _REPLAY_WORKER_ID: int | None = None
@@ -26,7 +32,7 @@ def get_replay_worker_id(default: int = 0) -> int:
     if _REPLAY_WORKER_ID is not None:
         return _REPLAY_WORKER_ID
     try:
-        worker_info = torch.utils.data.get_worker_info()
+        worker_info = _torch.utils.data.get_worker_info() if _TORCH_AVAILABLE else None
     except Exception:
         worker_info = None
     if worker_info is None:
@@ -138,12 +144,14 @@ class MultiProcessReplayBatchIterator(ReplayBatchIterator):
 
 
 def _numpy_to_torch(value: Any, pin_memory: bool):
-    if torch.is_tensor(value):
+    if not _TORCH_AVAILABLE:
+        raise RuntimeError("torch is required for TorchReplayBatchIterator")
+    if _torch.is_tensor(value):
         tensor = value
     elif isinstance(value, np.ndarray):
-        tensor = torch.from_numpy(value)
+        tensor = _torch.from_numpy(value)
     else:
-        tensor = torch.as_tensor(value)
+        tensor = _torch.as_tensor(value)
     if pin_memory and tensor.device.type == "cpu":
         tensor = tensor.pin_memory()
     return tensor

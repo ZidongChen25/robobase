@@ -7,6 +7,7 @@ logic that was previously duplicated across JaxBC and JaxDiffusion.
 from __future__ import annotations
 
 import time
+import warnings
 from abc import abstractmethod
 from typing import Iterator, Optional
 
@@ -19,7 +20,6 @@ from robobase.method.bc_runtime import (
 )
 from robobase.method.core import Method
 from robobase.method.jax_utils import maybe_numpy, stack_tensor_dictionary
-from robobase.replay_buffer.prioritized_replay_buffer import PrioritizedReplayBuffer
 from robobase.replay_buffer.replay_buffer import ReplayBuffer
 from robobase.replay_buffer.vision_feature_cache import (
     cached_feature_observation_key,
@@ -74,7 +74,22 @@ class JaxMethodBase(Method):
         import optax
 
         if platform:
-            jax.config.update("jax_platform_name", str(platform))
+            requested_platform = str(platform)
+            jax.config.update("jax_platform_name", requested_platform)
+            try:
+                # Force backend creation early so we can gracefully fallback in CPU-only envs.
+                _ = jax.devices()
+            except RuntimeError as exc:
+                if requested_platform.lower() in {"cuda", "gpu"}:
+                    jax.config.update("jax_platform_name", "cpu")
+                    warnings.warn(
+                        "Requested JAX platform '%s' is unavailable; falling back to 'cpu'."
+                        % requested_platform,
+                        RuntimeWarning,
+                        stacklevel=2,
+                    )
+                else:
+                    raise
 
         self.jax = jax
         self.jnp = jnp
@@ -253,7 +268,7 @@ class JaxMethodBase(Method):
     def _maybe_update_priorities(
         self, replay_buffer, batch, new_priority_np: np.ndarray
     ):
-        if isinstance(replay_buffer, PrioritizedReplayBuffer):
+        if replay_buffer is not None and hasattr(replay_buffer, "set_priority"):
             replay_buffer.set_priority(
                 indices=maybe_numpy(batch["indices"]),
                 priorities=new_priority_np ** self.replay_alpha,

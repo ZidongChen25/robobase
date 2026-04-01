@@ -7,7 +7,7 @@ from gymnasium import spaces
 from hydra import compose, initialize_config_dir
 from hydra.core.global_hydra import GlobalHydra
 
-from robobase.backends.jax.method.diffusion import JaxDiffusion
+from robobase.method.diffusion import Diffusion as JaxDiffusion
 from robobase.envs.env import EnvFactory
 from robobase.method.diffusion import (
     DiffusionActorModelSpec,
@@ -168,7 +168,7 @@ def test_jax_diffusion_workspace_smoke_and_snapshot(tmp_path):
         if not train_completed:
             workspace.shutdown()
 
-    snapshot_path = tmp_path / "snapshots" / "latest_snapshot.pt"
+    snapshot_path = tmp_path / "snapshots" / "latest_snapshot.pkl"
     assert snapshot_path.exists()
 
     restored = Workspace(
