@@ -78,6 +78,8 @@ def create_agent(
             actor_grad_clip=spec.actor_grad_clip,
             num_diffusion_iters=spec.num_diffusion_iters,
             use_ema=spec.use_ema,
+            ema_decay=spec.ema_decay,
+            weight_decay=spec.weight_decay,
             model=spec.model,
             jit=bool(cfg.get("backend", {}).get("jit", True) if cfg.get("backend") else True),
             platform=cfg.get("backend", {}).get("platform", None) if cfg.get("backend") else None,

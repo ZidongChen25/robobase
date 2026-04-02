@@ -10,6 +10,8 @@ method:
   adaptive_lr: true
   actor_grad_clip: null
   use_ema: false
+  ema_decay: 0.9999
+  weight_decay: 1.0e-6
   noise_mask_steps: 0
   repeat_action: false
 

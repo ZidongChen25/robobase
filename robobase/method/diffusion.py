@@ -49,6 +49,8 @@ class DiffusionSpec:
     actor_grad_clip: float | None
     num_diffusion_iters: int
     use_ema: bool
+    ema_decay: float
+    weight_decay: float
     model: DiffusionModelSpec
 
 
@@ -147,6 +149,8 @@ def diffusion_spec_from_cfg(cfg: DictConfig) -> DiffusionSpec:
         ),
         num_diffusion_iters=int(cfg.method.num_diffusion_iters),
         use_ema=bool(cfg.method.get("use_ema", False)),
+        ema_decay=float(cfg.method.get("ema_decay", 0.9999)),
+        weight_decay=float(cfg.method.get("weight_decay", 1e-6)),
         model=diffusion_model_spec_from_cfg(cfg),
     )
 
@@ -297,6 +301,8 @@ class Diffusion(JaxMethodBase):
         seed: int = 0,
         is_rl: bool = False,
         use_ema: bool = False,
+        ema_decay: float = 0.9999,
+        weight_decay: float = 1e-6,
     ):
         if not frame_stack_on_channel:
             raise NotImplementedError(
@@ -332,7 +338,7 @@ class Diffusion(JaxMethodBase):
         self._init_cached_pixel_feature_key("diffusion")
 
         # EMA config
-        self._ema_decay = 0.9999
+        self._ema_decay = ema_decay
         self._ema_min_decay = 0.0
         self._ema_update_after_step = 0
         self._ema_use_warmup = False
@@ -390,7 +396,7 @@ class Diffusion(JaxMethodBase):
         transforms = []
         if actor_grad_clip is not None:
             transforms.append(self.optax.clip_by_global_norm(float(actor_grad_clip)))
-        transforms.append(self.optax.adamw(learning_rate, weight_decay=1e-6))
+        transforms.append(self.optax.adamw(learning_rate, weight_decay=weight_decay))
         self.optimizer = self.optax.chain(*transforms)
         self.opt_state = self.optimizer.init(self.params)
 

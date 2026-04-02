@@ -18,7 +18,7 @@ from robobase.method.bc import (
     BCModelSpec,
     BCViewFusionModelSpec,
 )
-# from robobase.workspace import Workspace
+from robobase.workspace import Workspace
 
 jax = pytest.importorskip("jax")
 pytest.importorskip("optax")
@@ -160,78 +160,78 @@ def _make_jax_bc(
     )
 
 
-# def test_jax_bc_workspace_smoke_and_snapshot(tmp_path):
-#     GlobalHydra.instance().clear()
-#     with initialize_config_dir(
-#         version_base=None,
-#         config_dir=str(Path(__file__).resolve().parents[3] / "robobase/cfgs"),
-#         job_name="test_jax_bc_workspace",
-#     ):
-#         cfg = compose(
-#             config_name="robobase_config",
-#             overrides=[
-#                 "backend=jax",
-#                 "method=bc",
-#                 "env=dmc/cartpole_balance",
-#                 "pixels=false",
-#                 "demos=0",
-#                 "num_train_envs=1",
-#                 "num_eval_envs=1",
-#                 "num_eval_episodes=0",
-#                 "num_pretrain_steps=0",
-#                 "num_train_frames=4",
-#                 "replay_size_before_train=2",
-#                 "num_gpus=0",
-#                 "batch_size=1",
-#                 "replay.size=16",
-#                 "replay.nstep=1",
-#                 "replay.num_workers=0",
-#                 "replay.pin_memory=false",
-#                 "action_repeat=1",
-#                 "action_sequence=1",
-#                 "execution_length=1",
-#                 "env.episode_length=2",
-#                 "method.adaptive_lr=false",
-#                 "log_every=1",
-#                 "log_eval_video=false",
-#                 "save_snapshot=true",
-#                 "snapshot_every_n=1",
-#                 "wandb.use=false",
-#             ],
-#         )
+def test_jax_bc_workspace_smoke_and_snapshot(tmp_path):
+    GlobalHydra.instance().clear()
+    with initialize_config_dir(
+        version_base=None,
+        config_dir=str(Path(__file__).resolve().parents[2] / "robobase/cfgs"),
+        job_name="test_jax_bc_workspace",
+    ):
+        cfg = compose(
+            config_name="robobase_config",
+            overrides=[
+                "backend=jax",
+                "method=bc",
+                "env=dmc/cartpole_balance",
+                "pixels=false",
+                "demos=0",
+                "num_train_envs=1",
+                "num_eval_envs=1",
+                "num_eval_episodes=0",
+                "num_pretrain_steps=0",
+                "num_train_frames=4",
+                "replay_size_before_train=2",
+                "num_gpus=0",
+                "batch_size=1",
+                "replay.size=16",
+                "replay.nstep=1",
+                "replay.num_workers=0",
+                "replay.pin_memory=false",
+                "action_repeat=1",
+                "action_sequence=1",
+                "execution_length=1",
+                "env.episode_length=2",
+                "method.adaptive_lr=false",
+                "log_every=1",
+                "log_eval_video=false",
+                "save_snapshot=true",
+                "snapshot_every_n=1",
+                "wandb.use=false",
+            ],
+        )
 
-#     workspace = Workspace(
-#         cfg,
-#         env_factory=_TinyTrainAndEvalFactory(),
-#         work_dir=tmp_path,
-#     )
-#     train_completed = False
-#     try:
-#         workspace.train()
-#         train_completed = True
-#         saved_state = workspace.agent.state_dict()
-#     finally:
-#         if not train_completed:
-#             workspace.shutdown()
+    workspace = Workspace(
+        cfg,
+        env_factory=_TinyTrainAndEvalFactory(),
+        work_dir=tmp_path,
+    )
+    train_completed = False
+    try:
+        workspace.train()
+        train_completed = True
+        saved_state = workspace.agent.state_dict()
+    finally:
+        if not train_completed:
+            workspace.shutdown()
 
-#     snapshot_path = tmp_path / "snapshots" / "latest_snapshot.pt"
-#     assert snapshot_path.exists()
+    snapshot_path = tmp_path / "snapshots" / "latest_snapshot.pkl"
+    assert snapshot_path.exists()
 
-#     restored = Workspace(
-#         cfg,
-#         env_factory=_TinyTrainAndEvalFactory(),
-#         work_dir=tmp_path,
-#     )
-#     try:
-#         restored.load_snapshot()
-#         restored_state = restored.agent.state_dict()
-#     finally:
-#         restored.shutdown()
-#         GlobalHydra.instance().clear()
+    restored = Workspace(
+        cfg,
+        env_factory=_TinyTrainAndEvalFactory(),
+        work_dir=tmp_path,
+    )
+    try:
+        restored.load_snapshot()
+        restored_state = restored.agent.state_dict()
+    finally:
+        restored.shutdown()
+        GlobalHydra.instance().clear()
 
-#     assert len(_params_leaves(saved_state)) == len(_params_leaves(restored_state))
-#     for before, after in zip(_params_leaves(saved_state), _params_leaves(restored_state)):
-#         assert np.allclose(before, after)
+    assert len(_params_leaves(saved_state)) == len(_params_leaves(restored_state))
+    for before, after in zip(_params_leaves(saved_state), _params_leaves(restored_state)):
+        assert np.allclose(before, after)
 
 
 def test_jax_bc_supports_recurrent_sequence_output():

@@ -116,7 +116,7 @@ def test_jax_diffusion_workspace_smoke_and_snapshot(tmp_path):
     GlobalHydra.instance().clear()
     with initialize_config_dir(
         version_base=None,
-        config_dir=str(Path(__file__).resolve().parents[3] / "robobase/cfgs"),
+        config_dir=str(Path(__file__).resolve().parents[2] / "robobase/cfgs"),
         job_name="test_jax_diffusion_workspace",
     ):
         cfg = compose(
