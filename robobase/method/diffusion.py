@@ -1,429 +1,662 @@
-from collections import OrderedDict
-from functools import partial
-import logging
+from __future__ import annotations
 
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
+import time
+from dataclasses import dataclass
+from typing import Iterator, Optional
+
+import jax
+import jax.numpy as jnp
+import numpy as np
 from gymnasium import spaces
+from omegaconf import DictConfig
 
-from robobase.method.bc import BC
-
-from robobase.models.fully_connected import FullyConnectedModule
-
-from robobase.models.diffusion_models import replace_bn_with_gn
-
-from diffusers import DDIMScheduler, SchedulerMixin
-from diffusers.training_utils import EMAModel
-
-from robobase.method.utils import (
-    extract_from_spec,
-    extract_many_from_spec,
-    flatten_time_dim_into_channel_dim,
-    sequence_loss_mean,
-    stack_tensor_dictionary,
-)
-
-import copy
+from robobase.method.bc import BCEncoderModelSpec, BCViewFusionModelSpec
+from robobase.method.bc_runtime import bc_observation_layout
+from robobase.method.jax_base import JaxMethodBase
+from robobase.method.jax_utils import maybe_numpy
+from robobase.models.diffusion import JaxConditionalUnet1D
+from robobase.models.encoder import JaxResNetEncoder
+from robobase.models.fusion import JaxFusionMultiCamFeature
+from robobase.replay_buffer.replay_buffer import ReplayBuffer
 
 
-class Actor(nn.Module):
-    def __init__(
-        self,
-        action_space: spaces.Box,
-        actor_model: FullyConnectedModule,
-        noise_scheduler: SchedulerMixin,
-        num_diffusion_iters: int,
-        use_ema: bool,
-    ):
-        super().__init__()
-        assert len(action_space.shape) == 2
-        self.action_space = action_space
-        self.actor = actor_model
-        self.noise_scheduler = noise_scheduler
-        self.num_diffusion_iters = num_diffusion_iters
-        self.use_ema = use_ema
-        self.sequence_length = action_space.shape[0]
-        self.action_dim = action_space.shape[1]
-        self.ema = None
-        self.ema_actor = None
-        if self.use_ema:
-            self.ema = EMAModel(
-                parameters=self.actor.parameters(),
-                power=0.75,
-            )
-            self.ema_actor = copy.deepcopy(self.actor)
+# ---------------------------------------------------------------------------
+# Spec dataclasses
+# ---------------------------------------------------------------------------
 
-    @property
-    def preferred_optimiser(self) -> callable:
-        return getattr(
-            self.actor,
-            "preferred_optimiser",
-            partial(torch.optim.Adam, self.actor.parameters()),
+@dataclass(frozen=True)
+class DiffusionActorModelSpec:
+    type: str
+    sequence_length: int
+    diffusion_step_embed_dim: int
+    down_dims: tuple[int, ...]
+    kernel_size: int
+    n_groups: int
+
+
+@dataclass(frozen=True)
+class DiffusionModelSpec:
+    actor_model: DiffusionActorModelSpec
+    encoder_model: BCEncoderModelSpec | None
+    view_fusion_model: BCViewFusionModelSpec | None
+
+
+@dataclass(frozen=True)
+class DiffusionSpec:
+    lr: float
+    adaptive_lr: bool
+    num_train_steps: int
+    actor_grad_clip: float | None
+    num_diffusion_iters: int
+    use_ema: bool
+    ema_decay: float
+    weight_decay: float
+    model: DiffusionModelSpec
+
+
+# ---------------------------------------------------------------------------
+# Config parsers
+# ---------------------------------------------------------------------------
+
+def _config_type(
+    cfg: DictConfig | None,
+    *,
+    default: str,
+    target_to_type: dict[str, str] | None = None,
+) -> str:
+    if cfg is None:
+        return default
+    config_type = cfg.get("type", None)
+    if config_type is not None:
+        return str(config_type).lower()
+    if target_to_type is not None:
+        target = str(cfg.get("_target_", "")).strip()
+        if target in target_to_type:
+            return target_to_type[target]
+    return default
+
+
+def diffusion_model_spec_from_cfg(cfg: DictConfig) -> DiffusionModelSpec:
+    method_cfg = cfg.method
+    actor_model_cfg = method_cfg.get("actor_model", None)
+    if actor_model_cfg is None:
+        raise ValueError("Diffusion requires an actor_model config.")
+
+    actor_model_type = _config_type(
+        actor_model_cfg,
+        default="conditional_unet1d",
+        target_to_type={
+            "robobase.models.diffusion.JaxConditionalUnet1D": "conditional_unet1d",
+        },
+    )
+    actor_model_spec = DiffusionActorModelSpec(
+        type=actor_model_type,
+        sequence_length=int(actor_model_cfg.get("sequence_length", cfg.action_sequence)),
+        diffusion_step_embed_dim=int(
+            actor_model_cfg.get("diffusion_step_embed_dim", 256)
+        ),
+        down_dims=tuple(int(v) for v in actor_model_cfg.get("down_dims", (256, 512, 1024))),
+        kernel_size=int(actor_model_cfg.get("kernel_size", 5)),
+        n_groups=int(actor_model_cfg.get("n_groups", 8)),
+    )
+
+    encoder_model_cfg = method_cfg.get("encoder_model", None)
+    encoder_model_spec = None
+    if encoder_model_cfg is not None:
+        encoder_model_type = _config_type(
+            encoder_model_cfg,
+            default="resnet",
+            target_to_type={
+                "robobase.models.encoder.JaxResNetEncoder": "resnet",
+            },
+        )
+        encoder_model_spec = BCEncoderModelSpec(
+            type=encoder_model_type,
+            model=str(encoder_model_cfg.get("model", "resnet18")),
         )
 
-    def _combine(self, low_dim_obs, fused_view_feats):
-        flat_feats = []
-        if low_dim_obs is not None:
-            flat_feats.append(low_dim_obs)
-        if fused_view_feats is not None:
-            flat_feats.append(fused_view_feats)
-        obs_features = torch.cat(flat_feats, dim=-1)
-        return obs_features
+    view_fusion_model_cfg = method_cfg.get("view_fusion_model", None)
+    view_fusion_model_spec = None
+    if view_fusion_model_cfg is not None:
+        view_fusion_model_type = _config_type(
+            view_fusion_model_cfg,
+            default="multicam_feature",
+            target_to_type={
+                "robobase.models.fusion.JaxFusionMultiCamFeature": "multicam_feature",
+            },
+        )
+        view_fusion_model_spec = BCViewFusionModelSpec(
+            type=view_fusion_model_type,
+            mode=str(view_fusion_model_cfg.get("mode", "flatten")).lower(),
+        )
 
-    def forward(
-        self,
-        low_dim_obs,
-        fused_view_feats,
-        action,
-        action_pad_mask: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        obs_features = self._combine(low_dim_obs, fused_view_feats)
+    return DiffusionModelSpec(
+        actor_model=actor_model_spec,
+        encoder_model=encoder_model_spec,
+        view_fusion_model=view_fusion_model_spec,
+    )
 
-        b = obs_features.shape[0]
-        # sample noise to add to actions
-        noise = torch.randn((b,) + self.action_space.shape, device=obs_features.device)
 
-        # sample a diffusion iteration for each data point
-        timesteps = torch.randint(
-            0,
-            self.noise_scheduler.config.num_train_timesteps,
-            (b,),
-            device=obs_features.device,
-        ).long()
+def diffusion_spec_from_cfg(cfg: DictConfig) -> DiffusionSpec:
+    return DiffusionSpec(
+        lr=float(cfg.method.lr),
+        adaptive_lr=bool(cfg.method.adaptive_lr),
+        num_train_steps=int(cfg.method.num_train_steps),
+        actor_grad_clip=(
+            None
+            if cfg.method.actor_grad_clip is None
+            else float(cfg.method.actor_grad_clip)
+        ),
+        num_diffusion_iters=int(cfg.method.num_diffusion_iters),
+        use_ema=bool(cfg.method.get("use_ema", False)),
+        ema_decay=float(cfg.method.get("ema_decay", 0.9999)),
+        weight_decay=float(cfg.method.get("weight_decay", 1e-6)),
+        model=diffusion_model_spec_from_cfg(cfg),
+    )
 
-        # add noise to the clean actions
-        # according to the noise magnitude at each diffusion iteration
-        # (this is the forward diffusion process)
-        noisy_actions = self.noise_scheduler.add_noise(action, noise, timesteps)
-        if action_pad_mask is not None:
-            action_pad_mask = action_pad_mask.to(
-                dtype=torch.bool, device=noisy_actions.device
+
+# ---------------------------------------------------------------------------
+# Internal helpers
+# ---------------------------------------------------------------------------
+
+def _cosine_betas(num_diffusion_iters: int, *, max_beta: float = 0.999) -> np.ndarray:
+    def alpha_bar(t: float) -> float:
+        return np.cos((t + 0.008) / 1.008 * np.pi / 2) ** 2
+
+    betas = []
+    for index in range(num_diffusion_iters):
+        t1 = index / num_diffusion_iters
+        t2 = (index + 1) / num_diffusion_iters
+        betas.append(min(1.0 - alpha_bar(t2) / alpha_bar(t1), max_beta))
+    return np.asarray(betas, dtype=np.float32)
+
+
+@dataclass(frozen=True)
+class _BuiltDiffusionModel:
+    actor_model: JaxConditionalUnet1D
+    encoder_model: JaxResNetEncoder | None
+    view_fusion_model: JaxFusionMultiCamFeature | None
+
+
+def _build_encoder_and_fusion(
+    *,
+    model_spec: DiffusionModelSpec,
+    observation_space: spaces.Dict,
+    encoder_jit: bool,
+) -> tuple[JaxResNetEncoder | None, JaxFusionMultiCamFeature | None, int]:
+    obs_layout = bc_observation_layout(observation_space)
+    encoder_model = None
+    view_fusion_model = None
+
+    if obs_layout.use_pixels:
+        if model_spec.encoder_model is None:
+            raise ValueError(
+                "Pixel diffusion requires encoder_model in the shared model spec."
             )
-            noisy_actions = noisy_actions.masked_fill(action_pad_mask.unsqueeze(-1), 0.0)
-            noise = noise.masked_fill(action_pad_mask.unsqueeze(-1), 0.0)
-
-        net_ins = {
-            "actions": noisy_actions,
-            "features": obs_features,
-            "timestep": timesteps,
-        }
-        noise_pred = self.actor(net_ins)
-        return noise_pred, noise
-
-    def infer(
-        self, low_dim_obs, fused_view_feats, use_ema: bool
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """
-        Inverse process for inference.
-        """
-        obs_features = self._combine(low_dim_obs, fused_view_feats)
-        with torch.no_grad():
-            actor = self.actor
-            if use_ema:
-                if self.ema is None or self.ema_actor is None:
-                    raise RuntimeError("EMA inference requested but EMA is disabled.")
-                actor = self.ema_actor
-                self.ema.copy_to(actor.parameters())
-
-            # initialize action from Gaussian noise
-            b = 1
-            noisy_action = torch.randn(
-                (b, self.sequence_length, self.action_dim), device=obs_features.device
+        if model_spec.encoder_model.type != "resnet":
+            raise NotImplementedError(
+                "Unsupported diffusion encoder model type "
+                f"'{model_spec.encoder_model.type}'."
             )
+        if obs_layout.rgb_input_shape is None:
+            raise ValueError("Pixel diffusion expected a valid RGB input shape.")
+        encoder_model = JaxResNetEncoder(
+            input_shape=obs_layout.rgb_input_shape,
+            model=model_spec.encoder_model.model,
+            jit=encoder_jit,
+        )
+        if obs_layout.use_multicam_fusion:
+            if model_spec.view_fusion_model is None:
+                raise ValueError(
+                    "Multi-camera pixel diffusion requires view_fusion_model."
+                )
+            if model_spec.view_fusion_model.type != "multicam_feature":
+                raise NotImplementedError(
+                    "Unsupported diffusion view fusion model type "
+                    f"'{model_spec.view_fusion_model.type}'."
+                )
+            view_fusion_model = JaxFusionMultiCamFeature.from_input_shape(
+                input_shape=encoder_model.output_shape,
+                mode=model_spec.view_fusion_model.mode,
+            )
+    elif model_spec.encoder_model is not None and model_spec.encoder_model.type != "resnet":
+        raise NotImplementedError(
+            "Unsupported diffusion encoder model type "
+            f"'{model_spec.encoder_model.type}'."
+        )
 
-            # init scheduler
-            self.noise_scheduler.set_timesteps(self.num_diffusion_iters)
-
-            for k in self.noise_scheduler.timesteps:
-                net_ins = {
-                    "actions": noisy_action,
-                    "features": obs_features,
-                    "timestep": k,
-                }
-                noise_pred = actor(net_ins)
-                # inverse diffusion step
-                noisy_action = self.noise_scheduler.step(
-                    model_output=noise_pred,
-                    timestep=k,
-                    sample=noisy_action,
-                ).prev_sample
-
-        return noise_pred, noisy_action
+    rgb_latent_size = 0
+    if encoder_model is not None:
+        if view_fusion_model is not None:
+            rgb_latent_size = int(view_fusion_model.output_shape[-1])
+        else:
+            rgb_latent_size = int(encoder_model.output_shape[-1])
+    return encoder_model, view_fusion_model, rgb_latent_size
 
 
-class Diffusion(BC):
-    _EMA_STATE_PREFIX = "_actor_ema_state."
-    _EMA_SCALAR_FIELDS = {
-        "decay": float,
-        "min_decay": float,
-        "optimization_step": int,
-        "update_after_step": int,
-        "use_ema_warmup": bool,
-        "inv_gamma": float,
-        "power": float,
-    }
+def _build_model(
+    model_spec: DiffusionModelSpec,
+    *,
+    observation_space: spaces.Dict,
+    action_space: spaces.Box,
+    encoder_jit: bool,
+) -> tuple[_BuiltDiffusionModel, int]:
+    obs_layout = bc_observation_layout(observation_space)
+    actor_spec = model_spec.actor_model
+    if actor_spec.type != "conditional_unet1d":
+        raise NotImplementedError(
+            f"Unsupported diffusion actor model type '{actor_spec.type}'."
+        )
+    if actor_spec.sequence_length != int(action_space.shape[0]):
+        raise ValueError(
+            "Diffusion actor model sequence_length does not match the action space."
+        )
+
+    encoder_model, view_fusion_model, rgb_latent_size = _build_encoder_and_fusion(
+        model_spec=model_spec,
+        observation_space=observation_space,
+        encoder_jit=encoder_jit,
+    )
+    feature_dim = int(obs_layout.low_dim_size + rgb_latent_size)
+    return _BuiltDiffusionModel(
+        actor_model=JaxConditionalUnet1D(
+            action_dim=int(action_space.shape[1]),
+            sequence_length=int(action_space.shape[0]),
+            feature_dim=feature_dim,
+            diffusion_step_embed_dim=actor_spec.diffusion_step_embed_dim,
+            down_dims=actor_spec.down_dims,
+            kernel_size=actor_spec.kernel_size,
+            n_groups=actor_spec.n_groups,
+        ),
+        encoder_model=encoder_model,
+        view_fusion_model=view_fusion_model,
+    ), feature_dim
+
+
+# ---------------------------------------------------------------------------
+# Diffusion class
+# ---------------------------------------------------------------------------
+
+class Diffusion(JaxMethodBase):
+    """Diffusion policy implementation backed by JAX with Flax models."""
 
     def __init__(
         self,
+        lr: float,
+        adaptive_lr: bool,
+        num_train_steps: int,
         num_diffusion_iters: int,
-        use_ema: bool = True,
-        *args,
-        **kwargs,
+        model: DiffusionModelSpec,
+        observation_space: spaces.Dict,
+        action_space: spaces.Box,
+        num_train_envs: int,
+        num_eval_envs: int,
+        replay_alpha: float,
+        replay_beta: float,
+        frame_stack_on_channel: bool,
+        intrinsic_reward_module=None,
+        actor_grad_clip: Optional[float] = None,
+        jit: bool = True,
+        platform: str | None = None,
+        seed: int = 0,
+        is_rl: bool = False,
+        use_ema: bool = False,
+        ema_decay: float = 0.9999,
+        weight_decay: float = 1e-6,
     ):
-        if not kwargs["frame_stack_on_channel"]:
+        if not frame_stack_on_channel:
             raise NotImplementedError(
                 "frame_stack_on_channel must be true for diffusion policies."
             )
-        self.num_diffusion_iters = num_diffusion_iters
-        self.use_ema = use_ema
-        kwargs["use_ema"] = use_ema
-        self.noise_scheduler = DDIMScheduler(
-            num_train_timesteps=num_diffusion_iters,
-            # the choise of beta schedule has big impact on performance
-            # we found squared cosine works the best
-            beta_schedule="squaredcos_cap_v2",
-            # clip output to [-1,1] to improve stability
-            clip_sample=True,
-            # our network predicts noise (instead of denoised action)
-            prediction_type="epsilon",
-        )
-        super().__init__(*args, **kwargs)
-
-    @classmethod
-    def _ema_state_key(cls, suffix: str) -> str:
-        return f"{cls._EMA_STATE_PREFIX}{suffix}"
-
-    @staticmethod
-    def _has_ema_actor_state(state_dict: OrderedDict) -> bool:
-        return any(k.startswith("actor.ema_actor.") for k in state_dict)
-
-    @staticmethod
-    def _drop_ema_actor_state(state_dict: OrderedDict):
-        for key in [k for k in list(state_dict.keys()) if k.startswith("actor.ema_actor.")]:
-            state_dict.pop(key)
-
-    @classmethod
-    def _serialize_ema_scalar(cls, value):
-        return torch.tensor(float(value), dtype=torch.float64)
-
-    @classmethod
-    def _deserialize_ema_scalar(cls, field: str, value: torch.Tensor):
-        scalar = value.item()
-        caster = cls._EMA_SCALAR_FIELDS[field]
-        if caster is bool:
-            return bool(int(scalar))
-        return caster(scalar)
-
-    @classmethod
-    def _pop_ema_state(cls, state_dict: OrderedDict) -> dict | None:
-        ema_keys = [k for k in list(state_dict.keys()) if k.startswith(cls._EMA_STATE_PREFIX)]
-        if not ema_keys:
-            return None
-
-        ema_state = {}
-        for field in cls._EMA_SCALAR_FIELDS:
-            key = cls._ema_state_key(field)
-            value = state_dict.pop(key, None)
-            if value is not None:
-                ema_state[field] = cls._deserialize_ema_scalar(field, value)
-
-        shadow_prefix = cls._ema_state_key("shadow_params.")
-        shadow_param_keys = sorted(
-            [k for k in ema_keys if k.startswith(shadow_prefix)],
-            key=lambda k: int(k.rsplit(".", 1)[-1]),
-        )
-        ema_state["shadow_params"] = [state_dict.pop(k) for k in shadow_param_keys]
-        return ema_state
-
-    def _sync_ema_actor(self):
-        if self.actor.ema is None or self.actor.ema_actor is None:
-            return
-        self.actor.ema.copy_to(self.actor.ema_actor.parameters())
-
-    def state_dict(self, *args, destination=None, prefix="", keep_vars=False):
-        state = super().state_dict(
-            *args,
-            destination=destination,
-            prefix=prefix,
-            keep_vars=keep_vars,
-        )
-        if not self.use_ema or self.actor.ema is None:
-            return state
-
-        self._sync_ema_actor()
-        ema_actor_prefix = f"{prefix}actor.ema_actor."
-        for key in [k for k in list(state.keys()) if k.startswith(ema_actor_prefix)]:
-            del state[key]
-        ema_state = self.actor.ema.state_dict()
-        for field in self._EMA_SCALAR_FIELDS:
-            state[f"{prefix}{self._ema_state_key(field)}"] = self._serialize_ema_scalar(
-                ema_state[field]
-            )
-        for idx, shadow_param in enumerate(ema_state["shadow_params"]):
-            key = f"{prefix}{self._ema_state_key(f'shadow_params.{idx}')}"
-            tensor = shadow_param.clone() if keep_vars else shadow_param.detach().clone()
-            state[key] = tensor
-        return state
-
-    def load_state_dict(self, state_dict, strict=True):
-        state_dict = OrderedDict(state_dict)
-        ema_state = self._pop_ema_state(state_dict)
-        has_ema_actor_state = self._has_ema_actor_state(state_dict)
-        if not self.use_ema:
-            self._drop_ema_actor_state(state_dict)
-            return super().load_state_dict(state_dict, strict=strict)
-
-        incompatible_keys = super().load_state_dict(state_dict, strict=False)
-        missing_keys = [
-            key
-            for key in incompatible_keys.missing_keys
-            if not key.startswith("actor.ema_actor.")
-        ]
-        unexpected_keys = incompatible_keys.unexpected_keys
-        if strict and (missing_keys or unexpected_keys):
-            error_messages = []
-            if missing_keys:
-                error_messages.append(f"Missing key(s): {missing_keys}")
-            if unexpected_keys:
-                error_messages.append(f"Unexpected key(s): {unexpected_keys}")
-            raise RuntimeError(
-                "Error(s) in loading state_dict for Diffusion:\n\t"
-                + "\n\t".join(error_messages)
-            )
-
-        if ema_state is not None and ema_state["shadow_params"]:
-            self.actor.ema.load_state_dict(ema_state)
-        else:
-            logging.warning(
-                "Diffusion snapshot is missing EMA state; rebuilding EMA weights "
-                "from the stored %s parameters.",
-                "ema_actor" if has_ema_actor_state else "actor",
-            )
-            params = (
-                self.actor.ema_actor.parameters()
-                if has_ema_actor_state
-                else self.actor.actor.parameters()
-            )
-            self.actor.ema.shadow_params = [param.detach().clone() for param in params]
-
-        self._sync_ema_actor()
-        return incompatible_keys
-
-    def build_actor(self):
-        # TODO: remove this limitation
-        if self.action_space.shape[-2] % 4 != 0:
+        if len(action_space.shape) == 2 and int(action_space.shape[0]) % 4 != 0:
             raise ValueError(
                 "Action sequence length has to be a multiple of 4 for diffusion model."
             )
-        self.actor_model = self.actor_model(
-            input_shapes=self.get_fully_connected_inputs(),
-            output_shape=self.action_space.shape[-1],
-        ).to(self.device)
-        self.actor = Actor(
-            self.action_space,
-            self.actor_model,
-            self.noise_scheduler,
-            self.num_diffusion_iters,
-            self.use_ema,
-        ).to(self.device)
-        self.actor_opt = (self.actor.preferred_optimiser)(lr=self.lr)
 
-    def build_encoder(self):
-        super().build_encoder()
-        rgb_spaces = extract_many_from_spec(
-            self.observation_space, r"rgb.*", missing_ok=True
+        super().__init__(
+            lr=lr,
+            adaptive_lr=adaptive_lr,
+            num_train_steps=num_train_steps,
+            observation_space=observation_space,
+            action_space=action_space,
+            num_train_envs=num_train_envs,
+            num_eval_envs=num_eval_envs,
+            replay_alpha=replay_alpha,
+            replay_beta=replay_beta,
+            frame_stack_on_channel=frame_stack_on_channel,
+            intrinsic_reward_module=intrinsic_reward_module,
+            actor_grad_clip=actor_grad_clip,
+            jit=jit,
+            platform=platform,
+            seed=seed,
+            is_rl=is_rl,
+            use_ema=use_ema,
         )
-        if len(rgb_spaces) > 0:
-            # For more stable training according to https://diffusion-policy.cs.columbia.edu/diffusion_policy_2023.pdf.
-            self.encoder = replace_bn_with_gn(self.encoder)
-            self.encoder.to(self.device)
-            self.encoder_opt = torch.optim.Adam(self.encoder.parameters(), lr=self.lr)
 
-    def get_fully_connected_inputs(self) -> dict[str, tuple]:
-        # obs shapes
-        input_shapes = super().get_fully_connected_inputs()
+        self.num_diffusion_iters = int(num_diffusion_iters)
+        self.model_spec = model
+        self._init_cached_pixel_feature_key("diffusion")
 
-        # action shapes
-        input_shapes["actions"] = self.action_space.shape[-1:]
+        # EMA config
+        self._ema_decay = ema_decay
+        self._ema_min_decay = 0.0
+        self._ema_update_after_step = 0
+        self._ema_use_warmup = False
+        self._ema_inv_gamma = 1.0
+        self._ema_power = 0.75
+        self._ema_optimization_step = 0
 
-        # diffusion timestep shapes
-        return input_shapes
+        # Build model
+        built_model, feature_dim = _build_model(
+            self.model_spec,
+            observation_space=observation_space,
+            action_space=action_space,
+            encoder_jit=jit,
+        )
+        self.actor_model = built_model.actor_model
+        self.encoder = built_model.encoder_model
+        self.view_fusion = built_model.view_fusion_model
+        self.rgb_latent_size = max(0, feature_dim - self.low_dim_size)
 
-    def _act(self, observations: dict[str, torch.Tensor], eval_mode: bool):
-        low_dim_obs = fused_rgb_feats = None
-        if self.low_dim_size > 0:
-            low_dim_obs = flatten_time_dim_into_channel_dim(
-                extract_from_spec(observations, "low_dim_state")
+        # Diffusion schedule
+        betas = _cosine_betas(self.num_diffusion_iters)
+        alphas_cumprod = np.cumprod(1.0 - betas)
+        self.betas = jnp.asarray(betas)
+        self.alphas_cumprod = jnp.asarray(alphas_cumprod, dtype=jnp.float32)
+        self.sqrt_alphas_cumprod = jnp.sqrt(self.alphas_cumprod)
+        self.sqrt_one_minus_alphas_cumprod = jnp.sqrt(1.0 - self.alphas_cumprod)
+        self.inference_timesteps = jnp.arange(
+            self.num_diffusion_iters - 1, -1, -1, dtype=jnp.int32,
+        )
+
+        # Flax init with dummy inputs
+        self.rng_key, init_key = jax.random.split(self.rng_key)
+        dummy_actions = jnp.zeros(
+            (1, self.action_sequence, self.action_dim), dtype=jnp.float32
+        )
+        dummy_timesteps = jnp.zeros((1,), dtype=jnp.int32)
+        dummy_features = (
+            jnp.zeros((1, feature_dim), dtype=jnp.float32) if feature_dim > 0 else None
+        )
+        self.params = self.actor_model.init(
+            init_key, dummy_actions, dummy_timesteps, dummy_features
+        )
+        self.ema_params = self.params if self.use_ema else None
+
+        # Optimizer
+        learning_rate = lr
+        if adaptive_lr:
+            learning_rate = self.optax.warmup_cosine_decay_schedule(
+                init_value=0.0,
+                peak_value=lr,
+                warmup_steps=100,
+                decay_steps=self.num_train_steps,
+                end_value=0.0,
             )
-        if self.use_pixels:
-            rgb_obs = flatten_time_dim_into_channel_dim(
-                stack_tensor_dictionary(
-                    extract_many_from_spec(observations, r"rgb.*"), 1
-                ),
-                has_view_axis=True,
+        transforms = []
+        if actor_grad_clip is not None:
+            transforms.append(self.optax.clip_by_global_norm(float(actor_grad_clip)))
+        transforms.append(self.optax.adamw(learning_rate, weight_decay=weight_decay))
+        self.optimizer = self.optax.chain(*transforms)
+        self.opt_state = self.optimizer.init(self.params)
+
+        # JIT-compiled functions
+        update_fn = self._build_update_fn()
+        sample_fn = self._build_sample_fn()
+        if self._jit_enabled:
+            update_fn = jax.jit(update_fn)
+            sample_fn = jax.jit(sample_fn)
+        self._update_impl = update_fn
+        self._sample_impl = sample_fn
+
+    # ------------------------------------------------------------------
+    # EMA
+    # ------------------------------------------------------------------
+
+    def _ema_decay_value(self, optimization_step):
+        step = jnp.maximum(0, optimization_step - self._ema_update_after_step - 1)
+        if self._ema_use_warmup:
+            decay = 1.0 - (1.0 + step / self._ema_inv_gamma) ** (-self._ema_power)
+        else:
+            decay = (1.0 + step) / (10.0 + step)
+        decay = jnp.where(step <= 0, 0.0, decay)
+        decay = jnp.minimum(decay, self._ema_decay)
+        return jnp.maximum(decay, self._ema_min_decay)
+
+    # ------------------------------------------------------------------
+    # Forward / update
+    # ------------------------------------------------------------------
+
+    def _build_update_fn(self):
+        optimizer = self.optimizer
+        optax = self.optax
+        use_ema = self.use_ema
+        actor_model = self.actor_model
+
+        def update_fn(
+            params, opt_state, rng_key, obs_features, actions,
+            loss_coeff, action_pad_mask, ema_params, ema_optimization_step,
+        ):
+            noise_key, timestep_key, next_key = jax.random.split(rng_key, 3)
+            noise = jax.random.normal(noise_key, shape=actions.shape)
+            timesteps = jax.random.randint(
+                timestep_key,
+                shape=(actions.shape[0],),
+                minval=0,
+                maxval=self.num_diffusion_iters,
             )
-            with torch.no_grad():
-                multi_view_rgb_feats = self.encoder(rgb_obs.float())
-                fused_rgb_feats = self.view_fusion(multi_view_rgb_feats)
-        _, noisy_action = self.actor.infer(
-            low_dim_obs,
-            fused_rgb_feats,
-            use_ema=self.use_ema and eval_mode,
-        )
-        return noisy_action.detach()
 
-    def update_actor(
-        self,
-        low_dim_obs,
-        fused_view_feats,
-        action,
-        loss_coeff,
-        action_pad_mask: torch.Tensor | None = None,
-    ):
-        metrics = dict()
-        noise_pred, noise = self.actor(
-            low_dim_obs,
-            fused_view_feats,
-            action,
-            action_pad_mask=action_pad_mask,
-        )
-        mse_loss = sequence_loss_mean(
-            F.mse_loss(noise_pred, noise, reduction="none"),
-            action_pad_mask,
-        ).unsqueeze(1)
-        actor_loss = (mse_loss * loss_coeff.unsqueeze(1)).mean()
+            sqrt_alpha = self.sqrt_alphas_cumprod[timesteps][:, None, None]
+            sqrt_one_minus = self.sqrt_one_minus_alphas_cumprod[timesteps][:, None, None]
+            noisy_actions = sqrt_alpha * actions + sqrt_one_minus * noise
 
-        new_pri = torch.sqrt(mse_loss + 1e-10)
-        self._new_priority = (new_pri / torch.max(new_pri)).cpu().detach().numpy()
+            if action_pad_mask is not None:
+                valid_mask = jnp.logical_not(action_pad_mask)
+                noisy_actions = jnp.where(valid_mask[..., None], noisy_actions, 0.0)
+                noise = jnp.where(valid_mask[..., None], noise, 0.0)
 
-        if self.use_pixels and self.encoder_opt is not None:
-            self.encoder_opt.zero_grad(set_to_none=True)
-            if self.use_multicam_fusion and self.view_fusion_opt is not None:
-                self.view_fusion_opt.zero_grad(set_to_none=True)
-        self.actor_opt.zero_grad(set_to_none=True)
-        actor_loss.backward()
-        if self.actor_grad_clip:
-            nn.utils.clip_grad_norm_(self.actor.parameters(), self.actor_grad_clip)
-        self.actor_opt.step()
-        if self.use_pixels and self.encoder is not None:
-            if self.actor_grad_clip:
-                nn.utils.clip_grad_norm_(
-                    self.encoder.parameters(), self.critic_grad_clip
+            def loss_fn(current_params):
+                noise_pred = actor_model.apply(
+                    current_params, noisy_actions, timesteps, obs_features,
                 )
-            self.encoder_opt.step()
-            if self.use_multicam_fusion and self.view_fusion_opt is not None:
-                self.view_fusion_opt.step()
+                per_token_mse = jnp.square(noise_pred - noise)
+                reduce_dims = tuple(range(1, per_token_mse.ndim))
+                if action_pad_mask is None:
+                    mse_loss = per_token_mse.mean(axis=reduce_dims)
+                else:
+                    valid_mask = jnp.logical_not(action_pad_mask).astype(
+                        per_token_mse.dtype
+                    )
+                    while valid_mask.ndim < per_token_mse.ndim:
+                        valid_mask = valid_mask[..., None]
+                    masked_loss = per_token_mse * valid_mask
+                    denom = jnp.clip(valid_mask.sum(axis=reduce_dims), min=1.0)
+                    mse_loss = masked_loss.sum(axis=reduce_dims) / denom
+                total_loss = (mse_loss * loss_coeff).mean()
+                return total_loss, mse_loss
 
-        # step lr scheduler every batch
-        # this is different from standard pytorch behavior
-        if self.lr_scheduler is not None:
-            self.lr_scheduler.step()
+            (loss, mse_loss), grads = jax.value_and_grad(
+                loss_fn, has_aux=True,
+            )(params)
+            updates, new_opt_state = optimizer.update(grads, opt_state, params)
+            new_params = optax.apply_updates(params, updates)
 
-        # update Exponential Moving Average of the model weights
-        if self.use_ema and self.actor.ema is not None:
-            self.actor.ema.step(self.actor.actor.parameters())
+            new_ema_params = ema_params
+            new_ema_step = ema_optimization_step
+            if use_ema:
+                new_ema_step = ema_optimization_step + 1
+                decay = self._ema_decay_value(new_ema_step)
+                one_minus_decay = 1.0 - decay
+                new_ema_params = jax.tree.map(
+                    lambda ema, param: ema - one_minus_decay * (ema - param),
+                    ema_params, new_params,
+                )
 
-        if self.logging:
-            metrics["actor_loss"] = actor_loss.item()
+            new_pri = jnp.sqrt(mse_loss + 1e-10)
+            max_pri = jnp.max(new_pri)
+            normalized_pri = new_pri / jnp.where(max_pri > 0, max_pri, 1.0)
+            return (
+                new_params, new_opt_state, next_key, loss,
+                normalized_pri, new_ema_params, new_ema_step,
+            )
+
+        return update_fn
+
+    def _build_sample_fn(self):
+        actor_model = self.actor_model
+
+        def sample_fn(params, rng_key, obs_features):
+            batch_size = obs_features.shape[0]
+            sample = jax.random.normal(
+                rng_key,
+                shape=(batch_size, self.action_sequence, self.action_dim),
+            )
+
+            def body_fn(index, current_sample):
+                timestep = self.inference_timesteps[index]
+                timestep_batch = jnp.full((batch_size,), timestep, dtype=jnp.int32)
+                noise_pred = actor_model.apply(
+                    params, current_sample, timestep_batch, obs_features,
+                )
+                alpha_t = self.alphas_cumprod[timestep]
+                prev_index = jnp.maximum(timestep - 1, 0)
+                alpha_prev = jnp.where(
+                    timestep > 0,
+                    self.alphas_cumprod[prev_index],
+                    jnp.asarray(1.0, dtype=jnp.float32),
+                )
+                sqrt_alpha_t = jnp.sqrt(alpha_t)
+                sqrt_one_minus_alpha_t = jnp.sqrt(jnp.maximum(1.0 - alpha_t, 0.0))
+                pred_original_sample = (
+                    current_sample - sqrt_one_minus_alpha_t * noise_pred
+                ) / jnp.maximum(sqrt_alpha_t, 1e-12)
+                pred_original_sample = jnp.clip(pred_original_sample, -1.0, 1.0)
+                return (
+                    jnp.sqrt(alpha_prev) * pred_original_sample
+                    + jnp.sqrt(jnp.maximum(1.0 - alpha_prev, 0.0)) * noise_pred
+                )
+
+            return jax.lax.fori_loop(
+                0, self.inference_timesteps.shape[0], body_fn, sample,
+            )
+
+        return sample_fn
+
+    # ------------------------------------------------------------------
+    # Fusion override (Flax module)
+    # ------------------------------------------------------------------
+
+    def _fuse_multi_view(self, rgb_feats):
+        if rgb_feats is None:
+            return None
+        rgb_feats = jnp.asarray(rgb_feats, dtype=jnp.float32)
+        if self.view_fusion is not None:
+            return self.view_fusion.apply({}, rgb_feats)
+        return rgb_feats[:, 0]
+
+    def act(self, observations: dict, step: int, eval_mode: bool):
+        del step
+        obs_features, _ = self._prepare_obs_features(observations)
+        self.rng_key, sample_key = jax.random.split(self.rng_key)
+        sample_params = self.ema_params if (eval_mode and self.use_ema) else self.params
+        actions = self._sample_impl(sample_params, sample_key, obs_features)
+        self._block(actions)
+        return np.asarray(jax.device_get(actions), dtype=np.float32)
+
+    def update(
+        self,
+        replay_iter: Iterator[dict],
+        step: int,
+        replay_buffer: ReplayBuffer = None,
+    ) -> dict[str, np.ndarray]:
+        del step
+        batch = next(replay_iter)
+        actions = maybe_numpy(batch["action"]).astype(np.float32, copy=False)
+        action_pad_mask = self._extract_action_pad_mask(batch)
+        loss_coeff = self._loss_weights(batch)
+        obs_features, metrics = self._prepare_obs_features(batch)
+
+        start_time = time.perf_counter()
+        (
+            self.params,
+            self.opt_state,
+            self.rng_key,
+            actor_loss,
+            new_priority,
+            self.ema_params,
+            self._ema_optimization_step,
+        ) = self._update_impl(
+            self.params,
+            self.opt_state,
+            self.rng_key,
+            jnp.asarray(obs_features),
+            jnp.asarray(actions),
+            jnp.asarray(loss_coeff),
+            None if action_pad_mask is None else jnp.asarray(action_pad_mask),
+            self.params if self.ema_params is None else self.ema_params,
+            self._ema_optimization_step,
+        )
+        self._block(actor_loss, new_priority)
+        elapsed = time.perf_counter() - start_time
+        self._update_step_count += 1
+
+        new_priority_np = np.asarray(jax.device_get(new_priority), dtype=np.float32)
+        self._maybe_update_priorities(replay_buffer, batch, new_priority_np)
+        self._maybe_log_update_metrics(metrics, actor_loss, obs_features, elapsed)
+        self._first_update_completed = True
         return metrics
+
+    # ------------------------------------------------------------------
+    # State management (overrides for EMA)
+    # ------------------------------------------------------------------
+
+    def state_dict(self) -> dict:
+        state = {"params": self._tree_to_numpy(self.params)}
+        if self.use_ema and self.ema_params is not None:
+            state["_ema_params"] = self._tree_to_numpy(self.ema_params)
+            state["_ema_state"] = {
+                "decay": float(self._ema_decay),
+                "min_decay": float(self._ema_min_decay),
+                "optimization_step": int(self._ema_optimization_step),
+                "update_after_step": int(self._ema_update_after_step),
+                "use_ema_warmup": bool(self._ema_use_warmup),
+                "inv_gamma": float(self._ema_inv_gamma),
+                "power": float(self._ema_power),
+            }
+        return state
+
+    def load_state_dict(self, state_dict: dict):
+        self.params = self._tree_from_numpy(state_dict["params"])
+        if not self.use_ema:
+            return
+        ema_params = state_dict.get("_ema_params")
+        ema_state = state_dict.get("_ema_state")
+        self.ema_params = (
+            self._tree_from_numpy(ema_params) if ema_params is not None else self.params
+        )
+        if ema_state is None:
+            self._ema_optimization_step = 0
+            return
+        self._ema_decay = float(ema_state.get("decay", self._ema_decay))
+        self._ema_min_decay = float(ema_state.get("min_decay", self._ema_min_decay))
+        self._ema_optimization_step = int(
+            ema_state.get("optimization_step", self._ema_optimization_step)
+        )
+        self._ema_update_after_step = int(
+            ema_state.get("update_after_step", self._ema_update_after_step)
+        )
+        self._ema_use_warmup = bool(
+            ema_state.get("use_ema_warmup", self._ema_use_warmup)
+        )
+        self._ema_inv_gamma = float(ema_state.get("inv_gamma", self._ema_inv_gamma))
+        self._ema_power = float(ema_state.get("power", self._ema_power))
+
+
+__all__ = [
+    "DiffusionActorModelSpec",
+    "DiffusionModelSpec",
+    "DiffusionSpec",
+    "Diffusion",
+    "diffusion_model_spec_from_cfg",
+    "diffusion_spec_from_cfg",
+]

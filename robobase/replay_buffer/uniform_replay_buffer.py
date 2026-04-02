@@ -9,18 +9,17 @@ off-policy corrections.
 
 from __future__ import annotations
 import io
+import multiprocessing as mp
 import os
 import tempfile
 from datetime import datetime
 from pathlib import Path
 from typing import Callable, Type
 import math
-from multiprocessing import Value
 from collections import defaultdict
 import logging
 from typing_extensions import override
 
-import torch
 from gymnasium import spaces
 from natsort import natsort
 import numpy as np
@@ -29,6 +28,7 @@ from robobase.replay_buffer.replay_buffer import (
     ReplayBuffer,
     ReplayElement,
 )
+from robobase.replay_buffer.iterator import get_replay_worker_id
 
 
 # String constants for storage
@@ -125,12 +125,14 @@ class UniformReplayBuffer(ReplayBuffer):
         save_dir: str = None,
         purge_replay_on_shutdown: bool = True,
         save_snapshot: bool = False,
+        reuse_saved: bool = False,
         preprocessing_fn: list[Callable[[list[spaces.Dict]], list[spaces.Dict]]] = None,
         preprocess_every_sample: bool = False,
         num_workers: int = 0,
         fetch_every: int = 100,
         sequential: bool = False,
         transition_seq_len: int = 1,
+        multiprocessing_context: str = "fork",
     ):
         """Initializes OutOfGraphReplayBuffer.
 
@@ -233,7 +235,8 @@ class UniformReplayBuffer(ReplayBuffer):
         self.extra_replay_elements = extra_replay_elements
 
         self._storage_signature, self._obs_signature = self.get_storage_signature()
-        self._add_count = Value("i", 0)
+        self._multiprocessing_context = multiprocessing_context
+        self._add_count = mp.get_context(multiprocessing_context).Value("i", 0)
         self._replay_capacity = replay_capacity
 
         self._preprocessing_fn = preprocessing_fn
@@ -263,6 +266,7 @@ class UniformReplayBuffer(ReplayBuffer):
         self._fetch_every = fetch_every
         self._samples_since_last_fetch = self._fetch_every
         self._save_snapshot = save_snapshot
+        self._reused_existing = False
 
         logging.info(
             "Creating a %s replay memory with the following parameters:",
@@ -274,6 +278,8 @@ class UniformReplayBuffer(ReplayBuffer):
         logging.info("\t nstep: %d", self._nstep)
         logging.info("\t gamma: %f", self._gamma)
         self._is_first = True
+        if reuse_saved:
+            self._bootstrap_from_existing_episodes()
 
     @property
     def frame_stack(self):
@@ -298,6 +304,10 @@ class UniformReplayBuffer(ReplayBuffer):
     @property
     def batch_size(self):
         return self._batch_size
+
+    @property
+    def reused_existing(self) -> bool:
+        return self._reused_existing
 
     @property
     def sequential(self):
@@ -405,6 +415,7 @@ class UniformReplayBuffer(ReplayBuffer):
         # Info and observation are stored key by key
         transition.update(kwargs)
         transition.update(observation)
+        transition = self._apply_preprocessing(transition)
 
         # Check transition shape is correct
         self._check_add_types(transition, self._storage_signature)
@@ -423,6 +434,7 @@ class UniformReplayBuffer(ReplayBuffer):
 
         transition = {}
         transition.update(final_observation)
+        transition = self._apply_preprocessing(transition)
         self._check_add_types(transition, self._obs_signature)
 
         # Construct final transition with values from final_obs and final_info, with
@@ -462,6 +474,39 @@ class UniformReplayBuffer(ReplayBuffer):
                 )
                 save_episode(episode, self._replay_dir / eps_fn)
 
+    def _bootstrap_from_existing_episodes(self):
+        episode_files = sorted(self._replay_dir.glob("*.npz"))
+        if not episode_files:
+            return
+
+        max_add_count = 0
+        max_episode_idx = -1
+        total_transitions = 0
+        for episode_file in episode_files:
+            parts = episode_file.stem.split("_")
+            if len(parts) < 4:
+                continue
+            eps_idx = int(parts[-3])
+            eps_len = int(parts[-2])
+            global_idx = int(parts[-1])
+            max_episode_idx = max(max_episode_idx, eps_idx)
+            max_add_count = max(max_add_count, global_idx + eps_len)
+            total_transitions += eps_len
+
+        if max_episode_idx < 0:
+            return
+
+        self.add_count = int(max_add_count)
+        self._num_episodes = int(max_episode_idx + 1)
+        self._num_transitions = int(total_transitions)
+        self._is_first = False
+        self._reused_existing = True
+        logging.info(
+            "Bootstrapped replay metadata from %d saved episode files in %s.",
+            len(episode_files),
+            self._replay_dir,
+        )
+
     def _final_transition(self, kwargs):
         transition = {}
         for element_type in self._storage_signature.values():
@@ -482,12 +527,15 @@ class UniformReplayBuffer(ReplayBuffer):
         Args:
           transition: All the elements in a transition.
         """
-        if self._preprocessing_fn is not None and not self._preprocess_every_sample:
-            for fn in self._preprocessing_fn:
-                transition = fn([transition])[0]
-
         for name, data in transition.items():
             self._current_episode[name].append(data)
+
+    def _apply_preprocessing(self, transition: dict) -> dict:
+        if self._preprocessing_fn is None or self._preprocess_every_sample:
+            return transition
+        for fn in self._preprocessing_fn:
+            transition = fn([transition])[0]
+        return transition
 
     def _check_add_types(self, transition: dict, signature: dict):
         """Checks if args passed to the add method match those of the storage.
@@ -645,10 +693,7 @@ class UniformReplayBuffer(ReplayBuffer):
             return
         self._samples_since_last_fetch = 0
 
-        try:
-            worker_id = torch.utils.data.get_worker_info().id
-        except Exception:
-            worker_id = 0
+        worker_id = get_replay_worker_id()
 
         eps_fns = sorted(self._replay_dir.glob("*.npz"), reverse=True)
         fetched_size = 0

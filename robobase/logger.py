@@ -5,8 +5,14 @@ from pathlib import Path
 from omegaconf import OmegaConf
 
 import numpy as np
-import torch
 import wandb
+
+try:
+    import torch as _torch
+    _TORCH_AVAILABLE = True
+except ImportError:
+    _torch = None
+    _TORCH_AVAILABLE = False
 from termcolor import colored
 
 COMMON_PRETRAIN_FORMAT = [
@@ -238,7 +244,7 @@ class Logger(object):
                 self._sw.add_image(key, v, step)
 
     def _log(self, key, value, step):
-        if torch.is_tensor(value):
+        if _TORCH_AVAILABLE and _torch.is_tensor(value):
             # If used has logged tensor, convert to numpy
             value = value.detach().cpu().numpy()
         # If plot is in the key, it is not a video.

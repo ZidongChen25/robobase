@@ -42,7 +42,7 @@ method:
   learnable_std: false
 
   actor_model:
-    _target_: robobase.models.diffusion_models.MLPWithBottleneckFeaturesForDiffusion
+    _target_: robobase.backends.torch.models.diffusion.MLPWithBottleneckFeaturesForDiffusion
     _partial_: true
     input_shapes: ???
     output_shape: ???

@@ -1,0 +1,9 @@
+# @package _global_
+
+defaults:
+  - robomimic
+  - _self_
+
+env:
+  task_name: ToolHang
+  dataset_path: third_party_datasets/robomimic/tool_hang/ph/low_dim_v141.hdf5
