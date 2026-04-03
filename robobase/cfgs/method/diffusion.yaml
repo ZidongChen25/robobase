@@ -2,19 +2,21 @@
 action_sequence: 20
 
 method:
-  _target_: robobase.method.diffusion.Diffusion
+  name: diffusion
   is_rl: false
   lr: 1e-4
   num_train_steps: ${num_pretrain_steps}
-  num_diffusion_iters: 50
+  num_diffusion_iters: 100
   adaptive_lr: true
   actor_grad_clip: null
+  use_ema: false
+  ema_decay: 0.9999
+  weight_decay: 1.0e-6
+  noise_mask_steps: 0
+  repeat_action: false
 
   actor_model:
-    _target_: robobase.models.diffusion_models.ConditionalUnet1D  # film_unet
-    _partial_: true
-    input_shapes: ???
-    output_shape: ???
+    type: conditional_unet1d
     sequence_length: ${action_sequence}
     diffusion_step_embed_dim: 256
     down_dims: [256, 512, 1024]
@@ -22,13 +24,9 @@ method:
     n_groups: 8
 
   encoder_model:
-    _target_: robobase.models.ResNetEncoder
-    _partial_: true
-    input_shape: ???
+    type: resnet
     model: resnet18
 
   view_fusion_model:
-    _target_: robobase.models.FusionMultiCamFeature
-    _partial_: true
-    input_shape: ???
+    type: multicam_feature
     mode: flatten

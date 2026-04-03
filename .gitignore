@@ -40,3 +40,7 @@ events.out.*
 third_party_datasets/
 
 robomimic.md
+.venv/
+.claude/
+.pytest_cache/
+.vscode/

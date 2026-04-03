@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import numpy as np
-from torch.utils.data import IterableDataset
 
 
 class ReplayElement(object):
@@ -12,7 +11,7 @@ class ReplayElement(object):
         self.is_observation = is_observation
 
 
-class ReplayBuffer(IterableDataset):
+class ReplayBuffer:
     def replay_capacity(self):
         pass
 
@@ -85,3 +84,7 @@ class ReplayBuffer(IterableDataset):
 
     def load_state_dict(self, state_dict: dict):
         del state_dict
+
+    @property
+    def reused_existing(self) -> bool:
+        return False

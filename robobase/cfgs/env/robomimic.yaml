@@ -8,4 +8,5 @@ env:
   filter_key: train
   random_traj: false
   use_live_env: false
-  cameras: ["agentview"]
+  cameras: []  # infer cameras from the dataset for image observations
+  render_gpu_device_id: -1  # robosuite offscreen renderer device id (-1 lets robosuite choose)

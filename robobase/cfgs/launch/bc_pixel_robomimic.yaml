@@ -1,0 +1,21 @@
+# @package _global_
+
+defaults:
+  - ../method: bc
+
+demos: .inf
+num_pretrain_steps: 200000
+num_train_frames: 0
+num_train_envs: 0
+num_eval_episodes: 0
+batch_size: 256
+is_imitation_learning: true
+
+pixels: true
+frame_stack: 1
+action_sequence: 1
+execution_length: 1
+update_every_steps: 1
+
+replay:
+  nstep: 1

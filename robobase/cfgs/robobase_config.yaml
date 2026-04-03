@@ -1,5 +1,6 @@
 defaults:
   - _self_
+  - backend: jax
   - env: null
   - method: null
   - intrinsic_reward_module: null
@@ -9,6 +10,7 @@ defaults:
 # Universal settings
 create_train_env: true
 num_train_envs: 1
+num_eval_envs: 1
 replay_size_before_train: 2000
 num_pretrain_steps: 0
 num_train_frames: 1100000
@@ -18,6 +20,7 @@ update_every_steps: 2
 num_explore_steps: 2000
 save_snapshot: false
 snapshot_every_n: 1000
+snapshot_save_start_step: 0
 batch_size: 256
 is_imitation_learning: false
 
@@ -51,9 +54,13 @@ replay:
   gamma: 0.99
   demo_size: null
   save_dir: null
+  persist: false
+  reuse_saved: false
   nstep: 3
   num_workers: 4
   pin_memory: true
+  cache_frozen_image_features: false
+  cache_frozen_image_feature_backends: [jax]
   alpha: 0.7  # prioritization
   beta: 0.5  # prioritization
   sequential: false
@@ -63,7 +70,7 @@ replay:
 wandb:  # weight and bias
   use: true
   project: act_bigym
-  entity: younggyo
+  entity: tsztungchen25-imperial-college-london
   name: act
 
 tb:  # TensorBoard
@@ -74,6 +81,7 @@ tb:  # TensorBoard
 # Misc
 experiment_name: exp
 seed: 1
+gpu_id: null
 num_gpus: 1
 log_every: 1000
 log_train_video: false

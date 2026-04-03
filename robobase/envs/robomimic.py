@@ -4,8 +4,10 @@ import logging
 import math
 import os
 import random
+from functools import partial
 from pathlib import Path
 
+import cv2
 import gymnasium as gym
 import numpy as np
 from gymnasium import spaces
@@ -20,9 +22,12 @@ from robobase.envs.wrappers import (
     ConcatDim,
     FrameStack,
     OnehotTime,
+    RecedingHorizonControl,
     RescaleFromTanh,
+    RescaleFromTanhWithMinMax,
+    RescaleFromTanhWithStandardization,
 )
-from robobase.utils import add_demo_to_replay_buffer
+from robobase.utils import add_demo_to_replay_buffer, rescale_demo_actions
 
 try:
     import h5py
@@ -41,11 +46,24 @@ def _resolve_dataset_path(dataset_path: str) -> Path:
     path = Path(os.path.expanduser(dataset_path))
     if path.is_absolute():
         return path
+
+    candidates = []
     try:
         base_dir = Path(get_original_cwd())
     except ValueError:
         base_dir = Path.cwd()
-    return (base_dir / path).resolve()
+    candidates.append((base_dir / path).resolve())
+    candidates.append((Path.cwd() / path).resolve())
+
+    # Allow this backend repo to reuse datasets that live in the sibling
+    # /home/.../robobase workspace without copying them locally.
+    sibling_robobase_root = Path(__file__).resolve().parents[3] / "robobase"
+    candidates.append((sibling_robobase_root / path).resolve())
+
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return candidates[0]
 
 
 def _sorted_demo_keys(keys: list[str]) -> list[str]:
@@ -93,6 +111,88 @@ def _convert_obs_dict(obs_dict) -> dict[str, np.ndarray]:
     return converted
 
 
+def _sort_obs_dict(obs_dict: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
+    return {key: obs_dict[key] for key in sorted(obs_dict.keys())}
+
+
+def _camera_name_to_rgb_key(camera_name: str) -> str:
+    normalized = _normalise_rgb_key(str(camera_name))
+    if normalized.endswith("_rgb"):
+        return normalized
+    return f"{normalized}_rgb"
+
+
+def _rgb_keys_from_obs_dict(obs_dict: dict[str, np.ndarray]) -> list[str]:
+    return [
+        key
+        for key, value in sorted(obs_dict.items())
+        if value.dtype == np.uint8 and value.ndim == 3 and key.endswith("_rgb")
+    ]
+
+
+def _resize_rgb_obs(
+    value: np.ndarray, visual_observation_shape: tuple[int, int]
+) -> np.ndarray:
+    target_height, target_width = (int(dim) for dim in visual_observation_shape)
+    if value.shape[-2:] == (target_height, target_width):
+        return value
+
+    resized = cv2.resize(
+        np.moveaxis(value, 0, -1),
+        (target_width, target_height),
+        interpolation=cv2.INTER_AREA,
+    )
+    if resized.ndim == 2:
+        resized = resized[:, :, None]
+    return np.moveaxis(resized, -1, 0).astype(value.dtype, copy=False)
+
+
+def _filter_obs_dict_for_cfg(
+    obs_dict: dict[str, np.ndarray], cfg: DictConfig
+) -> dict[str, np.ndarray]:
+    if not cfg.pixels:
+        return {
+            key: value
+            for key, value in obs_dict.items()
+            if not (value.dtype == np.uint8 and value.ndim == 3 and key.endswith("_rgb"))
+        }
+
+    dataset_rgb_keys = _rgb_keys_from_obs_dict(obs_dict)
+    if not dataset_rgb_keys:
+        return obs_dict
+
+    configured_cameras = list(cfg.env.cameras)
+    configured_rgb_keys = [
+        _camera_name_to_rgb_key(camera_name) for camera_name in configured_cameras
+    ]
+    selected_rgb_keys = [key for key in configured_rgb_keys if key in dataset_rgb_keys]
+
+    if not selected_rgb_keys:
+        selected_rgb_keys = dataset_rgb_keys
+        inferred_cameras = [key[: -len("_rgb")] for key in selected_rgb_keys]
+        if configured_cameras and configured_cameras != inferred_cameras:
+            logging.warning(
+                "robomimic dataset cameras %s do not match cfg.env.cameras=%s. "
+                "Falling back to dataset cameras.",
+                inferred_cameras,
+                configured_cameras,
+            )
+        if configured_cameras != inferred_cameras:
+            with open_dict(cfg):
+                cfg.env.cameras = inferred_cameras
+
+    visual_observation_shape = tuple(cfg.visual_observation_shape)
+    filtered_obs = {}
+    for key, value in obs_dict.items():
+        is_rgb = value.dtype == np.uint8 and value.ndim == 3 and key.endswith("_rgb")
+        if is_rgb:
+            if key in selected_rgb_keys:
+                filtered_obs[key] = _resize_rgb_obs(value, visual_observation_shape)
+            continue
+        filtered_obs[key] = value
+    return filtered_obs
+
+
 def _convert_obs_group(obs_group, index: int) -> dict[str, np.ndarray]:
     return _convert_obs_dict({key: obs_group[key][index] for key in obs_group.keys()})
 
@@ -126,6 +226,10 @@ def _normalize_num_demos(num_demos) -> float:
             return math.inf
         return float(value)
     return float(num_demos)
+
+
+def _cfg_get(cfg: DictConfig, key: str, default):
+    return cfg.get(key, default)
 
 
 class RobomimicPlaceholderEnv(gym.Env):
@@ -174,6 +278,8 @@ class RobomimicRobosuiteEnv(gym.Env):
         pixels: bool,
         visual_observation_shape: tuple[int, int],
         cameras: list[str],
+        has_offscreen_renderer: bool,
+        render_gpu_device_id: int,
     ):
         try:
             import robosuite
@@ -187,10 +293,11 @@ class RobomimicRobosuiteEnv(gym.Env):
         kwargs = copy.deepcopy(env_kwargs)
         kwargs.update(
             has_renderer=False,
-            has_offscreen_renderer=True,
+            has_offscreen_renderer=has_offscreen_renderer,
             ignore_done=True,
             use_object_obs=True,
             use_camera_obs=pixels,
+            render_gpu_device_id=render_gpu_device_id,
         )
         if pixels:
             kwargs["camera_names"] = cameras
@@ -261,7 +368,7 @@ class RobomimicRobosuiteEnv(gym.Env):
                 new_key, converted = _convert_obs_value(key, value)
                 observation[new_key] = converted
 
-        return observation
+        return _sort_obs_dict(observation)
 
     def render(self):
         return self._env.sim.render(camera_name=self._render_camera)[::-1]
@@ -289,7 +396,9 @@ class RobomimicEnvFactory(EnvFactory):
                 raise ValueError("robomimic dataset does not contain any demos.")
             env_meta = json.loads(dataset_file["data"].attrs["env_args"])
             first_demo = dataset_file[f"data/{demo_keys[0]}"]
-            reset_observation = _convert_obs_group(first_demo["obs"], 0)
+            reset_observation = _filter_obs_dict_for_cfg(
+                _convert_obs_group(first_demo["obs"], 0), cfg
+            )
             max_episode_length = max(
                 int(dataset_file[f"data/{key}"].attrs["num_samples"])
                 for key in demo_keys
@@ -325,7 +434,12 @@ class RobomimicEnvFactory(EnvFactory):
                 cfg.env.episode_length = max_episode_length
 
     def _load_demos_from_dataset(
-        self, dataset_path: Path, filter_key: str | None, num_demos: int, random_traj: bool
+        self,
+        cfg: DictConfig,
+        dataset_path: Path,
+        filter_key: str | None,
+        num_demos: int,
+        random_traj: bool,
     ) -> list[Demo]:
         _require_h5py()
         num_demos = _normalize_num_demos(num_demos)
@@ -346,14 +460,23 @@ class RobomimicEnvFactory(EnvFactory):
                 actions = np.asarray(episode["actions"], dtype=np.float32)
                 rewards = np.asarray(episode["rewards"], dtype=np.float32)
                 dones = np.asarray(episode["dones"], dtype=np.uint8).astype(bool)
-                demo_timesteps = [(_convert_obs_group(episode["obs"], 0), {"demo": 1})]
+                demo_timesteps = [
+                    (
+                        _filter_obs_dict_for_cfg(
+                            _convert_obs_group(episode["obs"], 0), cfg
+                        ),
+                        {"demo": 1},
+                    )
+                ]
                 for index in range(actions.shape[0]):
                     terminated = bool(dones[index])
                     truncated = index == (actions.shape[0] - 1) and not terminated
                     info = {"demo_action": actions[index], "demo": 1}
                     demo_timesteps.append(
                         (
-                            _convert_obs_group(episode["next_obs"], index),
+                            _filter_obs_dict_for_cfg(
+                                _convert_obs_group(episode["next_obs"], index), cfg
+                            ),
                             float(rewards[index]),
                             terminated,
                             truncated,
@@ -362,6 +485,99 @@ class RobomimicEnvFactory(EnvFactory):
                     )
                 demos.append(Demo(demo_timesteps))
         return demos
+
+    def _compute_action_stats(self, demos: list[Demo]) -> dict[str, np.ndarray]:
+        actions = []
+        for demo in demos:
+            for step in demo:
+                *_, info = step
+                if isinstance(info, dict) and "demo_action" in info:
+                    actions.append(info["demo_action"])
+        if len(actions) == 0:
+            raise ValueError("robomimic demos do not contain any actions.")
+
+        actions = np.stack(actions, axis=0)
+        action_stats = {
+            "mean": np.mean(actions, axis=0),
+            "std": np.std(actions, axis=0),
+            "max": np.max(actions, axis=0),
+            "min": np.min(actions, axis=0),
+        }
+        action_stats["std"][action_stats["std"] == 0] = 1.0
+        return action_stats
+
+    def _compute_obs_stats(self, demos: list[Demo]) -> dict[str, dict[str, np.ndarray]]:
+        observations = []
+        for demo in demos:
+            for step in demo:
+                observation = step[0]
+                if isinstance(observation, dict):
+                    observations.append(observation)
+        if len(observations) == 0:
+            raise ValueError("robomimic demos do not contain any observations.")
+
+        keys = observations[0].keys()
+        obs_arrays = {
+            key: np.stack([obs[key] for obs in observations], axis=0) for key in keys
+        }
+        obs_stats = {
+            "mean": {key: np.mean(obs_arrays[key], axis=0) for key in keys},
+            "std": {key: np.std(obs_arrays[key], axis=0) for key in keys},
+            "max": {key: np.max(obs_arrays[key], axis=0) for key in keys},
+            "min": {key: np.min(obs_arrays[key], axis=0) for key in keys},
+        }
+        for key in keys:
+            obs_stats["std"][key][obs_stats["std"][key] == 0] = 1.0
+        return obs_stats
+
+    def _make_rescale_from_tanh_cls(self, cfg: DictConfig):
+        use_standardization = _cfg_get(cfg, "use_standardization", False)
+        use_min_max_normalization = _cfg_get(
+            cfg, "use_min_max_normalization", False
+        )
+        demos = _cfg_get(cfg, "demos", 0)
+        min_max_margin = _cfg_get(cfg, "min_max_margin", 0.0)
+
+        assert not (
+            use_standardization and use_min_max_normalization
+        ), "You can't use both standardization and min/max normalization."
+
+        if use_standardization:
+            assert demos != 0
+            return partial(
+                RescaleFromTanhWithStandardization,
+                action_stats=self._action_stats,
+            )
+        if use_min_max_normalization:
+            assert demos != 0
+            return partial(
+                RescaleFromTanhWithMinMax,
+                action_stats=self._action_stats,
+                min_max_margin=min_max_margin,
+            )
+        return RescaleFromTanh
+
+    def _rescale_demo_action_helper(self, info, cfg: DictConfig):
+        use_standardization = _cfg_get(cfg, "use_standardization", False)
+        use_min_max_normalization = _cfg_get(
+            cfg, "use_min_max_normalization", False
+        )
+        min_max_margin = _cfg_get(cfg, "min_max_margin", 0.0)
+
+        if use_standardization:
+            return RescaleFromTanhWithStandardization.transform_to_tanh(
+                info["demo_action"],
+                action_stats=self._action_stats,
+            )
+        if use_min_max_normalization:
+            return RescaleFromTanhWithMinMax.transform_to_tanh(
+                info["demo_action"],
+                action_stats=self._action_stats,
+                min_max_margin=min_max_margin,
+            )
+        return RescaleFromTanh.transform_to_tanh(
+            info["demo_action"], self._raw_action_space
+        )
 
     def _wrap_env(
         self,
@@ -374,7 +590,19 @@ class RobomimicEnvFactory(EnvFactory):
             action_space = copy.deepcopy(env.action_space)
             observation_space = copy.deepcopy(env.observation_space)
 
-        env = RescaleFromTanh(env)
+        rescale_from_tanh_cls = self._make_rescale_from_tanh_cls(cfg)
+        env = rescale_from_tanh_cls(env)
+
+        obs_stats = None
+        norm_obs = _cfg_get(cfg, "norm_obs", False)
+        demos = _cfg_get(cfg, "demos", 0)
+        execution_length = _cfg_get(cfg, "execution_length", cfg.action_sequence)
+        temporal_ensemble = _cfg_get(cfg, "temporal_ensemble", True)
+        temporal_ensemble_gain = _cfg_get(cfg, "temporal_ensemble_gain", 0.01)
+
+        if norm_obs:
+            assert demos != 0
+            obs_stats = self._obs_stats
 
         has_low_dim_keys = any(
             len(space.shape) == 1 for space in env.observation_space.values()
@@ -385,6 +613,8 @@ class RobomimicEnvFactory(EnvFactory):
                 shape_length=1,
                 dim=-1,
                 new_name="low_dim_state",
+                norm_obs=norm_obs,
+                obs_stats=obs_stats,
             )
 
         env = TimeLimit(env, cfg.env.episode_length)
@@ -392,7 +622,20 @@ class RobomimicEnvFactory(EnvFactory):
             env = OnehotTime(env, cfg.env.episode_length)
         if not demo_env:
             env = FrameStack(env, cfg.frame_stack)
-            env = ActionSequence(env, cfg.action_sequence)
+            if cfg.action_sequence == execution_length:
+                env = ActionSequence(
+                    env,
+                    cfg.action_sequence,
+                )
+            else:
+                env = RecedingHorizonControl(
+                    env,
+                    cfg.action_sequence,
+                    cfg.env.episode_length,
+                    execution_length,
+                    temporal_ensemble,
+                    temporal_ensemble_gain,
+                )
         env = AppendDemoInfo(env)
 
         if return_raw_spaces:
@@ -402,12 +645,15 @@ class RobomimicEnvFactory(EnvFactory):
     def _make_base_env(self, cfg: DictConfig):
         self._ensure_dataset_metadata(cfg)
         if cfg.env.use_live_env:
+            needs_offscreen_renderer = cfg.pixels or cfg.log_eval_video
             return RobomimicRobosuiteEnv(
                 env_name=self._env_meta["env_name"],
                 env_kwargs=self._env_meta["env_kwargs"],
                 pixels=cfg.pixels,
                 visual_observation_shape=tuple(cfg.visual_observation_shape),
                 cameras=list(cfg.env.cameras),
+                has_offscreen_renderer=needs_offscreen_renderer,
+                render_gpu_device_id=cfg.env.render_gpu_device_id,
             )
 
         if not self._warned_about_placeholder:
@@ -430,23 +676,54 @@ class RobomimicEnvFactory(EnvFactory):
             [lambda: self._wrap_env(self._make_base_env(cfg), cfg) for _ in range(cfg.num_train_envs)]
         )
 
+    def get_spaces(self, cfg: DictConfig) -> tuple[gym.Space, gym.Space]:
+        self._ensure_dataset_metadata(cfg)
+        wrapped_env = self._wrap_env(
+            RobomimicPlaceholderEnv(
+                observation_space=copy.deepcopy(self._raw_observation_space),
+                action_space=copy.deepcopy(self._raw_action_space),
+                reset_observation=copy.deepcopy(self._reset_observation),
+                render_shape=tuple(cfg.visual_observation_shape),
+            ),
+            cfg,
+        )
+        return wrapped_env.observation_space, wrapped_env.action_space
+
     def make_eval_env(self, cfg: DictConfig) -> gym.Env:
         self._ensure_dataset_metadata(cfg)
         env = self._make_base_env(cfg)
         wrapped_env, _ = self._wrap_env(env, cfg, return_raw_spaces=True)
         return wrapped_env
 
+    def make_eval_envs(self, cfg: DictConfig) -> gym.vector.VectorEnv:
+        self._ensure_dataset_metadata(cfg)
+        return gym.vector.SyncVectorEnv(
+            [
+                lambda: self._wrap_env(self._make_base_env(cfg), cfg)
+                for _ in range(cfg.num_eval_envs)
+            ]
+        )
+
     def collect_or_fetch_demos(self, cfg: DictConfig, num_demos: int):
         self._ensure_dataset_metadata(cfg)
         self._raw_demos = self._load_demos_from_dataset(
+            cfg=cfg,
             dataset_path=self._dataset_path,
             filter_key=cfg.env.filter_key,
             num_demos=num_demos,
             random_traj=cfg.env.random_traj,
         )
+        if _cfg_get(cfg, "use_standardization", False) or _cfg_get(
+            cfg, "use_min_max_normalization", False
+        ):
+            self._action_stats = self._compute_action_stats(self._raw_demos)
+        if _cfg_get(cfg, "norm_obs", False):
+            self._obs_stats = self._compute_obs_stats(self._raw_demos)
 
     def post_collect_or_fetch_demos(self, cfg: DictConfig):
-        self._demos = self._raw_demos
+        self._demos = rescale_demo_actions(
+            self._rescale_demo_action_helper, self._raw_demos, cfg
+        )
 
     def load_demos_into_replay(
         self, cfg: DictConfig, buffer, is_demo_buffer: bool = False
