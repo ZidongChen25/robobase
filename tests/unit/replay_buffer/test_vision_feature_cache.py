@@ -6,7 +6,9 @@ from omegaconf import OmegaConf
 
 from robobase.replay_buffer.uniform_replay_buffer import UniformReplayBuffer
 from robobase.replay_buffer.vision_feature_cache import (
+    JAX_ACT_FEATURE_KEY,
     JAX_DIFFUSION_FEATURE_KEY,
+    JAX_FLOW_MATCHING_FEATURE_KEY,
     build_vision_feature_cache_plan,
 )
 
@@ -20,6 +22,60 @@ def _make_diffusion_cfg(cache_setting="auto"):
                 "actor_model": {
                     "type": "conditional_unet1d",
                     "sequence_length": 16,
+                },
+                "encoder_model": {
+                    "type": "resnet",
+                    "model": "resnet18",
+                },
+                "view_fusion_model": {
+                    "type": "multicam_feature",
+                    "mode": "flatten",
+                },
+            },
+            "replay": {
+                "cache_frozen_image_features": cache_setting,
+                "cache_frozen_image_feature_backends": ["jax"],
+            },
+        }
+    )
+
+
+def _make_flow_matching_cfg(cache_setting="auto"):
+    return OmegaConf.create(
+        {
+            "action_sequence": 16,
+            "method": {
+                "name": "flow_matching",
+                "backbone": {
+                    "type": "fully_connected",
+                    "sequence_length": 16,
+                },
+                "encoder_model": {
+                    "type": "resnet",
+                    "model": "resnet18",
+                },
+                "view_fusion_model": {
+                    "type": "multicam_feature",
+                    "mode": "flatten",
+                },
+            },
+            "replay": {
+                "cache_frozen_image_features": cache_setting,
+                "cache_frozen_image_feature_backends": ["jax"],
+            },
+        }
+    )
+
+
+def _make_act_cfg(cache_setting="auto"):
+    return OmegaConf.create(
+        {
+            "action_sequence": 16,
+            "method": {
+                "name": "act",
+                "actor_model": {
+                    "type": "transformer",
+                    "num_queries": 16,
                 },
                 "encoder_model": {
                     "type": "resnet",
@@ -67,6 +123,26 @@ def test_build_vision_feature_cache_plan_replaces_raw_rgb_with_cached_features()
     assert "rgb1" not in plan.observation_space.spaces
     assert JAX_DIFFUSION_FEATURE_KEY in plan.observation_space.spaces
     assert plan.observation_space[JAX_DIFFUSION_FEATURE_KEY].shape == (1, 1024)
+
+
+def test_cache_plan_supports_flow_matching_and_act_feature_keys():
+    flow_plan = build_vision_feature_cache_plan(
+        cfg=_make_flow_matching_cfg(),
+        observation_space=_make_pixel_obs_space(),
+        save_dir=None,
+        reuse_saved=False,
+    )
+    act_plan = build_vision_feature_cache_plan(
+        cfg=_make_act_cfg(),
+        observation_space=_make_pixel_obs_space(),
+        save_dir=None,
+        reuse_saved=False,
+    )
+
+    assert JAX_FLOW_MATCHING_FEATURE_KEY in flow_plan.observation_space.spaces
+    assert flow_plan.observation_space[JAX_FLOW_MATCHING_FEATURE_KEY].shape == (1, 1024)
+    assert JAX_ACT_FEATURE_KEY in act_plan.observation_space.spaces
+    assert act_plan.observation_space[JAX_ACT_FEATURE_KEY].shape == (1, 1024)
 
 
 def test_feature_preprocessor_rewrites_raw_transition(monkeypatch):

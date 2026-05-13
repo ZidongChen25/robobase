@@ -186,6 +186,48 @@ class RescaleFromTanhWithStandardization(
         )
 
 
+class RescaleFromStandardization(gym.ActionWrapper, gym.utils.RecordConstructorArgs):
+    """Takes standardized policy actions and maps them back to raw env actions."""
+
+    def __init__(self, env: gym.Env, action_stats: Dict[str, np.ndarray]):
+        gym.utils.RecordConstructorArgs.__init__(self)
+        gym.ActionWrapper.__init__(self, env)
+        action_space = env.action_space
+        self.orig_action_space = action_space
+        self.action_space = spaces.Box(
+            -np.inf,
+            np.inf,
+            shape=action_space.shape,
+            dtype=action_space.dtype,
+        )
+        self.is_vector_env = getattr(env, "is_vector_env", False)
+        self.action_stats = action_stats
+
+    @staticmethod
+    def transform_from_standardization(action, action_stats):
+        action_mean, action_std = action_stats["mean"], action_stats["std"]
+        if action.ndim == 2:
+            new_action = action * action_std[None] + action_mean[None]
+        else:
+            new_action = action * action_std + action_mean
+        return new_action.astype(action.dtype, copy=False)
+
+    @staticmethod
+    def transform_to_standardization(action, action_stats):
+        action_mean, action_std = action_stats["mean"], action_stats["std"]
+        if action.ndim == 2:
+            new_action = (action - action_mean[None]) / (action_std[None] + 1e-8)
+        else:
+            new_action = (action - action_mean) / (action_std + 1e-8)
+        return new_action.astype(np.float32, copy=False)
+
+    def action(self, action: WrapperActType) -> ActType:
+        raw_action = RescaleFromStandardization.transform_from_standardization(
+            action, self.action_stats
+        )
+        return np.clip(raw_action, self.orig_action_space.low, self.orig_action_space.high)
+
+
 class RescaleFromTanhWithMinMax(gym.ActionWrapper, gym.utils.RecordConstructorArgs):
     """Takes action from tanh space (-1 to 1), and transforms to env action space
     by reverting min/max normalization."""

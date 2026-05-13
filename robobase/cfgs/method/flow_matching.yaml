@@ -1,0 +1,44 @@
+# @package _global_
+action_sequence: 20
+
+method:
+  name: flow_matching
+  is_rl: false
+  lr: 1e-4
+  num_train_steps: ${num_pretrain_steps}
+  num_flow_steps: 5
+  adaptive_lr: true
+  actor_grad_clip: null
+  use_ema: false
+  ema_decay: 0.9999
+  weight_decay: 1.0e-6
+  noise_mask_steps: 0
+  repeat_action: false
+
+  objective:
+    type: rectified_flow
+    num_flow_steps: ${method.num_flow_steps}
+    sampler: euler
+
+  backbone:
+    type: fully_connected
+    sequence_length: ${action_sequence}
+    diffusion_step_embed_dim: 256
+    down_dims: [256, 512, 1024]
+    kernel_size: 5
+    n_groups: 8
+    hidden_dims: [256, 256]
+    d_model: 256
+    n_heads: 4
+    num_layers: 8
+    n_cond_layers: 0
+    depth: 12
+    dropout: 0.0
+
+  encoder_model:
+    type: resnet
+    model: resnet18
+
+  view_fusion_model:
+    type: multicam_feature
+    mode: flatten

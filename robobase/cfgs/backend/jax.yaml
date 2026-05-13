@@ -5,3 +5,7 @@ backend:
   platform: cuda
   jit: true
   suppress_cpp_logs: true
+  replay_prefetch_size: 4
+  replay_device_prefetch: true
+  fused_update_steps: 8
+  update_block_every_steps: 1

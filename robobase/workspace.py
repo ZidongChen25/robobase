@@ -15,6 +15,8 @@ from robobase.factory import create_agent, method_name_from_cfg
 from robobase.envs.env import EnvFactory
 from robobase.logger import Logger
 from robobase.replay_buffer.iterator import (
+    PrefetchReplayBatchIterator,
+    create_epoch_replay_iterator,
     create_jax_replay_iterator,
     normalize_replay_num_workers,
 )
@@ -171,6 +173,11 @@ def _create_default_replay_buffer(
         preprocessing_fn=None if cache_plan is None else cache_plan.preprocessing_fn,
         num_workers=cfg.replay.num_workers,
         sequential=cfg.replay.sequential,
+        transition_seq_len=cfg.replay.transition_seq_len,
+        action_sequence_start_offset=int(
+            cfg.replay.get("action_sequence_start_offset", 0)
+        ),
+        action_padding=str(cfg.replay.get("action_padding", "zero")),
         multiprocessing_context=multiprocessing_context,
     )
 
@@ -229,6 +236,17 @@ class Workspace:
             raise ValueError(
                 "execution_length must be <= action_sequence, got "
                 f"{cfg.execution_length} and {cfg.action_sequence}."
+            )
+        action_execution_start = int(cfg.get("action_execution_start", 0))
+        if action_execution_start < 0:
+            raise ValueError(
+                f"action_execution_start must be >= 0, got {action_execution_start}."
+            )
+        if action_execution_start + cfg.execution_length > cfg.action_sequence:
+            raise ValueError(
+                "action_execution_start + execution_length must be <= "
+                f"action_sequence, got {action_execution_start} + "
+                f"{cfg.execution_length} > {cfg.action_sequence}."
             )
         noise_mask_steps = int(cfg.method.get("noise_mask_steps", 0))
         if noise_mask_steps < 0 or noise_mask_steps >= cfg.action_sequence:
@@ -429,10 +447,26 @@ class Workspace:
     @property
     def replay_iter(self):
         if self._replay_iter is None:
-            _replay_iter = create_jax_replay_iterator(
-                self.replay_buffer,
-                num_workers=self.replay_num_workers,
-            )
+            if self._should_use_epoch_style_replay():
+                if self.use_demo_replay:
+                    raise NotImplementedError(
+                        "Epoch-style replay sampling does not support demo replay."
+                    )
+                if self.prioritized_replay:
+                    raise NotImplementedError(
+                        "Epoch-style replay sampling is not compatible with prioritized replay."
+                    )
+                _replay_iter = create_epoch_replay_iterator(
+                    self.replay_buffer,
+                    execution_length=self.cfg.execution_length,
+                    shuffle=True,
+                    seed=int(self.cfg.seed),
+                )
+            else:
+                _replay_iter = create_jax_replay_iterator(
+                    self.replay_buffer,
+                    num_workers=self.replay_num_workers,
+                )
             if self.use_demo_replay:
                 _demo_replay_iter = create_jax_replay_iterator(
                     self.demo_replay_buffer,
@@ -441,8 +475,74 @@ class Workspace:
                 _replay_iter = _merge_replay_demo_iter(
                     _replay_iter, _demo_replay_iter
                 )
+            prefetch_size = int(
+                self.cfg.get("backend", {}).get("replay_prefetch_size", 0)
+                if self.cfg.get("backend", None)
+                else 0
+            )
+            if prefetch_size > 0:
+                backend_cfg = self.cfg.get("backend", {})
+                map_fn = None
+                if bool(backend_cfg.get("replay_device_prefetch", False)):
+                    map_fn = getattr(self.agent, "prefetch_batch", None)
+                _replay_iter = PrefetchReplayBatchIterator(
+                    _replay_iter,
+                    queue_size=prefetch_size,
+                    worker_name="jax_replay_prefetch",
+                    map_fn=map_fn,
+                )
             self._replay_iter = _replay_iter
         return self._replay_iter
+
+    def _should_use_epoch_style_replay(self) -> bool:
+        return bool(
+            self.cfg.is_imitation_learning
+            and self.cfg.num_train_frames <= 0
+            and self.cfg.replay.get("epoch_style_sampling", False)
+        )
+
+    def _offline_batches_per_epoch(self) -> int:
+        if not self._should_use_epoch_style_replay():
+            raise ValueError(
+                "num_pretrain_epochs/eval_every_epochs require offline imitation "
+                "learning with replay.epoch_style_sampling=true."
+            )
+        epoch_iter = create_epoch_replay_iterator(
+            self.replay_buffer,
+            execution_length=self.cfg.execution_length,
+            shuffle=False,
+            seed=int(self.cfg.seed),
+        )
+        try:
+            return int(epoch_iter.batches_per_epoch)
+        finally:
+            close = getattr(epoch_iter, "close", None)
+            if callable(close):
+                close()
+
+    def _resolve_pretrain_schedule(self) -> tuple[int, int]:
+        num_pretrain_steps = int(self.cfg.num_pretrain_steps)
+        eval_every_steps = int(self.cfg.eval_every_steps)
+        num_pretrain_epochs = self.cfg.get("num_pretrain_epochs", None)
+        eval_every_epochs = self.cfg.get("eval_every_epochs", None)
+
+        if num_pretrain_epochs is None and eval_every_epochs is None:
+            return num_pretrain_steps, eval_every_steps
+
+        batches_per_epoch = self._offline_batches_per_epoch()
+        if num_pretrain_epochs is not None:
+            num_pretrain_steps = int(num_pretrain_epochs) * batches_per_epoch
+        if eval_every_epochs is not None:
+            eval_every_steps = int(eval_every_epochs) * batches_per_epoch
+
+        logging.info(
+            "Resolved offline pretrain schedule: %d batches/epoch, "
+            "%d pretrain steps, eval every %d steps.",
+            batches_per_epoch,
+            num_pretrain_steps,
+            eval_every_steps,
+        )
+        return num_pretrain_steps, eval_every_steps
 
     def _close_replay_iter(self):
         if self._replay_iter is None:
@@ -568,7 +668,15 @@ class Workspace:
         first_rollout = []
         metrics = {}
         while eval_until_episode(episode):
-            observation, info = self.eval_env.reset()
+            reset_seed = None
+            env_cfg = self.cfg.get("env", {})
+            eval_seeds = env_cfg.get("eval_seeds", None)
+            eval_seed_start = env_cfg.get("eval_seed_start", None)
+            if eval_seeds is not None:
+                reset_seed = int(eval_seeds[episode % len(eval_seeds)])
+            elif eval_seed_start is not None:
+                reset_seed = int(eval_seed_start) + episode
+            observation, info = self.eval_env.reset(seed=reset_seed)
             # eval agent always has last id (ids start from 0)
             self.agent.reset(self.main_loop_iterations, [self._eval_agent_indices[-1]])
             enabled = eval_record_all_episode or episode == 0
@@ -917,10 +1025,11 @@ class Workspace:
         return action, (*env_step_tuple, next_info), metrics
 
     def _pretrain_on_demos(self):
-        if self.cfg.num_pretrain_steps > 0:
-            pre_train_until_step = _Until(self.cfg.num_pretrain_steps)
+        num_pretrain_steps, eval_every_steps = self._resolve_pretrain_schedule()
+        if num_pretrain_steps > 0:
+            pre_train_until_step = _Until(num_pretrain_steps)
             should_pretrain_log = _Every(self.cfg.log_pretrain_every)
-            should_pretrain_eval = _Every(self.cfg.eval_every_steps)
+            should_pretrain_eval = _Every(eval_every_steps)
             snapshot_every_n = (
                 self.cfg.snapshot_every_n if self.cfg.save_snapshot else 0
             )
@@ -931,13 +1040,50 @@ class Workspace:
             if len(self.replay_buffer) <= 0:
                 raise ValueError(
                     "there is no sample to pre-train with in the replay buffer "
-                    f"but num_pretrain_steps ({self.cfg.num_pretrain_steps}) is > 0"
+                    f"but num_pretrain_steps ({num_pretrain_steps}) is > 0"
                 )
 
             while pre_train_until_step(self.pretrain_steps):
                 if self._shutting_down:
                     break
                 self.agent.logging = False
+
+                fused_update_steps = int(
+                    self.cfg.get("backend", {}).get("fused_update_steps", 1)
+                    if self.cfg.get("backend", None)
+                    else 1
+                )
+                if (
+                    fused_update_steps > 1
+                    and hasattr(self.agent, "update_many")
+                    and not should_pretrain_log(self.pretrain_steps)
+                ):
+                    boundary_step = int(num_pretrain_steps)
+                    if self.cfg.log_pretrain_every:
+                        next_log_step = (
+                            self.pretrain_steps // self.cfg.log_pretrain_every + 1
+                        ) * self.cfg.log_pretrain_every
+                        boundary_step = min(boundary_step, next_log_step)
+                    if eval_every_steps:
+                        next_eval_step = (
+                            self.pretrain_steps // eval_every_steps + 1
+                        ) * eval_every_steps
+                        boundary_step = min(boundary_step, next_eval_step - 1)
+                    if snapshot_every_n:
+                        next_snapshot_step = (
+                            self.pretrain_steps // snapshot_every_n + 1
+                        ) * snapshot_every_n
+                        boundary_step = min(boundary_step, next_snapshot_step - 1)
+                    block_steps = min(
+                        fused_update_steps,
+                        max(0, boundary_step - self.pretrain_steps),
+                    )
+                    if block_steps > 1:
+                        self.agent.update_many(
+                            self.replay_iter, block_steps, self.replay_buffer
+                        )
+                        self._pretrain_step += block_steps
+                        continue
 
                 if should_pretrain_log(self.pretrain_steps):
                     self.agent.logging = True
@@ -1066,9 +1212,10 @@ class Workspace:
             main_loop_iterations = self.main_loop_iterations
         if pretrain_steps is None:
             pretrain_steps = self.pretrain_steps
+        iteration = pretrain_steps if self.train_envs is None else main_loop_iterations
         metrics = {
             "total_time": total_time,
-            "iteration": main_loop_iterations,
+            "iteration": iteration,
             "env_steps": self._calculate_global_env_steps(
                 main_loop_iterations=main_loop_iterations,
                 pretrain_steps=pretrain_steps,

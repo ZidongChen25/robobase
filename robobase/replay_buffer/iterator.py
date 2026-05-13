@@ -56,6 +56,118 @@ class SingleProcessReplayBatchIterator(ReplayBatchIterator):
         return self._replay_buffer.sample(self._replay_buffer.batch_size)
 
 
+class EpochReplayBatchIterator(ReplayBatchIterator):
+    def __init__(
+        self,
+        replay_buffer: ReplayBuffer,
+        *,
+        execution_length: int,
+        shuffle: bool = True,
+        drop_last: bool = True,
+        seed: int | None = None,
+    ):
+        if execution_length < 1:
+            raise ValueError("execution_length must be >= 1.")
+
+        self._replay_buffer = replay_buffer
+        self._batch_size = int(replay_buffer.batch_size)
+        self._shuffle = shuffle
+        self._drop_last = drop_last
+        self._rng = np.random.default_rng(seed)
+
+        replay_buffer.load_all_episodes()
+        self._all_indices = self._build_sample_indices(
+            replay_buffer,
+            execution_length=execution_length,
+        )
+        if self._all_indices.size == 0:
+            raise ValueError(
+                "Epoch replay iterator found no valid samples in the replay buffer."
+            )
+        if self._drop_last and self._all_indices.size < self._batch_size:
+            raise ValueError(
+                "Epoch replay iterator requires at least one full batch, but "
+                f"only found {self._all_indices.size} samples for batch_size="
+                f"{self._batch_size}."
+            )
+        if self._drop_last and self._all_indices.size % self._batch_size != 0:
+            logging.warning(
+                "Epoch replay iterator is dropping the final incomplete batch: "
+                "%d samples with batch_size=%d.",
+                self._all_indices.size,
+                self._batch_size,
+            )
+
+        self._epoch_indices = self._all_indices.copy()
+        self._cursor = 0
+        self._reshuffle()
+
+    @staticmethod
+    def _build_sample_indices(
+        replay_buffer: ReplayBuffer,
+        *,
+        execution_length: int,
+    ) -> np.ndarray:
+        frame_stack = int(getattr(replay_buffer, "frame_stack", 1))
+        action_seq = int(getattr(replay_buffer, "action_seq", 1))
+        indices = []
+        for global_start, episode_length in replay_buffer.episode_index_metadata():
+            max_valid_index = min(
+                episode_length - 1,
+                episode_length - action_seq + execution_length + frame_stack - 2,
+            )
+            if max_valid_index < 0:
+                continue
+            indices.extend(range(global_start, global_start + max_valid_index + 1))
+        return np.asarray(indices, dtype=np.int32)
+
+    def _reshuffle(self):
+        self._epoch_indices = self._all_indices.copy()
+        if self._shuffle:
+            if _TORCH_AVAILABLE:
+                # Match Mobile-GENIMA's epoch replay order, which uses
+                # torch.randperm and therefore advances PyTorch's CPU RNG.
+                order = _torch.randperm(self._epoch_indices.size).cpu().numpy()
+                self._epoch_indices = self._epoch_indices[order]
+            else:
+                self._rng.shuffle(self._epoch_indices)
+        self._cursor = 0
+
+    @property
+    def sample_indices(self) -> np.ndarray:
+        return self._all_indices.copy()
+
+    @property
+    def batches_per_epoch(self) -> int:
+        if self._drop_last:
+            return self._all_indices.size // self._batch_size
+        return int(np.ceil(self._all_indices.size / self._batch_size))
+
+    def __next__(self):
+        if self._cursor >= self._epoch_indices.size:
+            self._reshuffle()
+
+        batch_end = self._cursor + self._batch_size
+        if batch_end > self._epoch_indices.size:
+            if self._drop_last:
+                self._reshuffle()
+                batch_end = self._batch_size
+            else:
+                batch_end = self._epoch_indices.size
+
+        batch_indices = self._epoch_indices[self._cursor:batch_end]
+        self._cursor = batch_end
+        sample_batch_indices = getattr(
+            self._replay_buffer, "sample_batch_indices", None
+        )
+        if callable(sample_batch_indices):
+            return sample_batch_indices(batch_indices)
+        return self._replay_buffer.sample(
+            batch_size=batch_indices.shape[0],
+            indices=batch_indices.tolist(),
+        )
+
+
 class _ReplayWorkerError:
     def __init__(self, worker_id: int, traceback_text: str):
         self.worker_id = worker_id
@@ -181,8 +293,10 @@ class PrefetchReplayBatchIterator(ReplayBatchIterator):
         replay_iter: Iterator[dict[str, Any]],
         queue_size: int,
         worker_name: str,
+        map_fn=None,
     ):
         self._replay_iter = replay_iter
+        self._map_fn = map_fn
         self._queue = queue.Queue(maxsize=max(2, queue_size))
         self._stop_event = threading.Event()
         self._thread = threading.Thread(
@@ -196,6 +310,8 @@ class PrefetchReplayBatchIterator(ReplayBatchIterator):
         try:
             while not self._stop_event.is_set():
                 batch = next(self._replay_iter)
+                if self._map_fn is not None:
+                    batch = self._map_fn(batch)
                 while not self._stop_event.is_set():
                     try:
                         self._queue.put(batch, timeout=0.1)
@@ -271,6 +387,22 @@ def create_jax_replay_iterator(
         replay_buffer,
         num_workers=num_workers,
         start_method="spawn",
+    )
+
+
+def create_epoch_replay_iterator(
+    replay_buffer: ReplayBuffer,
+    *,
+    execution_length: int,
+    shuffle: bool = True,
+    seed: int | None = None,
+) -> ReplayBatchIterator:
+    return EpochReplayBatchIterator(
+        replay_buffer,
+        execution_length=execution_length,
+        shuffle=shuffle,
+        drop_last=True,
+        seed=seed,
     )
 
 

@@ -13,6 +13,8 @@ num_train_envs: 1
 num_eval_envs: 1
 replay_size_before_train: 2000
 num_pretrain_steps: 0
+num_pretrain_epochs: null
+eval_every_epochs: null
 num_train_frames: 1100000
 eval_every_steps: 10000
 num_eval_episodes: 10
@@ -46,6 +48,8 @@ use_standardization: false  # Demo-based standardization for action space
 use_min_max_normalization: false  # Demo-based min-max normalization for action space
 min_max_margin: 0.0  # If set to > 0, introduce margin for demo-driven min-max normalization
 norm_obs: false
+obs_norm_type: standardization
+action_execution_start: 0
 
 # Replay buffer settings
 replay:
@@ -64,7 +68,10 @@ replay:
   alpha: 0.7  # prioritization
   beta: 0.5  # prioritization
   sequential: false
+  epoch_style_sampling: true
   transition_seq_len: 1  # The length of transition sequence returned from sample() call. Only applicable if sequential is True
+  action_sequence_start_offset: 0
+  action_padding: zero
 
 # logging settings
 wandb:  # weight and bias

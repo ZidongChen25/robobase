@@ -542,8 +542,12 @@ def add_demo_to_replay_buffer(wrapped_env: DemoEnv, replay_buffer: ReplayBuffer)
     while not (term or trunc):
         next_obs, rew, term, trunc, next_info = wrapped_env.step(fake_action)
         action = next_info.pop("demo_action")
-        assert np.all(action <= 1.0)
-        assert np.all(action >= -1.0)
+        action_space = wrapped_env.action_space
+        if np.all(np.isfinite(action_space.low)) and np.all(
+            np.isfinite(action_space.high)
+        ):
+            assert np.all(action <= action_space.high)
+            assert np.all(action >= action_space.low)
         ep.append([obs, action, rew, term, trunc, info, next_info])
         obs = next_obs
         info = next_info

@@ -14,6 +14,8 @@ from robobase.method.bc_runtime import bc_observation_layout
 
 JAX_BC_FEATURE_KEY = "vision_features_jax_bc"
 JAX_DIFFUSION_FEATURE_KEY = "vision_features_jax_diffusion"
+JAX_FLOW_MATCHING_FEATURE_KEY = "vision_features_jax_flow_matching"
+JAX_ACT_FEATURE_KEY = "vision_features_jax_act"
 DEFAULT_CACHE_BACKENDS = ("jax",)
 _SUPPORTED_FUSION_MODES = {"flatten", "average", "sum"}
 _SUPPORTED_RESNETS = {"resnet18": 512, "resnet34": 512}
@@ -22,8 +24,10 @@ _SUPPORTED_RESNETS = {"resnet18": 512, "resnet34": 512}
 def cached_feature_observation_key(method_name: str, backend_name: str = "jax") -> str:
     method_name = str(method_name).lower()
     mapping = {
+        "act": JAX_ACT_FEATURE_KEY,
         "bc": JAX_BC_FEATURE_KEY,
         "diffusion": JAX_DIFFUSION_FEATURE_KEY,
+        "flow_matching": JAX_FLOW_MATCHING_FEATURE_KEY,
     }
     try:
         return mapping[method_name]
@@ -136,11 +140,11 @@ def build_vision_feature_cache_plan(
         )
 
     method_name = str(cfg.method.get("name", "")).lower()
-    if method_name not in {"bc", "diffusion"}:
+    if method_name not in {"act", "bc", "diffusion", "flow_matching"}:
         if cache_setting != "auto":
             raise ValueError(
                 "Frozen image-feature replay caching is only supported for "
-                "method=bc and method=diffusion."
+                "method=act, method=bc, method=diffusion, and method=flow_matching."
             )
         return None
 
@@ -166,12 +170,18 @@ def build_vision_feature_cache_plan(
             return None
         raise ValueError(message)
 
-    if method_name == "bc":
+    if method_name == "act":
+        from robobase.method.act import act_model_spec_from_cfg
+        model_spec = act_model_spec_from_cfg(cfg)
+    elif method_name == "bc":
         from robobase.method.bc import bc_model_spec_from_cfg
         model_spec = bc_model_spec_from_cfg(cfg)
-    else:
+    elif method_name == "diffusion":
         from robobase.method.diffusion import diffusion_model_spec_from_cfg
         model_spec = diffusion_model_spec_from_cfg(cfg)
+    else:
+        from robobase.method.flow_matching import flow_matching_model_spec_from_cfg
+        model_spec = flow_matching_model_spec_from_cfg(cfg)
 
     if model_spec.encoder_model is None or model_spec.encoder_model.type != "resnet":
         message = "Frozen image-feature replay caching currently supports only ResNet encoders."

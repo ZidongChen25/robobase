@@ -4,8 +4,10 @@ from typing import Any
 
 from omegaconf import DictConfig
 
+from robobase.method.act import act_spec_from_cfg
 from robobase.method.bc import bc_spec_from_cfg
 from robobase.method.diffusion import diffusion_spec_from_cfg
+from robobase.method.flow_matching import flow_matching_spec_from_cfg
 
 
 def method_name_from_cfg(cfg: DictConfig) -> str:
@@ -22,8 +24,11 @@ def method_name_from_cfg(cfg: DictConfig) -> str:
         raise ValueError("Method config does not define a name or _target_.")
 
     target_to_name = {
+        "robobase.method.act.ACT": "act",
+        "robobase.method.act.ActBCAgent": "act",
         "robobase.method.bc.BC": "bc",
         "robobase.method.diffusion.Diffusion": "diffusion",
+        "robobase.method.flow_matching.FlowMatching": "flow_matching",
     }
     if method_target in target_to_name:
         return target_to_name[method_target]
@@ -49,6 +54,11 @@ def create_agent(
         replay_beta=cfg.replay.beta,
         frame_stack_on_channel=cfg.frame_stack_on_channel,
         intrinsic_reward_module=intrinsic_reward_module,
+        update_block_every_steps=int(
+            cfg.get("backend", {}).get("update_block_every_steps", 1)
+            if cfg.get("backend", None)
+            else 1
+        ),
     )
 
     if method_name == "bc":
@@ -67,6 +77,24 @@ def create_agent(
             **common_kwargs,
         )
 
+    if method_name == "act":
+        from robobase.method.act import ACT
+
+        spec = act_spec_from_cfg(cfg)
+        return ACT(
+            lr=spec.lr,
+            lr_backbone=spec.lr_backbone,
+            adaptive_lr=spec.adaptive_lr,
+            num_train_steps=spec.num_train_steps,
+            actor_grad_clip=spec.actor_grad_clip,
+            weight_decay=spec.weight_decay,
+            model=spec.model,
+            jit=bool(cfg.get("backend", {}).get("jit", True) if cfg.get("backend") else True),
+            platform=cfg.get("backend", {}).get("platform", None) if cfg.get("backend") else None,
+            seed=int(cfg.seed),
+            **common_kwargs,
+        )
+
     if method_name == "diffusion":
         from robobase.method.diffusion import Diffusion
 
@@ -75,8 +103,34 @@ def create_agent(
             lr=spec.lr,
             adaptive_lr=spec.adaptive_lr,
             num_train_steps=spec.num_train_steps,
+            lr_schedule=spec.lr_schedule,
             actor_grad_clip=spec.actor_grad_clip,
+            objective_type=spec.objective_type,
             num_diffusion_iters=spec.num_diffusion_iters,
+            sampler=spec.sampler,
+            use_ema=spec.use_ema,
+            ema_decay=spec.ema_decay,
+            ema_decay_schedule=spec.ema_decay_schedule,
+            weight_decay=spec.weight_decay,
+            model=spec.model,
+            jit=bool(cfg.get("backend", {}).get("jit", True) if cfg.get("backend") else True),
+            platform=cfg.get("backend", {}).get("platform", None) if cfg.get("backend") else None,
+            seed=int(cfg.seed),
+            **common_kwargs,
+        )
+
+    if method_name == "flow_matching":
+        from robobase.method.flow_matching import FlowMatching
+
+        spec = flow_matching_spec_from_cfg(cfg)
+        return FlowMatching(
+            lr=spec.lr,
+            adaptive_lr=spec.adaptive_lr,
+            num_train_steps=spec.num_train_steps,
+            actor_grad_clip=spec.actor_grad_clip,
+            objective_type=spec.objective_type,
+            num_flow_steps=spec.num_flow_steps,
+            sampler=spec.sampler,
             use_ema=spec.use_ema,
             ema_decay=spec.ema_decay,
             weight_decay=spec.weight_decay,
@@ -88,5 +142,5 @@ def create_agent(
         )
 
     raise NotImplementedError(
-        f"Unsupported method '{method_name}'. Supported: bc, diffusion."
+        f"Unsupported method '{method_name}'. Supported: act, bc, diffusion, flow_matching."
     )

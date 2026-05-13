@@ -14,6 +14,7 @@ from gymnasium import spaces
 from gymnasium.wrappers import TimeLimit
 from hydra.utils import get_original_cwd
 from omegaconf import DictConfig, open_dict
+from scipy.spatial.transform import Rotation
 
 from robobase.envs.env import Demo, DemoEnv, EnvFactory
 from robobase.envs.wrappers import (
@@ -150,6 +151,27 @@ def _resize_rgb_obs(
 def _filter_obs_dict_for_cfg(
     obs_dict: dict[str, np.ndarray], cfg: DictConfig
 ) -> dict[str, np.ndarray]:
+    obs_keys = list(_cfg_get(cfg.env, "obs_keys", []))
+    if obs_keys:
+        missing_keys = [key for key in obs_keys if key not in obs_dict]
+        if missing_keys:
+            raise KeyError(
+                "Configured robomimic obs_keys are missing from the dataset/env: "
+                f"{missing_keys}"
+            )
+        selected = {key: obs_dict[key] for key in obs_keys}
+        if cfg.pixels:
+            selected.update(
+                {
+                    key: value
+                    for key, value in obs_dict.items()
+                    if value.dtype == np.uint8
+                    and value.ndim == 3
+                    and key.endswith("_rgb")
+                }
+            )
+        obs_dict = selected
+
     if not cfg.pixels:
         return {
             key: value
@@ -197,6 +219,27 @@ def _convert_obs_group(obs_group, index: int) -> dict[str, np.ndarray]:
     return _convert_obs_dict({key: obs_group[key][index] for key in obs_group.keys()})
 
 
+def _load_obs_sequence_for_cfg(
+    obs_group,
+    length: int,
+    cfg: DictConfig,
+) -> list[dict[str, np.ndarray]]:
+    obs_keys = list(_cfg_get(cfg.env, "obs_keys", []))
+    if obs_keys and not cfg.pixels:
+        arrays = {
+            key: np.asarray(obs_group[key][:length], dtype=np.float32)
+            for key in obs_keys
+        }
+        return [
+            {key: arrays[key][index] for key in obs_keys}
+            for index in range(length)
+        ]
+    return [
+        _filter_obs_dict_for_cfg(_convert_obs_group(obs_group, index), cfg)
+        for index in range(length)
+    ]
+
+
 def _space_from_array(array: np.ndarray) -> spaces.Box:
     if array.dtype == np.uint8 and array.ndim == 3:
         low = np.zeros(array.shape, dtype=np.uint8)
@@ -230,6 +273,83 @@ def _normalize_num_demos(num_demos) -> float:
 
 def _cfg_get(cfg: DictConfig, key: str, default):
     return cfg.get(key, default)
+
+
+def _normalize_vectors(vectors: np.ndarray, eps: float = 1e-12) -> np.ndarray:
+    norms = np.linalg.norm(vectors, axis=-1, keepdims=True)
+    return vectors / np.maximum(norms, eps)
+
+
+def _axis_angle_to_rotation_6d(axis_angle: np.ndarray) -> np.ndarray:
+    matrices = Rotation.from_rotvec(axis_angle.reshape(-1, 3)).as_matrix()
+    matrices = matrices.reshape(*axis_angle.shape[:-1], 3, 3)
+    return matrices[..., :2, :].reshape(*axis_angle.shape[:-1], 6)
+
+
+def _rotation_6d_to_axis_angle(rotation_6d: np.ndarray) -> np.ndarray:
+    a1 = rotation_6d[..., :3]
+    a2 = rotation_6d[..., 3:]
+    b1 = _normalize_vectors(a1)
+    b2 = _normalize_vectors(a2 - np.sum(b1 * a2, axis=-1, keepdims=True) * b1)
+    b3 = np.cross(b1, b2, axis=-1)
+    matrices = np.stack([b1, b2, b3], axis=-2)
+    return Rotation.from_matrix(matrices.reshape(-1, 3, 3)).as_rotvec().reshape(
+        *rotation_6d.shape[:-1], 3
+    )
+
+
+def _raw_action_to_abs_action(raw_actions: np.ndarray) -> np.ndarray:
+    raw_shape = raw_actions.shape
+    is_dual_arm = raw_shape[-1] == 14
+    actions = raw_actions.reshape(*raw_shape[:-1], 2, 7) if is_dual_arm else raw_actions
+    pos = actions[..., :3]
+    rot = _axis_angle_to_rotation_6d(actions[..., 3:6])
+    gripper = actions[..., 6:]
+    abs_actions = np.concatenate([pos, rot, gripper], axis=-1).astype(
+        np.float32, copy=False
+    )
+    if is_dual_arm:
+        abs_actions = abs_actions.reshape(*raw_shape[:-1], 20)
+    return abs_actions
+
+
+def _abs_action_to_raw_action(abs_actions: np.ndarray) -> np.ndarray:
+    raw_shape = abs_actions.shape
+    is_dual_arm = raw_shape[-1] == 20
+    actions = abs_actions.reshape(*raw_shape[:-1], 2, 10) if is_dual_arm else abs_actions
+    pos = actions[..., :3]
+    rot = _rotation_6d_to_axis_angle(actions[..., 3:-1])
+    gripper = actions[..., -1:]
+    raw_actions = np.concatenate([pos, rot, gripper], axis=-1).astype(
+        np.float32, copy=False
+    )
+    if is_dual_arm:
+        raw_actions = raw_actions.reshape(*raw_shape[:-1], 14)
+    return raw_actions
+
+
+class RobomimicAbsoluteAction(gym.ActionWrapper, gym.utils.RecordConstructorArgs):
+    """Expose CleanDiffuser's absolute 6D-rotation action representation."""
+
+    def __init__(self, env: gym.Env):
+        gym.utils.RecordConstructorArgs.__init__(self)
+        gym.ActionWrapper.__init__(self, env)
+        raw_shape = env.action_space.shape
+        if len(raw_shape) != 1 or raw_shape[-1] not in (7, 14):
+            raise ValueError(
+                "robomimic absolute action conversion expects a 7D or 14D raw "
+                f"action space, got {raw_shape}."
+            )
+        action_dim = 20 if raw_shape[-1] == 14 else 10
+        self.action_space = spaces.Box(
+            low=np.full((action_dim,), -np.inf, dtype=np.float32),
+            high=np.full((action_dim,), np.inf, dtype=np.float32),
+            dtype=np.float32,
+        )
+        self.is_vector_env = getattr(env, "is_vector_env", False)
+
+    def action(self, action):
+        return _abs_action_to_raw_action(np.asarray(action, dtype=np.float32))
 
 
 class RobomimicPlaceholderEnv(gym.Env):
@@ -280,6 +400,8 @@ class RobomimicRobosuiteEnv(gym.Env):
         cameras: list[str],
         has_offscreen_renderer: bool,
         render_gpu_device_id: int,
+        abs_action: bool = False,
+        obs_keys: list[str] | None = None,
     ):
         try:
             import robosuite
@@ -290,7 +412,12 @@ class RobomimicRobosuiteEnv(gym.Env):
 
         self._is_v1 = robosuite.__version__.split(".")[0] == "1"
         self._render_camera = cameras[0] if cameras else "agentview"
+        self._obs_keys = list(obs_keys or [])
         kwargs = copy.deepcopy(env_kwargs)
+        if abs_action:
+            kwargs.setdefault("controller_configs", {})
+            kwargs["controller_configs"] = copy.deepcopy(kwargs["controller_configs"])
+            kwargs["controller_configs"]["control_delta"] = False
         kwargs.update(
             has_renderer=False,
             has_offscreen_renderer=has_offscreen_renderer,
@@ -368,7 +495,30 @@ class RobomimicRobosuiteEnv(gym.Env):
                 new_key, converted = _convert_obs_value(key, value)
                 observation[new_key] = converted
 
-        return _sort_obs_dict(observation)
+        observation = _sort_obs_dict(observation)
+        if self._obs_keys:
+            missing_keys = [key for key in self._obs_keys if key not in observation]
+            if missing_keys:
+                raise KeyError(
+                    "Configured robomimic obs_keys are missing from live env: "
+                    f"{missing_keys}"
+                )
+            selected = {key: observation[key] for key in self._obs_keys}
+            if self._render_camera and any(
+                value.dtype == np.uint8 and value.ndim == 3
+                for value in observation.values()
+            ):
+                selected.update(
+                    {
+                        key: value
+                        for key, value in observation.items()
+                        if value.dtype == np.uint8
+                        and value.ndim == 3
+                        and key.endswith("_rgb")
+                    }
+                )
+            observation = selected
+        return observation
 
     def render(self):
         return self._env.sim.render(camera_name=self._render_camera)[::-1]
@@ -455,28 +605,32 @@ class RobomimicEnvFactory(EnvFactory):
                 demo_keys = demo_keys[:num_demos]
 
             demos = []
+            selected_demo_keys = []
             for demo_key in demo_keys:
                 episode = dataset_file[f"data/{demo_key}"]
                 actions = np.asarray(episode["actions"], dtype=np.float32)
+                if bool(_cfg_get(cfg.env, "abs_action", False)):
+                    actions = _raw_action_to_abs_action(actions)
                 rewards = np.asarray(episode["rewards"], dtype=np.float32)
                 dones = np.asarray(episode["dones"], dtype=np.uint8).astype(bool)
-                demo_timesteps = [
-                    (
-                        _filter_obs_dict_for_cfg(
-                            _convert_obs_group(episode["obs"], 0), cfg
-                        ),
-                        {"demo": 1},
-                    )
-                ]
+                obs_sequence = _load_obs_sequence_for_cfg(
+                    episode["obs"],
+                    actions.shape[0],
+                    cfg,
+                )
+                next_obs_sequence = _load_obs_sequence_for_cfg(
+                    episode["next_obs"],
+                    actions.shape[0],
+                    cfg,
+                )
+                demo_timesteps = [(obs_sequence[0], {"demo": 1})]
                 for index in range(actions.shape[0]):
                     terminated = bool(dones[index])
                     truncated = index == (actions.shape[0] - 1) and not terminated
                     info = {"demo_action": actions[index], "demo": 1}
                     demo_timesteps.append(
                         (
-                            _filter_obs_dict_for_cfg(
-                                _convert_obs_group(episode["next_obs"], index), cfg
-                            ),
+                            next_obs_sequence[index],
                             float(rewards[index]),
                             terminated,
                             truncated,
@@ -484,6 +638,8 @@ class RobomimicEnvFactory(EnvFactory):
                         )
                     )
                 demos.append(Demo(demo_timesteps))
+                selected_demo_keys.append(demo_key)
+            self._selected_demo_keys = selected_demo_keys
         return demos
 
     def _compute_action_stats(self, demos: list[Demo]) -> dict[str, np.ndarray]:
@@ -530,6 +686,57 @@ class RobomimicEnvFactory(EnvFactory):
             obs_stats["std"][key][obs_stats["std"][key] == 0] = 1.0
         return obs_stats
 
+    def _compute_obs_stats_from_dataset_obs(
+        self, cfg: DictConfig
+    ) -> dict[str, dict[str, np.ndarray]]:
+        """Match CleanDiffuser stats: fit on dataset obs, not final next_obs."""
+
+        selected_demo_keys = getattr(self, "_selected_demo_keys", None)
+        if not selected_demo_keys:
+            return self._compute_obs_stats(self._raw_demos)
+
+        obs_arrays = {}
+        obs_keys = list(_cfg_get(cfg.env, "obs_keys", []))
+        with h5py.File(self._dataset_path, "r") as dataset_file:
+            for demo_key in selected_demo_keys:
+                obs_group = dataset_file[f"data/{demo_key}/obs"]
+                episode_length = dataset_file[f"data/{demo_key}/actions"].shape[0]
+                if obs_keys and not cfg.pixels:
+                    for key in obs_keys:
+                        obs_arrays.setdefault(key, []).append(
+                            np.asarray(
+                                obs_group[key][:episode_length],
+                                dtype=np.float32,
+                            )
+                        )
+                    continue
+
+                for index in range(episode_length):
+                    obs = _filter_obs_dict_for_cfg(
+                        _convert_obs_group(obs_group, index),
+                        cfg,
+                    )
+                    for key, value in obs.items():
+                        if value.dtype == np.uint8:
+                            continue
+                        obs_arrays.setdefault(key, []).append(value[None])
+
+        if len(obs_arrays) == 0:
+            raise ValueError("robomimic demos do not contain low-dimensional observations.")
+
+        stacked = {
+            key: np.concatenate(values, axis=0) for key, values in obs_arrays.items()
+        }
+        obs_stats = {
+            "mean": {key: np.mean(stacked[key], axis=0) for key in stacked},
+            "std": {key: np.std(stacked[key], axis=0) for key in stacked},
+            "max": {key: np.max(stacked[key], axis=0) for key in stacked},
+            "min": {key: np.min(stacked[key], axis=0) for key in stacked},
+        }
+        for key in stacked:
+            obs_stats["std"][key][obs_stats["std"][key] == 0] = 1.0
+        return obs_stats
+
     def _make_rescale_from_tanh_cls(self, cfg: DictConfig):
         use_standardization = _cfg_get(cfg, "use_standardization", False)
         use_min_max_normalization = _cfg_get(
@@ -541,6 +748,11 @@ class RobomimicEnvFactory(EnvFactory):
         assert not (
             use_standardization and use_min_max_normalization
         ), "You can't use both standardization and min/max normalization."
+        if bool(_cfg_get(cfg.env, "abs_action", False)) and not use_min_max_normalization:
+            raise ValueError(
+                "env.abs_action=true requires use_min_max_normalization=true so "
+                "the 10D absolute action representation can be mapped to [-1, 1]."
+            )
 
         if use_standardization:
             assert demos != 0
@@ -586,6 +798,9 @@ class RobomimicEnvFactory(EnvFactory):
         return_raw_spaces: bool = False,
         demo_env: bool = False,
     ):
+        if bool(_cfg_get(cfg.env, "abs_action", False)):
+            env = RobomimicAbsoluteAction(env)
+
         if return_raw_spaces:
             action_space = copy.deepcopy(env.action_space)
             observation_space = copy.deepcopy(env.observation_space)
@@ -603,6 +818,7 @@ class RobomimicEnvFactory(EnvFactory):
         if norm_obs:
             assert demos != 0
             obs_stats = self._obs_stats
+        obs_norm_type = str(_cfg_get(cfg, "obs_norm_type", "standardization")).lower()
 
         has_low_dim_keys = any(
             len(space.shape) == 1 for space in env.observation_space.values()
@@ -615,6 +831,7 @@ class RobomimicEnvFactory(EnvFactory):
                 new_name="low_dim_state",
                 norm_obs=norm_obs,
                 obs_stats=obs_stats,
+                obs_norm_type=obs_norm_type,
             )
 
         env = TimeLimit(env, cfg.env.episode_length)
@@ -635,6 +852,7 @@ class RobomimicEnvFactory(EnvFactory):
                     execution_length,
                     temporal_ensemble,
                     temporal_ensemble_gain,
+                    _cfg_get(cfg, "action_execution_start", 0),
                 )
         env = AppendDemoInfo(env)
 
@@ -654,6 +872,8 @@ class RobomimicEnvFactory(EnvFactory):
                 cameras=list(cfg.env.cameras),
                 has_offscreen_renderer=needs_offscreen_renderer,
                 render_gpu_device_id=cfg.env.render_gpu_device_id,
+                abs_action=bool(_cfg_get(cfg.env, "abs_action", False)),
+                obs_keys=list(_cfg_get(cfg.env, "obs_keys", [])),
             )
 
         if not self._warned_about_placeholder:
@@ -718,7 +938,7 @@ class RobomimicEnvFactory(EnvFactory):
         ):
             self._action_stats = self._compute_action_stats(self._raw_demos)
         if _cfg_get(cfg, "norm_obs", False):
-            self._obs_stats = self._compute_obs_stats(self._raw_demos)
+            self._obs_stats = self._compute_obs_stats_from_dataset_obs(cfg)
 
     def post_collect_or_fetch_demos(self, cfg: DictConfig):
         self._demos = rescale_demo_actions(

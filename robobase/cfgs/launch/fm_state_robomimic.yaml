@@ -1,0 +1,43 @@
+# @package _global_
+
+defaults:
+  - ../method: flow_matching
+
+demos: .inf
+num_pretrain_steps: 200000
+num_train_frames: 0
+num_train_envs: 1
+eval_every_steps: 25000
+num_eval_episodes: 50
+num_eval_envs: 10
+batch_size: 256
+save_snapshot: true
+snapshot_every_n: ${eval_every_steps}
+snapshot_save_start_step: 50000
+is_imitation_learning: true
+
+pixels: false
+frame_stack: 1
+action_sequence: 16
+execution_length: 8
+temporal_ensemble: false
+use_min_max_normalization: true
+min_max_margin: 0
+norm_obs: true
+
+update_every_steps: 1
+env:
+  use_live_env: true
+
+log_eval_video: false
+
+replay:
+  nstep: 1
+
+method:
+  noise_mask_steps: 0
+  repeat_action: false
+
+hydra:
+  run:
+    dir: ./exp_local/robomimic_fm_${env.task_name}_${now:%Y%m%d%H%M%S}

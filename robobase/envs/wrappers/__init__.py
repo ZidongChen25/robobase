@@ -4,6 +4,7 @@ from robobase.envs.wrappers.onehot_time import OnehotTime
 from robobase.envs.wrappers.rescale_from_tanh import (
     RescaleFromTanh,
     RescaleFromTanhEEPose,
+    RescaleFromStandardization,
     RescaleFromTanhWithStandardization,
     RescaleFromTanhWithMinMax,
 )
@@ -25,6 +26,7 @@ __all__ = [
     "OnehotTime",
     "RescaleFromTanh",
     "RescaleFromTanhEEPose",
+    "RescaleFromStandardization",
     "RescaleFromTanhWithStandardization",
     "RescaleFromTanhWithMinMax",
     "TransposeImageCHW",

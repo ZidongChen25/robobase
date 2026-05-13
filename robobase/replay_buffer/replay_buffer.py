@@ -76,6 +76,18 @@ class ReplayBuffer:
         """
         pass
 
+    def episode_index_metadata(self) -> list[tuple[int, int]]:
+        """Return ``(global_start_index, episode_length)`` metadata.
+
+        Replay buffers that want to support epoch-style offline iteration can
+        override this to expose deterministic episode boundaries.
+        """
+        raise NotImplementedError
+
+    def load_all_episodes(self):
+        """Eagerly load all episode data needed for deterministic iteration."""
+        raise NotImplementedError
+
     def shutdown(self):
         pass
 

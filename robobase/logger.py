@@ -16,7 +16,7 @@ except ImportError:
 from termcolor import colored
 
 COMMON_PRETRAIN_FORMAT = [
-    ("iteration", "Iter", "int"),
+    ("iteration", "Step", "int"),
     ("total_time", "T", "time"),
     ("buffer_size", "BS", "int"),
     ("agent_batched_updates_per_second", "Batched Update FPS", "float"),
@@ -35,6 +35,15 @@ COMMON_TRAIN_FORMAT = [
 
 COMMON_EVAL_FORMAT = [
     ("iteration", "Iter", "int"),
+    ("env_steps", "S", "int"),
+    ("env_episodes", "E", "int"),
+    ("episode_length", "L", "int"),
+    ("episode_reward", "R", "float"),
+    ("total_time", "T", "time"),
+]
+
+COMMON_PRETRAIN_EVAL_FORMAT = [
+    ("iteration", "Step", "int"),
     ("env_steps", "S", "int"),
     ("env_episodes", "E", "int"),
     ("episode_length", "L", "int"),
@@ -84,15 +93,31 @@ class MetersGroup(object):
         return data
 
     def _remove_old_entries(self, data):
+        progress_key = None
+        for key in ("episode", "env_steps", "iteration"):
+            if key in data:
+                progress_key = key
+                break
+        if progress_key is None:
+            return
+
         rows = []
         with self._csv_file_name.open("r") as f:
             reader = csv.DictReader(f)
             for row in reader:
-                if float(row["episode"]) >= data["episode"]:
+                if progress_key not in row:
+                    rows.append(row)
+                    continue
+                if float(row[progress_key]) >= data[progress_key]:
                     break
                 rows.append(row)
         with self._csv_file_name.open("w") as f:
-            writer = csv.DictWriter(f, fieldnames=sorted(data.keys()), restval=0.0)
+            writer = csv.DictWriter(
+                f,
+                fieldnames=sorted(data.keys()),
+                restval=0.0,
+                extrasaction="ignore",
+            )
             writer.writeheader()
             for row in rows:
                 writer.writerow(row)
@@ -157,7 +182,7 @@ class Logger(object):
             log_dir / "pretrain.csv", COMMON_PRETRAIN_FORMAT, cfg.save_csv
         )
         self._pretrain_eval_mg = MetersGroup(
-            log_dir / "pretrain_eval.csv", COMMON_EVAL_FORMAT, cfg.save_csv
+            log_dir / "pretrain_eval.csv", COMMON_PRETRAIN_EVAL_FORMAT, cfg.save_csv
         )
         self._train_mg = MetersGroup(
             log_dir / "train.csv", COMMON_TRAIN_FORMAT, cfg.save_csv

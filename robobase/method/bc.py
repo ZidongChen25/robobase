@@ -14,7 +14,6 @@ from omegaconf import DictConfig
 
 from robobase.method.bc_runtime import bc_actor_input_shapes, bc_observation_layout
 from robobase.method.jax_base import JaxMethodBase
-from robobase.method.jax_utils import maybe_numpy
 from robobase.models.encoder import JaxResNetEncoder
 from robobase.models.fully_connected import JaxMLPWithSequenceOutput
 from robobase.models.fusion import JaxFusionMultiCamFeature
@@ -305,6 +304,7 @@ class BC(JaxMethodBase):
         seed: int = 0,
         is_rl: bool = False,
         use_ema: bool = False,
+        update_block_every_steps: int = 1,
     ):
         super().__init__(
             lr=lr,
@@ -324,6 +324,7 @@ class BC(JaxMethodBase):
             seed=seed,
             is_rl=is_rl,
             use_ema=use_ema,
+            update_block_every_steps=update_block_every_steps,
         )
 
         self.model_spec = model
@@ -430,7 +431,7 @@ class BC(JaxMethodBase):
     ) -> dict[str, np.ndarray]:
         del step
         batch = next(replay_iter)
-        actions = maybe_numpy(batch["action"]).astype(np.float32, copy=False)
+        actions = self._as_jax_array(batch["action"], self.jnp.float32)
         action_pad_mask = self._extract_action_pad_mask(batch)
         loss_coeff = self._loss_weights(batch)
         obs_features, metrics = self._prepare_obs_features(batch)
@@ -439,17 +440,26 @@ class BC(JaxMethodBase):
         self.params, self.opt_state, actor_loss, new_priority = self._update_impl(
             self.params,
             self.opt_state,
-            jnp.asarray(obs_features),
-            jnp.asarray(actions),
-            jnp.asarray(loss_coeff),
-            None if action_pad_mask is None else jnp.asarray(action_pad_mask),
+            obs_features,
+            actions,
+            loss_coeff,
+            action_pad_mask,
         )
-        self._block(actor_loss, new_priority)
+        uses_priorities = self._uses_replay_priorities(replay_buffer)
+        if self._should_block_update(uses_priorities):
+            if uses_priorities:
+                self._block(actor_loss, new_priority)
+            else:
+                self._block(actor_loss)
         elapsed = time.perf_counter() - start_time
         self._update_step_count += 1
 
-        new_priority_np = np.asarray(jax.device_get(new_priority), dtype=np.float32)
-        self._maybe_update_priorities(replay_buffer, batch, new_priority_np)
+        if uses_priorities:
+            new_priority_np = np.asarray(
+                jax.device_get(new_priority),
+                dtype=np.float32,
+            )
+            self._maybe_update_priorities(replay_buffer, batch, new_priority_np)
         self._maybe_log_update_metrics(metrics, actor_loss, obs_features, elapsed)
         self._first_update_completed = True
         return metrics

@@ -76,6 +76,7 @@ class RecedingHorizonControl(ActionSequence):
         execution_length: int,
         temporal_ensemble: bool = True,
         gain: float = 0.01,
+        execution_start: int = 0,
     ):
         """Init.
 
@@ -92,6 +93,11 @@ class RecedingHorizonControl(ActionSequence):
         self._execution_length = execution_length
         self._temporal_ensemble = temporal_ensemble
         self._gain = gain
+        self._execution_start = max(0, int(execution_start))
+        if self._execution_start + self._execution_length > self._sequence_length:
+            raise ValueError(
+                "execution_start + execution_length must be <= action sequence length."
+            )
         self._init_action_history()
 
     def _init_action_history(self):
@@ -129,7 +135,10 @@ class RecedingHorizonControl(ActionSequence):
             self._cur_step, self._cur_step : self._cur_step + self._sequence_length
         ] = action
 
-        for i, sub_action in enumerate(action):
+        executable_actions = action[
+            self._execution_start : self._execution_start + self._execution_length
+        ]
+        for i, sub_action in enumerate(executable_actions):
             if self._temporal_ensemble and self._sequence_length > 1:
                 # Select all predicted actions for self._cur_step. This will cover the
                 # actions from [cur_step - sequence_length + 1, cur_step)

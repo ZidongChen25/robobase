@@ -8,20 +8,34 @@ method:
   num_train_steps: ${num_pretrain_steps}
   num_diffusion_iters: 100
   adaptive_lr: true
+  lr_schedule: warmup_cosine
   actor_grad_clip: null
   use_ema: false
   ema_decay: 0.9999
+  ema_decay_schedule: diffusers
   weight_decay: 1.0e-6
   noise_mask_steps: 0
   repeat_action: false
 
-  actor_model:
-    type: conditional_unet1d
+  objective:
+    type: ddpm
+    num_diffusion_iters: ${method.num_diffusion_iters}
+    sampler: ddim
+
+  backbone:
+    type: unet1d
     sequence_length: ${action_sequence}
     diffusion_step_embed_dim: 256
     down_dims: [256, 512, 1024]
     kernel_size: 5
     n_groups: 8
+    hidden_dims: [256, 256]
+    d_model: 256
+    n_heads: 4
+    num_layers: 8
+    n_cond_layers: 0
+    depth: 12
+    dropout: 0.0
 
   encoder_model:
     type: resnet

@@ -44,3 +44,21 @@ robomimic.md
 .claude/
 .pytest_cache/
 .vscode/
+
+# Runtime/training artifacts
+log/
+logs/
+runs/
+evaluation/
+evaluations/
+checkpoint/
+checkpoints/
+*.ckpt
+*.pt
+*.pth
+*.safetensors
+*.pid
+latest_*_run
+RoboMimic/logs/
+RoboMimic/runs/
+RoboMimic/smoke/

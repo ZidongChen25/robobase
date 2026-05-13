@@ -16,6 +16,7 @@ class ConcatDim(gym.ObservationWrapper, gym.utils.RecordConstructorArgs):
         new_name: str,
         norm_obs: bool = False,
         obs_stats: dict = None,
+        obs_norm_type: str = "standardization",
         keys_to_ignore: list[str] = None,
     ):
         """Init.
@@ -39,6 +40,7 @@ class ConcatDim(gym.ObservationWrapper, gym.utils.RecordConstructorArgs):
         self._keys_to_ignore = [] if keys_to_ignore is None else keys_to_ignore
         self._norm_obs = norm_obs
         self._obs_stats = obs_stats
+        self._obs_norm_type = str(obs_norm_type).lower()
         new_obs_dict = {}
         combined = []
         for k, v in self.observation_space.items():
@@ -62,8 +64,22 @@ class ConcatDim(gym.ObservationWrapper, gym.utils.RecordConstructorArgs):
             # ConcatDim will rename them to new keys. Doing it here would
             # safer and cleaner.
             if len(v.shape) == shape_len and k not in self._keys_to_ignore:
-                if self._norm_obs and k in self._obs_stats:
-                    v = (v - self._obs_stats["mean"][k]) / self._obs_stats["std"][k]
+                if (
+                    self._norm_obs
+                    and self._obs_stats is not None
+                    and k in self._obs_stats["mean"]
+                ):
+                    if self._obs_norm_type in {"min_max", "minmax"}:
+                        obs_min = self._obs_stats["min"][k]
+                        obs_max = self._obs_stats["max"][k]
+                        obs_range = obs_max - obs_min
+                        mask = (obs_range != 0).astype(v.dtype, copy=False)
+                        obs_range = np.where(obs_range == 0, 1.0, obs_range)
+                        v = ((v - obs_min) / obs_range * 2.0 - 1.0) * mask
+                    else:
+                        v = (v - self._obs_stats["mean"][k]) / (
+                            self._obs_stats["std"][k] + 1e-10
+                        )
                 combined.append(v)
             else:
                 new_obs[k] = v

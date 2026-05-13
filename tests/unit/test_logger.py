@@ -78,3 +78,29 @@ def test_logger_does_not_pass_wandb_entity_when_null(monkeypatch, tmp_path):
     Logger(tmp_path, cfg=cfg)
 
     assert "entity" not in captured_kwargs
+
+
+def test_pretrain_console_log_uses_step_label(capsys, tmp_path):
+    cfg = OmegaConf.create(
+        {
+            "save_csv": False,
+            "wandb": {"use": False},
+            "tb": {"use": False},
+        }
+    )
+    logger = Logger(tmp_path, cfg=cfg)
+
+    logger.log_metrics(
+        {
+            "iteration": 123,
+            "total_time": 1.0,
+            "buffer_size": 10,
+            "agent_batched_updates_per_second": 2.0,
+        },
+        step=123,
+        prefix="pretrain",
+    )
+
+    output = capsys.readouterr().out
+    assert "Step: 123" in output
+    assert "Iter:" not in output
