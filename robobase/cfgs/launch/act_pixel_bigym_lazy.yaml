@@ -1,7 +1,12 @@
 # @package _global_
+# General lazy-replay ACT launch for any BiGym task.
+# Same hyperparameters as act_pixel_bigym_move_plate.yaml but task-agnostic
+# (../env: null) — pick the task with `env=bigym/<task>` on the CLI.
+# For reset-aligned (D0-included) data, also pass
+# `lazy_replay.observation_timing=pre_action`.
 
 defaults:
-  - ../env: bigym/move_plate
+  - ../env: null
   - ../method: act
 
 demos: 60
@@ -74,8 +79,8 @@ backend:
 wandb:
   use: false
   project: act_bigym
-  name: move_plate_act_1000epochs
+  name: ${env.task_name}_act_1000e_b128
 
 hydra:
   run:
-    dir: ./exp_local/bigym_move_plate_act_direct15d_refparams_${now:%Y%m%d%H%M%S}
+    dir: ./exp_local/bigym_${env.task_name}_act_1000e_b128_${now:%Y%m%d%H%M%S}

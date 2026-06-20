@@ -19,6 +19,7 @@ from robobase.models.backbone import (
     DiffusionBackboneSpec,
     backbone_spec_from_cfg,
     build_diffusion_backbone,
+    canonical_backbone_type,
 )
 from robobase.models.encoder import JaxResNetEncoder
 from robobase.models.fusion import JaxFusionMultiCamFeature
@@ -33,17 +34,21 @@ class FlowMatchingModelSpec:
     backbone: FlowMatchingBackboneSpec
     encoder_model: BCEncoderModelSpec | None
     view_fusion_model: BCViewFusionModelSpec | None
+    use_lang_cond: bool = False
+    lang_feature_dim: int = 512
 
 
 @dataclass(frozen=True)
 class FlowMatchingSpec:
     lr: float
     adaptive_lr: bool
+    lr_schedule: str
     num_train_steps: int
     actor_grad_clip: float | None
     objective_type: str
     num_flow_steps: int
     sampler: str
+    sample_schedule: str
     use_ema: bool
     ema_decay: float
     weight_decay: float
@@ -66,6 +71,24 @@ def _config_type(
         if target in target_to_type:
             return target_to_type[target]
     return default
+
+
+def _sample_schedule_jump_point(sample_schedule: str) -> float | None:
+    if sample_schedule in {"uniform", "linear"}:
+        return None
+    for prefix in ("front_loaded_", "nonuniform_"):
+        if sample_schedule.startswith(prefix):
+            value = sample_schedule[len(prefix):].replace("p", ".")
+            try:
+                jump_point = float(value)
+            except ValueError:
+                break
+            if 0.0 < jump_point < 1.0:
+                return jump_point
+            break
+    raise NotImplementedError(
+        f"Unsupported Flow Matching sample_schedule '{sample_schedule}'."
+    )
 
 
 def flow_matching_model_spec_from_cfg(cfg: DictConfig) -> FlowMatchingModelSpec:
@@ -93,6 +116,7 @@ def flow_matching_model_spec_from_cfg(cfg: DictConfig) -> FlowMatchingModelSpec:
         encoder_model_spec = BCEncoderModelSpec(
             type=encoder_model_type,
             model=str(encoder_model_cfg.get("model", "resnet18")),
+            trainable=bool(encoder_model_cfg.get("trainable", False)),
         )
 
     view_fusion_model_cfg = method_cfg.get("view_fusion_model", None)
@@ -114,6 +138,8 @@ def flow_matching_model_spec_from_cfg(cfg: DictConfig) -> FlowMatchingModelSpec:
         backbone=backbone_spec,
         encoder_model=encoder_model_spec,
         view_fusion_model=view_fusion_model_spec,
+        use_lang_cond=bool(method_cfg.get("use_lang_cond", False)),
+        lang_feature_dim=int(method_cfg.get("lang_feature_dim", 512)),
     )
 
 
@@ -134,9 +160,20 @@ def flow_matching_spec_from_cfg(cfg: DictConfig) -> FlowMatchingSpec:
         if objective_cfg is not None
         else str(cfg.method.get("sampler", "euler")).lower()
     )
+    sample_schedule = (
+        str(
+            objective_cfg.get(
+                "sample_schedule",
+                cfg.method.get("sample_schedule", "uniform"),
+            )
+        ).lower()
+        if objective_cfg is not None
+        else str(cfg.method.get("sample_schedule", "uniform")).lower()
+    )
     return FlowMatchingSpec(
         lr=float(cfg.method.lr),
         adaptive_lr=bool(cfg.method.adaptive_lr),
+        lr_schedule=str(cfg.method.get("lr_schedule", "cosine")),
         num_train_steps=int(cfg.method.num_train_steps),
         actor_grad_clip=(
             None
@@ -146,6 +183,7 @@ def flow_matching_spec_from_cfg(cfg: DictConfig) -> FlowMatchingSpec:
         objective_type=objective_type,
         num_flow_steps=num_flow_steps,
         sampler=sampler,
+        sample_schedule=sample_schedule,
         use_ema=bool(cfg.method.get("use_ema", False)),
         ema_decay=float(cfg.method.get("ema_decay", 0.9999)),
         weight_decay=float(cfg.method.get("weight_decay", 1e-6)),
@@ -230,6 +268,8 @@ def _build_model(
         encoder_jit=encoder_jit,
     )
     feature_dim = int(obs_layout.low_dim_size + rgb_latent_size)
+    if model_spec.use_lang_cond:
+        feature_dim += int(model_spec.lang_feature_dim)
     return _BuiltFlowMatchingModel(
         backbone_model=build_diffusion_backbone(
             model_spec.backbone,
@@ -261,6 +301,7 @@ class FlowMatching(JaxMethodBase):
         frame_stack_on_channel: bool,
         intrinsic_reward_module=None,
         actor_grad_clip: Optional[float] = None,
+        lr_schedule: str = "cosine",
         jit: bool = True,
         platform: str | None = None,
         seed: int = 0,
@@ -270,6 +311,7 @@ class FlowMatching(JaxMethodBase):
         weight_decay: float = 1e-6,
         objective_type: str = "rectified_flow",
         sampler: str = "euler",
+        sample_schedule: str = "uniform",
         update_block_every_steps: int = 1,
     ):
         if not frame_stack_on_channel:
@@ -284,6 +326,8 @@ class FlowMatching(JaxMethodBase):
             raise NotImplementedError(
                 "FlowMatching currently supports Euler sampling."
             )
+        sample_schedule = str(sample_schedule).lower()
+        sample_schedule_jump_point = _sample_schedule_jump_point(sample_schedule)
         if int(num_flow_steps) < 1:
             raise ValueError("num_flow_steps must be >= 1.")
 
@@ -310,8 +354,23 @@ class FlowMatching(JaxMethodBase):
 
         self.objective_type = str(objective_type).lower()
         self.sampler = str(sampler).lower()
+        self.sample_schedule = sample_schedule
+        self._sample_schedule_jump_point = sample_schedule_jump_point
         self.num_flow_steps = int(num_flow_steps)
+        # The diffusion-style SinusoidalPosEmb is tuned for the integer step
+        # range (~[0, 1000]); CleanDiffuser feeds the integer diffusion-step
+        # index to the network, not the continuous t in [0, 1]. Feeding raw
+        # t in [0, 1] squashes the time embedding (it becomes nearly constant),
+        # so the network cannot read the ODE time. Keep continuous t for the
+        # interpolation/integration, but scale the *network* time input.
+        self._time_scale = 1000.0
         self.model_spec = model
+        self.use_lang_cond = bool(model.use_lang_cond)
+        self.lang_feature_dim = int(model.lang_feature_dim) if self.use_lang_cond else 0
+        self._clip_text_cache = {}
+        self._condition_as_sequence = canonical_backbone_type(
+            self.model_spec.backbone.type
+        ) in {"transformer", "dit"}
         self._init_cached_pixel_feature_key("flow_matching")
 
         built_model, feature_dim = _build_model(
@@ -323,7 +382,14 @@ class FlowMatching(JaxMethodBase):
         self.actor_model = built_model.backbone_model
         self.encoder = built_model.encoder_model
         self.view_fusion = built_model.view_fusion_model
-        self.rgb_latent_size = max(0, feature_dim - self.low_dim_size)
+        self._trainable_encoder = (
+            self.encoder is not None
+            and self.model_spec.encoder_model is not None
+            and bool(self.model_spec.encoder_model.trainable)
+        )
+        self.rgb_latent_size = max(
+            0, feature_dim - self.low_dim_size - self.lang_feature_dim
+        )
 
         self.rng_key, init_key = jax.random.split(self.rng_key)
         dummy_actions = jnp.zeros(
@@ -333,8 +399,13 @@ class FlowMatching(JaxMethodBase):
         dummy_features = (
             jnp.zeros((1, feature_dim), dtype=jnp.float32) if feature_dim > 0 else None
         )
-        self.params = self.actor_model.init(
+        actor_params = self.actor_model.init(
             init_key, dummy_actions, dummy_timesteps, dummy_features
+        )
+        self.params = (
+            {"actor": actor_params, "encoder": self.encoder.trainable_params}
+            if self._trainable_encoder
+            else actor_params
         )
         self.ema_params = self.params if self.use_ema else None
 
@@ -348,13 +419,23 @@ class FlowMatching(JaxMethodBase):
 
         learning_rate = lr
         if adaptive_lr:
-            learning_rate = self.optax.warmup_cosine_decay_schedule(
-                init_value=0.0,
-                peak_value=lr,
-                warmup_steps=100,
-                decay_steps=self.num_train_steps,
-                end_value=0.0,
-            )
+            lr_schedule = str(lr_schedule).lower()
+            if lr_schedule == "cosine":
+                learning_rate = self.optax.cosine_decay_schedule(
+                    init_value=lr,
+                    decay_steps=self.num_train_steps,
+                    alpha=0.0,
+                )
+            elif lr_schedule in {"warmup_cosine", "warmup-cosine"}:
+                learning_rate = self.optax.warmup_cosine_decay_schedule(
+                    init_value=0.0,
+                    peak_value=lr,
+                    warmup_steps=100,
+                    decay_steps=self.num_train_steps,
+                    end_value=0.0,
+                )
+            else:
+                raise ValueError(f"Unknown flow matching lr_schedule '{lr_schedule}'.")
         transforms = []
         if actor_grad_clip is not None:
             transforms.append(self.optax.clip_by_global_norm(float(actor_grad_clip)))
@@ -364,11 +445,25 @@ class FlowMatching(JaxMethodBase):
 
         update_fn = self._build_update_fn()
         sample_fn = self._build_sample_fn()
+        sample_from_noise_fn = self._build_sample_from_noise_fn()
         if self._jit_enabled:
             update_fn = jax.jit(update_fn)
             sample_fn = jax.jit(sample_fn)
+            sample_from_noise_fn = jax.jit(sample_from_noise_fn)
         self._update_impl = update_fn
         self._sample_impl = sample_fn
+        self._sample_from_noise_impl = sample_from_noise_fn
+
+        # Optional seed-aligned eval noise. When `_active_eval_seeds` is set
+        # (list of env seeds in observation-batch-row order), `act` draws the
+        # flow-matching initial noise deterministically from
+        # (env_seed, per-seed episode step) instead of advancing the shared
+        # rng_key batch-wise. This makes vectorized and serial evaluation
+        # reproduce each other per seed. Disabled by default (None) so training
+        # and ordinary eval behaviour is unchanged.
+        self._eval_noise_base_key = jax.random.PRNGKey(0)
+        self._eval_step_by_seed = {}
+        self._active_eval_seeds = None
 
     def _ema_decay_value(self, optimization_step):
         step = jnp.maximum(0, optimization_step - self._ema_update_after_step - 1)
@@ -380,14 +475,161 @@ class FlowMatching(JaxMethodBase):
         decay = jnp.minimum(decay, self._ema_decay)
         return jnp.maximum(decay, self._ema_min_decay)
 
+    # ------------------------------------------------------------------
+    # Language Conditioning
+    # ------------------------------------------------------------------
+
+    def _lang_token_rows(self, batch_or_obs: dict) -> np.ndarray:
+        if "lang_tokens" not in batch_or_obs:
+            raise ValueError(
+                "Language-conditioned flow matching requires 'lang_tokens' observations."
+            )
+        tokens = np.asarray(batch_or_obs["lang_tokens"], dtype=np.int32)
+        if tokens.ndim == 1:
+            tokens = tokens[None, :]
+        elif tokens.ndim >= 3:
+            tokens = tokens.reshape(tokens.shape[0], -1, tokens.shape[-1])[:, -1, :]
+        return tokens
+
+    def _encode_clip_text(self, tokens: np.ndarray) -> np.ndarray:
+        token_rows = np.asarray(tokens, dtype=np.int32)
+        features = []
+        missing = []
+        missing_keys = []
+        for row in token_rows:
+            key = tuple(int(v) for v in row.tolist())
+            cached = self._clip_text_cache.get(key)
+            if cached is None:
+                missing.append(row)
+                missing_keys.append(key)
+            features.append((key, cached))
+
+        if missing:
+            import torch
+            import clip
+
+            if not hasattr(self, "clip_model"):
+                clip_model, _ = clip.load("ViT-B/32", device="cpu")
+                clip_model.eval()
+                for param in clip_model.parameters():
+                    param.requires_grad_(False)
+                self.__dict__["clip_model"] = clip_model
+
+            with torch.no_grad():
+                token_tensor = torch.as_tensor(
+                    np.stack(missing),
+                    dtype=torch.long,
+                    device="cpu",
+                )
+                encoded = self.clip_model.encode_text(token_tensor).float().cpu().numpy()
+            if encoded.shape[-1] != self.lang_feature_dim:
+                raise ValueError(
+                    "CLIP text feature dimension does not match "
+                    f"method.lang_feature_dim: {encoded.shape[-1]} != "
+                    f"{self.lang_feature_dim}."
+                )
+            for key, value in zip(missing_keys, encoded):
+                self._clip_text_cache[key] = value.astype(np.float32, copy=False)
+
+        return np.stack(
+            [self._clip_text_cache[key] for key, _ in features],
+            axis=0,
+        ).astype(np.float32, copy=False)
+
+    def _extract_lang_features(self, batch_or_obs: dict):
+        if not self.use_lang_cond:
+            return None
+        return self._as_jax_array(
+            self._encode_clip_text(self._lang_token_rows(batch_or_obs)),
+            self.jnp.float32,
+        )
+
+    def _prepare_obs_features(self, batch_or_obs: dict):
+        if self._condition_as_sequence and not self.use_pixels:
+            if "low_dim_state" not in batch_or_obs:
+                raise ValueError(
+                    "Transformer flow matching expects low_dim_state observations."
+                )
+            obs_features = self._as_jax_array(
+                batch_or_obs["low_dim_state"], self.jnp.float32
+            )
+            if self.use_lang_cond:
+                lang_features = self._extract_lang_features(batch_or_obs)
+                lang_features = self.jnp.repeat(
+                    lang_features[:, None, :],
+                    obs_features.shape[1],
+                    axis=1,
+                )
+                obs_features = self.jnp.concatenate(
+                    [obs_features, lang_features],
+                    axis=-1,
+                )
+            metrics = {}
+            if self.logging:
+                metrics["low_dim_state"] = np.asarray(
+                    self.jax.device_get(obs_features[0, -1])
+                )
+            return obs_features, metrics
+        obs_features, metrics = super()._prepare_obs_features(batch_or_obs)
+        if self.use_lang_cond:
+            obs_features = self.jnp.concatenate(
+                [obs_features, self._extract_lang_features(batch_or_obs)],
+                axis=-1,
+            )
+        return obs_features, metrics
+
+    def _actor_params(self, params):
+        if self._trainable_encoder:
+            return params["actor"]
+        return params
+
+    def _prepare_trainable_obs_inputs(self, batch_or_obs: dict):
+        inputs = {}
+        low_dim_obs = self._extract_low_dim_batch(batch_or_obs)
+        if low_dim_obs is not None:
+            inputs["low_dim"] = low_dim_obs
+        if self.use_pixels:
+            if self._has_cached_pixel_features(batch_or_obs):
+                raise ValueError(
+                    "Trainable JAX flow-matching encoder requires raw RGB "
+                    "observations; disable replay.cache_frozen_image_features."
+                )
+            rgb_obs, _ = self._extract_rgb_obs(batch_or_obs)
+            inputs["rgb"] = rgb_obs
+        if self.use_lang_cond:
+            inputs["lang"] = self._extract_lang_features(batch_or_obs)
+        return inputs
+
+    def _features_from_inputs(self, params, obs_inputs):
+        if not self._trainable_encoder:
+            return obs_inputs
+        features = []
+        if "low_dim" in obs_inputs:
+            features.append(obs_inputs["low_dim"])
+        if "rgb" in obs_inputs:
+            rgb_feats = self.encoder.apply_trainable(
+                params["encoder"], obs_inputs["rgb"],
+            )
+            features.append(self._fuse_multi_view(rgb_feats))
+        if "lang" in obs_inputs:
+            features.append(obs_inputs["lang"])
+        if not features:
+            raise ValueError(
+                "Flow matching requires at least one observation feature."
+            )
+        if len(features) == 1:
+            return features[0]
+        return jnp.concatenate(features, axis=-1)
+
     def _build_update_fn(self):
         optimizer = self.optimizer
         optax = self.optax
         use_ema = self.use_ema
         actor_model = self.actor_model
+        time_scale = self._time_scale
 
         def update_fn(
-            params, opt_state, rng_key, obs_features, actions,
+            params, opt_state, rng_key, obs_inputs, actions,
             loss_coeff, action_pad_mask, ema_params, ema_optimization_step,
         ):
             source_key, time_key, next_key = jax.random.split(rng_key, 3)
@@ -412,8 +654,14 @@ class FlowMatching(JaxMethodBase):
                 )
 
             def loss_fn(current_params):
+                obs_features = self._features_from_inputs(
+                    current_params, obs_inputs
+                )
                 velocity_pred = actor_model.apply(
-                    current_params, xt, t, obs_features,
+                    self._actor_params(current_params),
+                    xt,
+                    t * time_scale,
+                    obs_features,
                 )
                 per_token_mse = jnp.square(velocity_pred - target_velocity)
                 reduce_dims = tuple(range(1, per_token_mse.ndim))
@@ -460,35 +708,87 @@ class FlowMatching(JaxMethodBase):
 
     def _build_sample_fn(self):
         actor_model = self.actor_model
-        sample_schedule = jnp.linspace(
-            0.0,
-            1.0,
-            self.num_flow_steps + 1,
-            dtype=jnp.float32,
-        )
+        time_scale = self._time_scale
+        sample_schedule = self._build_sample_schedule()
 
-        def sample_fn(params, rng_key, obs_features):
+        def sample_fn(params, rng_key, obs_inputs):
+            obs_features = self._features_from_inputs(params, obs_inputs)
             batch_size = obs_features.shape[0]
             sample = jax.random.normal(
                 rng_key,
                 shape=(batch_size, self.action_sequence, self.action_dim),
             )
-
-            def body_fn(index, current_sample):
-                step = self.num_flow_steps - index
-                t_value = sample_schedule[step]
-                prev_t = sample_schedule[step - 1]
-                delta_t = t_value - prev_t
-                t_batch = jnp.full((batch_size,), t_value, dtype=jnp.float32)
-                velocity = actor_model.apply(
-                    params, current_sample, t_batch, obs_features,
-                )
-                return current_sample + delta_t * velocity
-
-            sample = jax.lax.fori_loop(0, self.num_flow_steps, body_fn, sample)
-            return jnp.clip(sample, -1.0, 1.0)
+            return self._integrate_sample(
+                params, sample, obs_features, sample_schedule, actor_model, time_scale
+            )
 
         return sample_fn
+
+    def _build_sample_from_noise_fn(self):
+        """Like `sample_fn` but integrates an externally supplied initial noise
+        of shape (batch, action_sequence, action_dim). Used by seed-aligned
+        eval so the noise can be keyed on (env_seed, episode_step)."""
+        actor_model = self.actor_model
+        time_scale = self._time_scale
+        sample_schedule = self._build_sample_schedule()
+
+        def sample_from_noise_fn(params, noise, obs_inputs):
+            obs_features = self._features_from_inputs(params, obs_inputs)
+            return self._integrate_sample(
+                params, noise, obs_features, sample_schedule, actor_model, time_scale
+            )
+
+        return sample_from_noise_fn
+
+    def _build_sample_schedule(self):
+        if self._sample_schedule_jump_point is None:
+            return jnp.linspace(
+                0.0,
+                1.0,
+                self.num_flow_steps + 1,
+                dtype=jnp.float32,
+            )
+        jump_point = float(self._sample_schedule_jump_point)
+        return jnp.concatenate(
+            [
+                jnp.linspace(
+                    0.0,
+                    jump_point,
+                    self.num_flow_steps,
+                    dtype=jnp.float32,
+                ),
+                jnp.asarray([1.0], dtype=jnp.float32),
+            ],
+            axis=0,
+        )
+
+    def _integrate_sample(
+        self, params, sample, obs_features, sample_schedule, actor_model, time_scale
+    ):
+        batch_size = obs_features.shape[0]
+
+        def body_fn(index, current_sample):
+            step = self.num_flow_steps - index
+            t_value = sample_schedule[step]
+            prev_t = sample_schedule[step - 1]
+            delta_t = t_value - prev_t
+            t_batch = jnp.full((batch_size,), t_value, dtype=jnp.float32)
+            velocity = actor_model.apply(
+                self._actor_params(params),
+                current_sample,
+                t_batch * time_scale,
+                obs_features,
+            )
+            velocity = jnp.nan_to_num(velocity, nan=0.0, posinf=0.0, neginf=0.0)
+            next_sample = current_sample + delta_t * velocity
+            next_sample = jnp.nan_to_num(
+                next_sample, nan=0.0, posinf=1.0, neginf=-1.0
+            )
+            return next_sample
+
+        sample = jax.lax.fori_loop(0, self.num_flow_steps, body_fn, sample)
+        sample = jnp.nan_to_num(sample, nan=0.0, posinf=1.0, neginf=-1.0)
+        return jnp.clip(sample, -1.0, 1.0)
 
     def _fuse_multi_view(self, rgb_feats):
         if rgb_feats is None:
@@ -500,12 +800,48 @@ class FlowMatching(JaxMethodBase):
 
     def act(self, observations: dict, step: int, eval_mode: bool):
         del step
-        obs_features, _ = self._prepare_obs_features(observations)
-        self.rng_key, sample_key = jax.random.split(self.rng_key)
+        if self._trainable_encoder:
+            obs_inputs = self._prepare_trainable_obs_inputs(observations)
+        else:
+            obs_inputs, _ = self._prepare_obs_features(observations)
         sample_params = self.ema_params if (eval_mode and self.use_ema) else self.params
-        actions = self._sample_impl(sample_params, sample_key, obs_features)
+        if eval_mode and self._active_eval_seeds is not None:
+            noise = self._aligned_eval_noise(self._active_eval_seeds)
+            actions = self._sample_from_noise_impl(sample_params, noise, obs_inputs)
+        else:
+            self.rng_key, sample_key = jax.random.split(self.rng_key)
+            actions = self._sample_impl(sample_params, sample_key, obs_inputs)
         self._block(actions)
         return np.asarray(jax.device_get(actions), dtype=np.float32)
+
+    def set_active_eval_seeds(self, seeds_in_batch_order):
+        """Enable seed-aligned eval noise. `seeds_in_batch_order` is the env
+        seed for each observation-batch row, in row order. Pass None to
+        disable and restore the default shared-rng_key sampling."""
+        if seeds_in_batch_order is None:
+            self._active_eval_seeds = None
+        else:
+            self._active_eval_seeds = [int(s) for s in seeds_in_batch_order]
+
+    def reset_aligned_eval_noise(self):
+        """Clear per-seed episode-step counters (call once before an eval run)."""
+        self._eval_step_by_seed = {}
+
+    def _aligned_eval_noise(self, seeds):
+        rows = []
+        for s in seeds:
+            s = int(s)
+            t = self._eval_step_by_seed.get(s, 0)
+            self._eval_step_by_seed[s] = t + 1
+            row_key = jax.random.fold_in(
+                jax.random.fold_in(self._eval_noise_base_key, s), t
+            )
+            rows.append(
+                jax.random.normal(
+                    row_key, shape=(self.action_sequence, self.action_dim)
+                )
+            )
+        return jnp.stack(rows, axis=0)
 
     def update(
         self,
@@ -518,7 +854,11 @@ class FlowMatching(JaxMethodBase):
         actions = self._as_jax_array(batch["action"], self.jnp.float32)
         action_pad_mask = self._extract_action_pad_mask(batch)
         loss_coeff = self._loss_weights(batch)
-        obs_features, metrics = self._prepare_obs_features(batch)
+        if self._trainable_encoder:
+            obs_inputs = self._prepare_trainable_obs_inputs(batch)
+            metrics = {}
+        else:
+            obs_inputs, metrics = self._prepare_obs_features(batch)
 
         start_time = time.perf_counter()
         (
@@ -533,7 +873,7 @@ class FlowMatching(JaxMethodBase):
             self.params,
             self.opt_state,
             self.rng_key,
-            obs_features,
+            obs_inputs,
             actions,
             loss_coeff,
             action_pad_mask,
@@ -555,7 +895,7 @@ class FlowMatching(JaxMethodBase):
                 dtype=np.float32,
             )
             self._maybe_update_priorities(replay_buffer, batch, new_priority_np)
-        self._maybe_log_update_metrics(metrics, actor_loss, obs_features, elapsed)
+        self._maybe_log_update_metrics(metrics, actor_loss, obs_inputs, elapsed)
         self._first_update_completed = True
         return metrics
 

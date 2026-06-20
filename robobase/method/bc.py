@@ -42,6 +42,7 @@ class BCActorModelSpec:
 class BCEncoderModelSpec:
     type: str
     model: str
+    trainable: bool = False
 
 
 @dataclass(frozen=True)
@@ -139,6 +140,7 @@ def bc_model_spec_from_cfg(cfg: DictConfig) -> BCModelSpec:
         encoder_model_spec = BCEncoderModelSpec(
             type=encoder_model_type,
             model=str(encoder_model_cfg.get("model", "resnet18")),
+            trainable=bool(encoder_model_cfg.get("trainable", False)),
         )
 
     view_fusion_model_cfg = method_cfg.get("view_fusion_model", None)

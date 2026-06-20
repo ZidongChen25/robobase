@@ -3,6 +3,7 @@ import signal
 import sys
 import time
 import random
+import gc
 from typing import Callable, Any
 from functools import partial
 import logging
@@ -23,6 +24,10 @@ from robobase.replay_buffer.iterator import (
 from robobase.replay_buffer.prioritized_replay_buffer import PrioritizedReplayBuffer
 from robobase.replay_buffer.replay_buffer import ReplayBuffer
 from robobase.replay_buffer.uniform_replay_buffer import UniformReplayBuffer
+from robobase.replay_buffer.bigym_lazy_replay import (
+    LazyBiGymReplayBuffer,
+    lazy_replay_enabled,
+)
 from robobase.replay_buffer.vision_feature_cache import (
     build_vision_feature_cache_plan,
 )
@@ -128,6 +133,22 @@ def _create_default_replay_buffer(
     save_snapshot: bool = False,
     reuse_saved: bool = False,
 ) -> ReplayBuffer:
+    if lazy_replay_enabled(cfg):
+        if demo_replay:
+            raise NotImplementedError("lazy_replay does not support demo replay.")
+        if cfg.env.env_name != "bigym":
+            raise NotImplementedError("lazy_replay is currently implemented for BiGym.")
+        extra_replay_elements = spaces.Dict({})
+        if cfg.demos != 0:
+            extra_replay_elements["demo"] = spaces.Box(0, 1, shape=(), dtype=np.uint8)
+        return LazyBiGymReplayBuffer(
+            cfg,
+            observation_space,
+            action_space,
+            batch_size=cfg.batch_size,
+            extra_replay_elements=extra_replay_elements,
+        )
+
     multiprocessing_context = "spawn"
     cache_plan = build_vision_feature_cache_plan(
         cfg=cfg,
@@ -178,6 +199,11 @@ def _create_default_replay_buffer(
             cfg.replay.get("action_sequence_start_offset", 0)
         ),
         action_padding=str(cfg.replay.get("action_padding", "zero")),
+        max_cached_episodes=cfg.replay.get("max_cached_episodes", None),
+        max_cached_episode_bytes=cfg.replay.get(
+            "max_cached_episode_bytes", None
+        ),
+        include_tp1=bool(cfg.replay.get("include_tp1", True)),
         multiprocessing_context=multiprocessing_context,
     )
 
@@ -204,6 +230,10 @@ def _create_default_envs(cfg: DictConfig) -> EnvFactory:
         from robobase.envs.robomimic import RobomimicEnvFactory
 
         factory = RobomimicEnvFactory()
+    elif cfg.env.env_name == "pusht":
+        from robobase.envs.pusht import PushTEnvFactory
+
+        factory = PushTEnvFactory()
     else:
         ValueError()
     return factory
@@ -295,7 +325,19 @@ class Workspace:
         if (num_demos := cfg.demos) != 0:
             # Collect demos or fetch saved demos before making environments
             # to consider demo-based action space (e.g., standardization)
-            if self._should_collect_demos_from_dataset():
+            if self._should_use_lazy_replay():
+                prepare_lazy_replay = getattr(
+                    self.env_factory,
+                    "prepare_lazy_replay",
+                    None,
+                )
+                if not callable(prepare_lazy_replay):
+                    raise NotImplementedError(
+                        "lazy_replay requires env_factory.prepare_lazy_replay()."
+                    )
+                prepare_lazy_replay(cfg, num_demos)
+                self._skip_demo_loading_from_dataset = True
+            elif self._should_collect_demos_from_dataset():
                 self.env_factory.collect_or_fetch_demos(cfg, num_demos)
             else:
                 self._skip_demo_loading_from_dataset = True
@@ -461,6 +503,12 @@ class Workspace:
                     execution_length=self.cfg.execution_length,
                     shuffle=True,
                     seed=int(self.cfg.seed),
+                    load_all_episodes=bool(
+                        self.cfg.replay.get("epoch_load_all_episodes", False)
+                    ),
+                    batch_chunk_size=self.cfg.replay.get(
+                        "epoch_batch_chunk_size", 0
+                    ),
                 )
             else:
                 _replay_iter = create_jax_replay_iterator(
@@ -480,6 +528,15 @@ class Workspace:
                 if self.cfg.get("backend", None)
                 else 0
             )
+            prefetch_workers = 1
+            if self._should_use_lazy_replay():
+                lazy_cfg = self.cfg.get("lazy_replay", {})
+                prefetch_workers = max(1, int(lazy_cfg.get("num_workers", 1)))
+                if prefetch_size <= 0:
+                    prefetch_size = (
+                        prefetch_workers
+                        * int(lazy_cfg.get("prefetch_factor", 2))
+                    )
             if prefetch_size > 0:
                 backend_cfg = self.cfg.get("backend", {})
                 map_fn = None
@@ -490,6 +547,7 @@ class Workspace:
                     queue_size=prefetch_size,
                     worker_name="jax_replay_prefetch",
                     map_fn=map_fn,
+                    num_workers=prefetch_workers,
                 )
             self._replay_iter = _replay_iter
         return self._replay_iter
@@ -512,6 +570,8 @@ class Workspace:
             execution_length=self.cfg.execution_length,
             shuffle=False,
             seed=int(self.cfg.seed),
+            load_all_episodes=False,
+            batch_chunk_size=self.cfg.replay.get("epoch_batch_chunk_size", 0),
         )
         try:
             return int(epoch_iter.batches_per_epoch)
@@ -520,29 +580,38 @@ class Workspace:
             if callable(close):
                 close()
 
-    def _resolve_pretrain_schedule(self) -> tuple[int, int]:
+    def _resolve_pretrain_schedule(self) -> tuple[int, int, int | None]:
         num_pretrain_steps = int(self.cfg.num_pretrain_steps)
         eval_every_steps = int(self.cfg.eval_every_steps)
         num_pretrain_epochs = self.cfg.get("num_pretrain_epochs", None)
         eval_every_epochs = self.cfg.get("eval_every_epochs", None)
+        snapshot_every_epochs = self.cfg.get("snapshot_every_epochs", None)
 
-        if num_pretrain_epochs is None and eval_every_epochs is None:
-            return num_pretrain_steps, eval_every_steps
+        if (
+            num_pretrain_epochs is None
+            and eval_every_epochs is None
+            and snapshot_every_epochs is None
+        ):
+            return num_pretrain_steps, eval_every_steps, None
 
         batches_per_epoch = self._offline_batches_per_epoch()
         if num_pretrain_epochs is not None:
             num_pretrain_steps = int(num_pretrain_epochs) * batches_per_epoch
         if eval_every_epochs is not None:
             eval_every_steps = int(eval_every_epochs) * batches_per_epoch
+        snapshot_every_steps = None
+        if snapshot_every_epochs is not None:
+            snapshot_every_steps = int(snapshot_every_epochs) * batches_per_epoch
 
         logging.info(
             "Resolved offline pretrain schedule: %d batches/epoch, "
-            "%d pretrain steps, eval every %d steps.",
+            "%d pretrain steps, eval every %d steps, snapshot every %s steps.",
             batches_per_epoch,
             num_pretrain_steps,
             eval_every_steps,
+            "disabled" if snapshot_every_steps is None else str(snapshot_every_steps),
         )
-        return num_pretrain_steps, eval_every_steps
+        return num_pretrain_steps, eval_every_steps, snapshot_every_steps
 
     def _close_replay_iter(self):
         if self._replay_iter is None:
@@ -578,6 +647,8 @@ class Workspace:
         return replay_path.exists() and any(replay_path.glob("*.npz"))
 
     def _should_collect_demos_from_dataset(self) -> bool:
+        if self._should_use_lazy_replay():
+            return False
         if self.use_demo_replay:
             return True
         if not bool(self.cfg.replay.reuse_saved):
@@ -585,6 +656,9 @@ class Workspace:
         if self._requires_demo_stats():
             return True
         return not self._saved_replay_exists(demo_replay=False)
+
+    def _should_use_lazy_replay(self) -> bool:
+        return lazy_replay_enabled(self.cfg)
 
     def _timer_state_dict(self) -> dict[str, float]:
         return {"elapsed_total": self._timer.total_time()}
@@ -921,6 +995,9 @@ class Workspace:
     def _load_demos(self):
         if self._snapshot_loaded:
             return
+        if self._should_use_lazy_replay():
+            logging.info("Using lazy replay; skipping DemoEnv replay import.")
+            return
         if self.replay_buffer.reused_existing and not self.use_demo_replay:
             logging.info("Reusing saved replay episodes from disk. Skipping demo import.")
             return
@@ -936,6 +1013,15 @@ class Workspace:
                 self.env_factory.load_demos_into_replay(
                     self.cfg, self.demo_replay_buffer, is_demo_buffer=True
                 )
+            if bool(self.cfg.replay.get("discard_loaded_demos_after_replay", True)):
+                clear_loaded_demos = getattr(
+                    self.env_factory,
+                    "clear_loaded_demos",
+                    None,
+                )
+                if callable(clear_loaded_demos):
+                    clear_loaded_demos()
+                    gc.collect()
 
         if self.cfg.replay_size_before_train > 0:
             num_demos = _normalize_demos_count(num_demos)
@@ -1025,14 +1111,22 @@ class Workspace:
         return action, (*env_step_tuple, next_info), metrics
 
     def _pretrain_on_demos(self):
-        num_pretrain_steps, eval_every_steps = self._resolve_pretrain_schedule()
+        (
+            num_pretrain_steps,
+            eval_every_steps,
+            snapshot_every_steps,
+        ) = self._resolve_pretrain_schedule()
         if num_pretrain_steps > 0:
             pre_train_until_step = _Until(num_pretrain_steps)
             should_pretrain_log = _Every(self.cfg.log_pretrain_every)
             should_pretrain_eval = _Every(eval_every_steps)
-            snapshot_every_n = (
-                self.cfg.snapshot_every_n if self.cfg.save_snapshot else 0
-            )
+            snapshot_every_n = 0
+            if self.cfg.save_snapshot:
+                snapshot_every_n = (
+                    snapshot_every_steps
+                    if snapshot_every_steps is not None
+                    else self.cfg.snapshot_every_n
+                )
             should_pretrain_save_snapshot = _Every(snapshot_every_n)
             snapshot_save_start_step = int(
                 self.cfg.get("snapshot_save_start_step", 0)
@@ -1303,7 +1397,12 @@ class Workspace:
         with snapshot.open("wb") as f:
             pickle.dump(payload, f)
         latest_snapshot = self.work_dir / "snapshots" / "latest_snapshot.pkl"
-        shutil.copy(snapshot, latest_snapshot)
+        # Point `latest` at the just-written snapshot via a relative symlink
+        # instead of a full copy, so we don't duplicate the (large) checkpoint
+        # on disk. Resume reads latest_snapshot.pkl and transparently follows
+        # the link; the numbered `<step>_snapshot.pkl` is kept as-is.
+        latest_snapshot.unlink(missing_ok=True)
+        latest_snapshot.symlink_to(snapshot.name)
 
     def load_snapshot(
         self,

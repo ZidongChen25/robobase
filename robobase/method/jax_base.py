@@ -304,11 +304,15 @@ class JaxMethodBase(Method):
         self, metrics: dict, actor_loss, obs_features, elapsed: float
     ):
         if self.logging:
+            if isinstance(obs_features, dict):
+                batch_size = self.jax.tree_util.tree_leaves(obs_features)[0].shape[0]
+            else:
+                batch_size = obs_features.shape[0]
             metrics["actor_loss"] = float(
                 np.asarray(self.jax.device_get(actor_loss))
             )
             metrics["backend/update_time_sec"] = elapsed
-            metrics["backend/update_steps_per_second"] = obs_features.shape[0] / max(
+            metrics["backend/update_steps_per_second"] = batch_size / max(
                 elapsed, 1e-12,
             )
             if not self._first_update_completed:

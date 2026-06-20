@@ -7,6 +7,7 @@ from functools import lru_cache
 import jax
 import jax.numpy as jnp
 import numpy as np
+from flax.core import FrozenDict, freeze
 
 
 _IMAGENET_MEAN = np.asarray([0.485, 0.456, 0.406], dtype=np.float32)
@@ -78,6 +79,14 @@ class JaxResNetEncoder:
     def output_shape(self) -> tuple[int, int]:
         return (self._input_shape[0], self._num_features)
 
+    @property
+    def trainable_params(self):
+        return self._feature_variables["params"]
+
+    @property
+    def batch_stats(self):
+        return self._feature_variables.get("batch_stats", None)
+
     def encode(self, rgb_obs) -> jnp.ndarray:
         if hasattr(rgb_obs, "detach"):
             rgb_obs = rgb_obs.detach().cpu().numpy()
@@ -85,7 +94,13 @@ class JaxResNetEncoder:
             rgb_obs = np.asarray(rgb_obs)
         return self._encode(jnp.asarray(rgb_obs))
 
-    def _encode_impl(self, rgb_obs: jnp.ndarray) -> jnp.ndarray:
+    def apply_trainable(self, params, rgb_obs: jnp.ndarray) -> jnp.ndarray:
+        variables = {"params": params}
+        if self.batch_stats is not None:
+            variables["batch_stats"] = self.batch_stats
+        return self._encode_impl(rgb_obs, variables=freeze(variables), stop_gradient=False)
+
+    def _preprocess(self, rgb_obs: jnp.ndarray) -> tuple[jnp.ndarray, int, int]:
         x = rgb_obs.astype(jnp.float32)
         batch_size, num_views, channels, height, width = x.shape
         x = jnp.transpose(x, (0, 1, 3, 4, 2))
@@ -95,6 +110,21 @@ class JaxResNetEncoder:
         )
         x = x / 255.0
         x = (x - self._mean) / self._std
-        x = self._feature_model.apply(self._feature_variables, x)
+        return x, batch_size, num_views
+
+    def _encode_impl(
+        self,
+        rgb_obs: jnp.ndarray,
+        *,
+        variables: FrozenDict | None = None,
+        stop_gradient: bool = True,
+    ) -> jnp.ndarray:
+        x, batch_size, num_views = self._preprocess(rgb_obs)
+        x = self._feature_model.apply(
+            self._feature_variables if variables is None else variables,
+            x,
+        )
         x = x.reshape((batch_size, num_views, self._num_features))
-        return jax.lax.stop_gradient(x)
+        if stop_gradient:
+            x = jax.lax.stop_gradient(x)
+        return x

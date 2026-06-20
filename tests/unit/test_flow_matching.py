@@ -214,6 +214,45 @@ def test_flow_matching_act_returns_action_sequence():
     assert np.all(actions <= 1.0)
 
 
+@pytest.mark.parametrize("bad_value", [np.nan, np.inf, -np.inf])
+def test_flow_matching_act_sanitizes_nonfinite_output(monkeypatch, bad_value):
+    observation_space = spaces.Dict(
+        {
+            "low_dim_state": spaces.Box(
+                low=-1.0,
+                high=1.0,
+                shape=(1, 4),
+                dtype=np.float32,
+            )
+        }
+    )
+    action_space = spaces.Box(
+        low=-1.0,
+        high=1.0,
+        shape=(3, 2),
+        dtype=np.float32,
+    )
+    agent = _make_flow_matching(
+        observation_space=observation_space,
+        action_space=action_space,
+        jit=False,
+    )
+
+    def _bad_apply_with_shape(*args, **kwargs):
+        del kwargs
+        current_sample = args[1]
+        return agent.jnp.full_like(current_sample, bad_value)
+
+    monkeypatch.setattr(agent.actor_model, "apply", _bad_apply_with_shape)
+
+    obs = {"low_dim_state": np.zeros((2, 1, 4), dtype=np.float32)}
+    actions = agent.act(obs, step=0, eval_mode=False)
+
+    assert np.isfinite(actions).all()
+    assert np.all(actions >= -1.0)
+    assert np.all(actions <= 1.0)
+
+
 def test_flow_matching_workspace_smoke_and_snapshot(tmp_path):
     GlobalHydra.instance().clear()
     with initialize_config_dir(

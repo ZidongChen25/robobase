@@ -65,6 +65,8 @@ class EpochReplayBatchIterator(ReplayBatchIterator):
         shuffle: bool = True,
         drop_last: bool = True,
         seed: int | None = None,
+        load_all_episodes: bool = False,
+        batch_chunk_size: int | None = None,
     ):
         if execution_length < 1:
             raise ValueError("execution_length must be >= 1.")
@@ -74,11 +76,29 @@ class EpochReplayBatchIterator(ReplayBatchIterator):
         self._shuffle = shuffle
         self._drop_last = drop_last
         self._rng = np.random.default_rng(seed)
+        self._batch_chunk_size = (
+            0 if batch_chunk_size is None else int(batch_chunk_size)
+        )
+        if self._batch_chunk_size < 0:
+            raise ValueError("batch_chunk_size must be >= 0 or null.")
+        if self._batch_chunk_size > self._batch_size:
+            self._batch_chunk_size = self._batch_size
 
-        replay_buffer.load_all_episodes()
-        self._all_indices = self._build_sample_indices(
+        if load_all_episodes:
+            replay_buffer.load_all_episodes()
+        else:
+            logging.info(
+                "Epoch replay iterator will stream replay episodes from disk "
+                "instead of eagerly loading the full dataset into RAM."
+            )
+        self._episode_indices = self._build_episode_sample_indices(
             replay_buffer,
             execution_length=execution_length,
+        )
+        self._all_indices = (
+            np.concatenate(self._episode_indices)
+            if self._episode_indices
+            else np.asarray([], dtype=np.int32)
         )
         if self._all_indices.size == 0:
             raise ValueError(
@@ -97,20 +117,28 @@ class EpochReplayBatchIterator(ReplayBatchIterator):
                 self._all_indices.size,
                 self._batch_size,
             )
+        if self._batch_chunk_size > 0:
+            logging.info(
+                "Epoch replay iterator will build locality-aware batches with "
+                "batch_chunk_size=%d.",
+                self._batch_chunk_size,
+            )
 
         self._epoch_indices = self._all_indices.copy()
+        self._epoch_batches = None
         self._cursor = 0
+        self._cursor_lock = threading.Lock()
         self._reshuffle()
 
     @staticmethod
-    def _build_sample_indices(
+    def _build_episode_sample_indices(
         replay_buffer: ReplayBuffer,
         *,
         execution_length: int,
-    ) -> np.ndarray:
+    ) -> list[np.ndarray]:
         frame_stack = int(getattr(replay_buffer, "frame_stack", 1))
         action_seq = int(getattr(replay_buffer, "action_seq", 1))
-        indices = []
+        episode_indices = []
         for global_start, episode_length in replay_buffer.episode_index_metadata():
             max_valid_index = min(
                 episode_length - 1,
@@ -118,10 +146,36 @@ class EpochReplayBatchIterator(ReplayBatchIterator):
             )
             if max_valid_index < 0:
                 continue
-            indices.extend(range(global_start, global_start + max_valid_index + 1))
-        return np.asarray(indices, dtype=np.int32)
+            episode_indices.append(
+                np.arange(
+                    global_start,
+                    global_start + max_valid_index + 1,
+                    dtype=np.int32,
+                )
+            )
+        return episode_indices
+
+    @staticmethod
+    def _build_sample_indices(
+        replay_buffer: ReplayBuffer,
+        *,
+        execution_length: int,
+    ) -> np.ndarray:
+        episode_indices = EpochReplayBatchIterator._build_episode_sample_indices(
+            replay_buffer,
+            execution_length=execution_length,
+        )
+        if not episode_indices:
+            return np.asarray([], dtype=np.int32)
+        return np.concatenate(episode_indices)
 
     def _reshuffle(self):
+        if self._batch_chunk_size > 0:
+            self._epoch_batches = self._build_locality_aware_batches()
+            self._cursor = 0
+            return
+
+        self._epoch_batches = None
         self._epoch_indices = self._all_indices.copy()
         if self._shuffle:
             if _TORCH_AVAILABLE:
@@ -132,6 +186,40 @@ class EpochReplayBatchIterator(ReplayBatchIterator):
             else:
                 self._rng.shuffle(self._epoch_indices)
         self._cursor = 0
+
+    def _build_locality_aware_batches(self) -> list[np.ndarray]:
+        chunks = []
+        for episode_indices in self._episode_indices:
+            indices = episode_indices.copy()
+            if self._shuffle:
+                self._rng.shuffle(indices)
+            for start in range(0, indices.size, self._batch_chunk_size):
+                chunks.append(indices[start : start + self._batch_chunk_size])
+
+        if self._shuffle and len(chunks) > 1:
+            order = self._rng.permutation(len(chunks))
+            chunks = [chunks[index] for index in order]
+
+        batches = []
+        current = []
+        current_size = 0
+        for chunk in chunks:
+            offset = 0
+            while offset < chunk.size:
+                needed = self._batch_size - current_size
+                take = min(needed, chunk.size - offset)
+                current.append(chunk[offset : offset + take])
+                current_size += take
+                offset += take
+
+                if current_size == self._batch_size:
+                    batches.append(np.concatenate(current).astype(np.int32, copy=False))
+                    current = []
+                    current_size = 0
+
+        if current_size and not self._drop_last:
+            batches.append(np.concatenate(current).astype(np.int32, copy=False))
+        return batches
 
     @property
     def sample_indices(self) -> np.ndarray:
@@ -144,6 +232,21 @@ class EpochReplayBatchIterator(ReplayBatchIterator):
         return int(np.ceil(self._all_indices.size / self._batch_size))
 
     def __next__(self):
+        batch_indices = self._next_batch_indices()
+        return self._sample_batch_indices(batch_indices)
+
+    def _next_batch_indices(self) -> np.ndarray:
+        with self._cursor_lock:
+            return self._next_batch_indices_unlocked()
+
+    def _next_batch_indices_unlocked(self) -> np.ndarray:
+        if self._epoch_batches is not None:
+            if self._cursor >= len(self._epoch_batches):
+                self._reshuffle()
+            batch_indices = self._epoch_batches[self._cursor]
+            self._cursor += 1
+            return batch_indices
+
         if self._cursor >= self._epoch_indices.size:
             self._reshuffle()
 
@@ -157,6 +260,9 @@ class EpochReplayBatchIterator(ReplayBatchIterator):
 
         batch_indices = self._epoch_indices[self._cursor:batch_end]
         self._cursor = batch_end
+        return batch_indices
+
+    def _sample_batch_indices(self, batch_indices: np.ndarray):
         sample_batch_indices = getattr(
             self._replay_buffer, "sample_batch_indices", None
         )
@@ -294,17 +400,21 @@ class PrefetchReplayBatchIterator(ReplayBatchIterator):
         queue_size: int,
         worker_name: str,
         map_fn=None,
+        num_workers: int = 1,
     ):
         self._replay_iter = replay_iter
         self._map_fn = map_fn
         self._queue = queue.Queue(maxsize=max(2, queue_size))
         self._stop_event = threading.Event()
-        self._thread = threading.Thread(
-            target=self._prefetch_loop,
-            args=(worker_name,),
-            daemon=True,
-        )
-        self._thread.start()
+        self._threads = []
+        for worker_idx in range(max(1, int(num_workers))):
+            thread = threading.Thread(
+                target=self._prefetch_loop,
+                args=(f"{worker_name}:{worker_idx}",),
+                daemon=True,
+            )
+            thread.start()
+            self._threads.append(thread)
 
     def _prefetch_loop(self, worker_name: str):
         try:
@@ -345,8 +455,10 @@ class PrefetchReplayBatchIterator(ReplayBatchIterator):
         close = getattr(self._replay_iter, "close", None)
         if callable(close):
             close()
-        if getattr(self, "_thread", None) is not None and self._thread.is_alive():
-            self._thread.join(timeout=1.0)
+        for thread in getattr(self, "_threads", []):
+            if thread.is_alive():
+                thread.join(timeout=1.0)
+        self._threads = []
         self._stop_event = None
 
 
@@ -396,6 +508,8 @@ def create_epoch_replay_iterator(
     execution_length: int,
     shuffle: bool = True,
     seed: int | None = None,
+    load_all_episodes: bool = False,
+    batch_chunk_size: int | None = None,
 ) -> ReplayBatchIterator:
     return EpochReplayBatchIterator(
         replay_buffer,
@@ -403,6 +517,8 @@ def create_epoch_replay_iterator(
         shuffle=shuffle,
         drop_last=True,
         seed=seed,
+        load_all_episodes=load_all_episodes,
+        batch_chunk_size=batch_chunk_size,
     )
 
 

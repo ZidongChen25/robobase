@@ -189,6 +189,12 @@ def build_vision_feature_cache_plan(
             logging.info("%s Falling back to raw replay images.", message)
             return None
         raise ValueError(message)
+    if getattr(model_spec.encoder_model, "trainable", False):
+        message = "Frozen image-feature replay caching is incompatible with trainable encoders."
+        if cache_setting == "auto":
+            logging.info("%s Falling back to raw replay images.", message)
+            return None
+        raise ValueError(message)
     if model_spec.encoder_model.model not in _SUPPORTED_RESNETS:
         message = (
             "Frozen image-feature replay caching supports only "

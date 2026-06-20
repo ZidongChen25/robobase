@@ -125,6 +125,7 @@ def act_model_spec_from_cfg(cfg: DictConfig) -> ACTModelSpec:
         encoder_model_spec = BCEncoderModelSpec(
             type=encoder_model_type,
             model=str(encoder_model_cfg.get("model", encoder_model_cfg.get("backbone", "resnet18"))),
+            trainable=bool(encoder_model_cfg.get("trainable", True)),
         )
 
     view_fusion_model_cfg = method_cfg.get("view_fusion_model", None)

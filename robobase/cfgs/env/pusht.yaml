@@ -1,0 +1,21 @@
+# @package _global_
+
+visual_observation_shape: [96, 96]
+
+env:
+  env_name: pusht
+  task_name: PushT
+  repo_id: lerobot/pusht
+  dataset_path: ""
+  cache_dir: null
+  download: true
+  split: train
+  random_traj: false
+  episode_length: 300
+  use_live_env: true
+  obs_type: ""  # infer from pixels unless explicitly set
+  image_key: image_rgb
+  render_mode: rgb_array
+  visualization_height: 384
+  visualization_width: 384
+  include_environment_state: false

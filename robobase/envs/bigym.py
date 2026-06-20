@@ -35,7 +35,31 @@ UNIT_TEST = False
 BIGYM_TASK_DESCRIPTIONS = {
     "move_plate": "Move the plate between two draining racks.",
     "MovePlate": "Move the plate between two draining racks.",
+    "flip_cup": "Flip the cup upright.",
+    "FlipCup": "Flip the cup upright.",
+    "dishwasher_load_cups": "Load the cups into the dishwasher.",
+    "DishwasherLoadCups": "Load the cups into the dishwasher.",
+    "put_cups": "Put the cups away.",
+    "PutCups": "Put the cups away.",
+    "sandwich_remove": "Remove the sandwich from the toaster.",
+    "RemoveSandwich": "Remove the sandwich from the toaster.",
+    "dishwasher_open": "Open the dishwasher door.",
+    "DishwasherOpen": "Open the dishwasher door.",
 }
+
+
+def _episode_limit_steps(cfg: DictConfig) -> int:
+    episode_length = int(cfg.env.episode_length)
+    if bool(cfg.env.get("episode_length_is_env_steps", False)):
+        return episode_length
+    return episode_length // int(cfg.env.demo_down_sample_rate)
+
+
+def _demo_observation_array(value):
+    array = np.asarray(value)
+    if array.dtype == np.uint8:
+        return array
+    return array.astype(np.float32, copy=False)
 
 
 class AddBiGymLanguageTokens(gym.ObservationWrapper):
@@ -142,14 +166,12 @@ class BiGymEnvFactory(EnvFactory):
         )
         if bool(cfg.method.get("use_lang_cond", False)):
             env = AddBiGymLanguageTokens(env, cfg.env.task_name)
+        episode_limit_steps = _episode_limit_steps(cfg)
         if cfg.use_onehot_time_and_no_bootstrap:
-            env = OnehotTime(env, cfg.env.episode_length)
+            env = OnehotTime(env, episode_limit_steps)
         if not demo_env:
             env = FrameStack(env, cfg.frame_stack)
-        env = TimeLimit(
-            env,
-            cfg.env.episode_length // cfg.env.demo_down_sample_rate,
-        )
+        env = TimeLimit(env, episode_limit_steps)
 
         if not demo_env:
             if not train:
@@ -162,10 +184,11 @@ class BiGymEnvFactory(EnvFactory):
                     env = RecedingHorizonControl(
                         env,
                         cfg.action_sequence,
-                        cfg.env.episode_length // (cfg.env.demo_down_sample_rate),
+                        episode_limit_steps,
                         cfg.execution_length,
                         temporal_ensemble=cfg.temporal_ensemble,
                         gain=cfg.temporal_ensemble_gain,
+                        execution_start=cfg.get("action_execution_start", 0),
                     )
             else:
                 env = ActionSequence(
@@ -229,6 +252,20 @@ class BiGymEnvFactory(EnvFactory):
             ],
         )
 
+    def make_eval_envs(self, cfg: DictConfig) -> gym.vector.VectorEnv:
+        vec_env_class = gym.vector.SyncVectorEnv
+        return vec_env_class(
+            [
+                lambda: self._wrap_env(
+                    self._create_env(cfg),
+                    cfg,
+                    demo_env=False,
+                    train=False,
+                )
+                for _ in range(cfg.num_eval_envs)
+            ],
+        )
+
     def make_eval_env(self, cfg: DictConfig) -> gym.Env:
         env, self._action_space, self._observation_space = self._wrap_env(
             env=self._create_env(cfg),
@@ -274,7 +311,7 @@ class BiGymEnvFactory(EnvFactory):
                 ]
                 for i, ts in enumerate(timesteps):
                     ts.observation = {
-                        k: np.array(v, dtype=np.float32)
+                        k: _demo_observation_array(v)
                         for k, v in ts.observation.items()
                     }
                     ts.info = dict(ts.info)
@@ -288,7 +325,7 @@ class BiGymEnvFactory(EnvFactory):
                 # so the first replay transition is reset_obs -> first demo action.
                 reset_obs, _ = env.reset(seed=demo.seed)
                 reset_obs = {
-                    k: np.array(v, dtype=np.float32) for k, v in reset_obs.items()
+                    k: _demo_observation_array(v) for k, v in reset_obs.items()
                 }
                 reset_step = DemoStep(
                     reset_obs,
@@ -302,7 +339,7 @@ class BiGymEnvFactory(EnvFactory):
                 demo._steps = [reset_step] + timesteps
                 for ts in demo.timesteps:
                     ts.observation = {
-                        k: np.array(v, dtype=np.float32)
+                        k: _demo_observation_array(v)
                         for k, v in ts.observation.items()
                     }
 
@@ -338,6 +375,16 @@ class BiGymEnvFactory(EnvFactory):
         self._action_stats = self._compute_action_stats(cfg, demos)
         self._obs_stats = self._compute_obs_stats(cfg, demos)
 
+    def prepare_lazy_replay(self, cfg: DictConfig, num_demos: int):
+        from robobase.replay_buffer.bigym_lazy_replay import (
+            build_bigym_lazy_manifest,
+        )
+
+        manifest = build_bigym_lazy_manifest(cfg, num_demos)
+        self._lazy_replay_manifest = manifest
+        self._action_stats = manifest.action_stats
+        self._obs_stats = manifest.obs_stats
+
     def post_collect_or_fetch_demos(self, cfg: DictConfig):
         demo_list = [demo.timesteps for demo in self._raw_demos]
         demo_list = rescale_demo_actions(
@@ -367,7 +414,9 @@ class BiGymEnvFactory(EnvFactory):
 
         demo_env = self._wrap_env(
             DemoEnv(
-                copy.deepcopy(demos), self._action_space, self._observation_space
+                [list(demo) for demo in demos],
+                self._action_space,
+                self._observation_space,
             ),
             cfg,
             demo_env=True,
@@ -455,7 +504,13 @@ class BiGymEnvFactory(EnvFactory):
             for step in self._training_timesteps(demo):
                 obs.append(step.observation)
 
-        keys = obs[0].keys()
+        keys = [
+            key
+            for key in obs[0].keys()
+            if np.asarray(obs[0][key]).dtype != np.uint8
+        ]
+        if not keys:
+            raise ValueError("BiGym demos do not contain low-dimensional observations.")
         obs = {key: np.stack([o[key] for o in obs], axis=0) for key in keys}
         obs_mean = {key: np.mean(obs[key], 0) for key in keys}
         obs_std = {key: np.clip(np.std(obs[key], 0), 1e-10, np.inf) for key in keys}

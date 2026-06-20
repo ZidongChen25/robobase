@@ -1,0 +1,98 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "robobase"
+version = "1.0.0"
+description = "RoboBase imitation-learning and reinforcement-learning training stack."
+requires-python = ">=3.10,<3.12"
+dependencies = [
+    "einops==0.8.2",
+    "gymnasium @ git+https://github.com/stepjam/Gymnasium.git@2cbc4d34c3124ef4921977fe4ed1e4e532f33ed3",
+    "hydra-core==1.3.2",
+    "hydra-joblib-launcher==1.2.0",
+    "imageio==2.37.3",
+    "imageio-ffmpeg==0.6.0",
+    "moviepy==2.2.1",
+    "natsort==8.4.0",
+    "numpy>=1.26,<2",
+    "omegaconf==2.3.0",
+    "opencv-python-headless==4.11.0.86",
+    "scipy==1.15.3",
+    "termcolor==3.3.0",
+    "wandb==0.22.3",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pre-commit",
+    "pytest==9.0.2",
+]
+jax = [
+    "flax==0.10.6",
+    "jax==0.6.2",
+    "jax-resnet @ git+https://github.com/n2cholas/jax-resnet.git@5b00735aa0a68ec239af4a728ad4a596c1b551f6",
+    "jaxlib==0.6.2",
+    "optax==0.2.8",
+    "orbax-checkpoint==0.11.33",
+    "timm",
+]
+jax-cuda12 = [
+    "flax==0.10.6",
+    "jax[cuda12]==0.6.2",
+    "jax-resnet @ git+https://github.com/n2cholas/jax-resnet.git@5b00735aa0a68ec239af4a728ad4a596c1b551f6",
+    "optax==0.2.8",
+    "orbax-checkpoint==0.11.33",
+    "timm",
+]
+torch = [
+    "torch",
+    "torchvision",
+]
+tensorboard = [
+    "tensorboard",
+]
+dmc = [
+    "dm_control==1.0.19",
+    "pillow",
+]
+robomimic = [
+    "h5py==3.16.0",
+    "robosuite==1.4.1",
+]
+bigym = [
+    "bigym @ git+https://github.com/chernyadev/bigym.git@d98124454dfa3bc697f75536daec5989a47bfa8d",
+    "safetensors==0.6.2",
+]
+pusht = [
+    "gym-pusht==0.1.6",
+    "huggingface-hub",
+    "pyarrow==24.0.0",
+    "pymunk<7",
+]
+rlbench = [
+    "rlbench @ git+https://github.com/stepjam/RLBench.git@b80e51feb3694d9959cb8c0408cd385001b01382",
+]
+d4rl = [
+    "cython<3",
+    "d4rl @ git+https://github.com/Farama-Foundation/d4rl@master#egg=d4rl",
+    "gym",
+    "tqdm==4.67.3",
+]
+
+[dependency-groups]
+dev = [
+    "pre-commit",
+    "pytest==9.0.2",
+]
+
+[tool.uv]
+default-groups = ["dev"]
+
+[tool.setuptools.packages.find]
+include = ["robobase*"]
+exclude = ["tests*", "third_party*"]
+
+[tool.setuptools.package-data]
+robobase = ["cfgs/**/*.yaml"]

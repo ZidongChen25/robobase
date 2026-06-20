@@ -254,6 +254,7 @@ class RescaleFromTanhWithMinMax(gym.ActionWrapper, gym.utils.RecordConstructorAr
         self.action_space = spaces.Box(
             minimum, maximum, shape=action_space.shape, dtype=action_space.dtype
         )
+        self.orig_action_space = action_space
         self.is_vector_env = getattr(env, "is_vector_env", False)
         self.action_stats = action_stats
         self.min_max_margin = min_max_margin
@@ -287,6 +288,11 @@ class RescaleFromTanhWithMinMax(gym.ActionWrapper, gym.utils.RecordConstructorAr
         Args:
             action: The original :meth:`step` actions
         """
-        return RescaleFromTanhWithMinMax.transform_from_tanh(
+        raw_action = RescaleFromTanhWithMinMax.transform_from_tanh(
             action, self.action_stats, self.min_max_margin
+        )
+        return np.clip(
+            raw_action,
+            self.orig_action_space.low,
+            self.orig_action_space.high,
         )

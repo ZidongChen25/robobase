@@ -37,6 +37,8 @@ class DiffusionModelSpec:
     encoder_model: BCEncoderModelSpec | None
     view_fusion_model: BCViewFusionModelSpec | None
     backbone: DiffusionBackboneSpec | None = None
+    use_lang_cond: bool = False
+    lang_feature_dim: int = 512
 
     @property
     def resolved_backbone(self) -> DiffusionBackboneSpec:
@@ -122,6 +124,7 @@ def diffusion_model_spec_from_cfg(cfg: DictConfig) -> DiffusionModelSpec:
         encoder_model_spec = BCEncoderModelSpec(
             type=encoder_model_type,
             model=str(encoder_model_cfg.get("model", "resnet18")),
+            trainable=bool(encoder_model_cfg.get("trainable", False)),
         )
 
     view_fusion_model_cfg = method_cfg.get("view_fusion_model", None)
@@ -144,6 +147,8 @@ def diffusion_model_spec_from_cfg(cfg: DictConfig) -> DiffusionModelSpec:
         encoder_model=encoder_model_spec,
         view_fusion_model=view_fusion_model_spec,
         backbone=backbone_spec if backbone_cfg is not None else None,
+        use_lang_cond=bool(method_cfg.get("use_lang_cond", False)),
+        lang_feature_dim=int(method_cfg.get("lang_feature_dim", 512)),
     )
 
 
@@ -282,11 +287,14 @@ def _build_model(
         observation_space=observation_space,
         encoder_jit=encoder_jit,
     )
-    feature_dim = int(obs_layout.low_dim_size + rgb_latent_size)
+    lang_feature_dim = (
+        int(model_spec.lang_feature_dim) if model_spec.use_lang_cond else 0
+    )
+    feature_dim = int(obs_layout.low_dim_size + rgb_latent_size + lang_feature_dim)
     if backbone_type == "transformer" and not obs_layout.use_pixels:
         low_dim_state_spec = observation_space.spaces.get("low_dim_state")
         if low_dim_state_spec is not None:
-            feature_dim = int(low_dim_state_spec.shape[-1])
+            feature_dim = int(low_dim_state_spec.shape[-1]) + lang_feature_dim
     return _BuiltDiffusionModel(
         actor_model=build_diffusion_backbone(
             backbone_spec,
@@ -382,6 +390,9 @@ class Diffusion(JaxMethodBase):
         self.objective_type = str(objective_type).lower()
         self.sampler = str(sampler).lower()
         self.model_spec = model
+        self.use_lang_cond = bool(model.use_lang_cond)
+        self.lang_feature_dim = int(model.lang_feature_dim) if self.use_lang_cond else 0
+        self._clip_text_cache: dict[tuple[int, ...], np.ndarray] = {}
         self._backbone_type = backbone_type
         self._condition_as_sequence = backbone_type == "transformer"
         self._init_cached_pixel_feature_key("diffusion")
@@ -406,7 +417,15 @@ class Diffusion(JaxMethodBase):
         self.actor_model = built_model.actor_model
         self.encoder = built_model.encoder_model
         self.view_fusion = built_model.view_fusion_model
-        self.rgb_latent_size = max(0, feature_dim - self.low_dim_size)
+        self._trainable_encoder = (
+            self.encoder is not None
+            and self.model_spec.encoder_model is not None
+            and bool(self.model_spec.encoder_model.trainable)
+        )
+        self.rgb_latent_size = max(
+            0,
+            feature_dim - self.low_dim_size - self.lang_feature_dim,
+        )
 
         # Diffusion schedule
         betas = _cosine_betas(self.num_diffusion_iters)
@@ -435,8 +454,16 @@ class Diffusion(JaxMethodBase):
                 if feature_dim > 0
                 else None
             )
-        self.params = self.actor_model.init(
+        actor_params = self.actor_model.init(
             init_key, dummy_actions, dummy_timesteps, dummy_features
+        )
+        self.params = (
+            {
+                "actor": actor_params,
+                "encoder": self.encoder.trainable_params,
+            }
+            if self._trainable_encoder
+            else actor_params
         )
         self.ema_params = self.params if self.use_ema else None
 
@@ -502,13 +529,148 @@ class Diffusion(JaxMethodBase):
             obs_features = self._as_jax_array(
                 batch_or_obs["low_dim_state"], self.jnp.float32
             )
+            if self.use_lang_cond:
+                lang_features = self._extract_lang_features(batch_or_obs)
+                lang_features = self.jnp.repeat(
+                    lang_features[:, None, :],
+                    obs_features.shape[1],
+                    axis=1,
+                )
+                obs_features = self.jnp.concatenate(
+                    [obs_features, lang_features],
+                    axis=-1,
+                )
             metrics = {}
             if self.logging:
                 metrics["low_dim_state"] = np.asarray(
                     self.jax.device_get(obs_features[0, -1])
                 )
             return obs_features, metrics
-        return super()._prepare_obs_features(batch_or_obs)
+        obs_features, metrics = super()._prepare_obs_features(batch_or_obs)
+        if self.use_lang_cond:
+            obs_features = self.jnp.concatenate(
+                [obs_features, self._extract_lang_features(batch_or_obs)],
+                axis=-1,
+            )
+        return obs_features, metrics
+
+    def _actor_params(self, params):
+        if self._trainable_encoder:
+            return params["actor"]
+        return params
+
+    def _lang_token_rows(self, batch_or_obs: dict) -> np.ndarray:
+        if "lang_tokens" not in batch_or_obs:
+            raise ValueError(
+                "Language-conditioned diffusion requires 'lang_tokens' observations."
+            )
+        tokens = np.asarray(batch_or_obs["lang_tokens"], dtype=np.int32)
+        if tokens.ndim == 1:
+            tokens = tokens[None, :]
+        elif tokens.ndim >= 3:
+            tokens = tokens.reshape(tokens.shape[0], -1, tokens.shape[-1])[:, -1, :]
+        return tokens
+
+    def _encode_clip_text(self, tokens: np.ndarray) -> np.ndarray:
+        token_rows = np.asarray(tokens, dtype=np.int32)
+        features = []
+        missing = []
+        missing_keys = []
+        for row in token_rows:
+            key = tuple(int(v) for v in row.tolist())
+            cached = self._clip_text_cache.get(key)
+            if cached is None:
+                missing.append(row)
+                missing_keys.append(key)
+            features.append((key, cached))
+
+        if missing:
+            import torch
+            import clip
+
+            if not hasattr(self, "clip_model"):
+                clip_model, _ = clip.load("ViT-B/32", device="cpu")
+                clip_model.eval()
+                for param in clip_model.parameters():
+                    param.requires_grad_(False)
+                self.__dict__["clip_model"] = clip_model
+
+            with torch.no_grad():
+                token_tensor = torch.as_tensor(
+                    np.stack(missing),
+                    dtype=torch.long,
+                    device="cpu",
+                )
+                encoded = self.clip_model.encode_text(token_tensor).float().cpu().numpy()
+            if encoded.shape[-1] != self.lang_feature_dim:
+                raise ValueError(
+                    "CLIP text feature dimension does not match "
+                    f"method.lang_feature_dim: {encoded.shape[-1]} != "
+                    f"{self.lang_feature_dim}."
+                )
+            for key, value in zip(missing_keys, encoded):
+                self._clip_text_cache[key] = value.astype(np.float32, copy=False)
+
+        return np.stack(
+            [self._clip_text_cache[key] for key, _ in features],
+            axis=0,
+        ).astype(np.float32, copy=False)
+
+    def _extract_lang_features(self, batch_or_obs: dict):
+        if not self.use_lang_cond:
+            return None
+        return self._as_jax_array(
+            self._encode_clip_text(self._lang_token_rows(batch_or_obs)),
+            self.jnp.float32,
+        )
+
+    def _prepare_trainable_obs_inputs(self, batch_or_obs: dict):
+        inputs = {}
+        low_dim_obs = self._extract_low_dim_batch(batch_or_obs)
+        if low_dim_obs is not None:
+            inputs["low_dim"] = low_dim_obs
+        if self.use_pixels:
+            if self._has_cached_pixel_features(batch_or_obs):
+                raise ValueError(
+                    "Trainable JAX diffusion encoder requires raw RGB observations; "
+                    "disable replay.cache_frozen_image_features."
+                )
+            rgb_obs, _ = self._extract_rgb_obs(batch_or_obs)
+            inputs["rgb"] = rgb_obs
+        if self.use_lang_cond:
+            inputs["lang"] = self._extract_lang_features(batch_or_obs)
+        return inputs
+
+    def _features_from_inputs(self, params, obs_inputs):
+        if not self._trainable_encoder:
+            return obs_inputs
+        features = []
+        if "low_dim" in obs_inputs:
+            features.append(obs_inputs["low_dim"])
+        if "rgb" in obs_inputs:
+            rgb_feats = self.encoder.apply_trainable(
+                params["encoder"],
+                obs_inputs["rgb"],
+            )
+            features.append(self._fuse_multi_view(rgb_feats))
+        if "lang" in obs_inputs:
+            features.append(obs_inputs["lang"])
+        if not features:
+            raise ValueError("Diffusion requires at least one observation feature.")
+        if len(features) == 1:
+            return features[0]
+        return self.jnp.concatenate(features, axis=-1)
+
+    def _obs_input_batch_size(self, obs_inputs) -> int:
+        if isinstance(obs_inputs, dict):
+            leaves = self.jax.tree_util.tree_leaves(obs_inputs)
+            return int(leaves[0].shape[0])
+        return int(obs_inputs.shape[0])
+
+    def _last_obs_inputs(self, obs_inputs):
+        if isinstance(obs_inputs, dict):
+            return self.jax.tree_util.tree_map(lambda value: value[-1], obs_inputs)
+        return obs_inputs[-1]
 
     # ------------------------------------------------------------------
     # Forward / update
@@ -521,7 +683,7 @@ class Diffusion(JaxMethodBase):
         actor_model = self.actor_model
 
         def update_fn(
-            params, opt_state, rng_key, obs_features, actions,
+            params, opt_state, rng_key, obs_inputs, actions,
             loss_coeff, action_pad_mask, ema_params, ema_optimization_step,
         ):
             noise_key, timestep_key, dropout_key, next_key = jax.random.split(rng_key, 4)
@@ -543,9 +705,11 @@ class Diffusion(JaxMethodBase):
                 noise = jnp.where(valid_mask[..., None], noise, 0.0)
 
             def loss_fn(current_params):
+                obs_features = self._features_from_inputs(current_params, obs_inputs)
+                actor_params = self._actor_params(current_params)
                 if self._condition_as_sequence:
                     noise_pred = actor_model.apply(
-                        current_params,
+                        actor_params,
                         noisy_actions,
                         timesteps,
                         obs_features,
@@ -554,7 +718,7 @@ class Diffusion(JaxMethodBase):
                     )
                 else:
                     noise_pred = actor_model.apply(
-                        current_params, noisy_actions, timesteps, obs_features,
+                        actor_params, noisy_actions, timesteps, obs_features,
                     )
                 per_token_mse = jnp.square(noise_pred - noise)
                 reduce_dims = tuple(range(1, per_token_mse.ndim))
@@ -601,16 +765,16 @@ class Diffusion(JaxMethodBase):
 
     def _build_update_many_fn(self, update_fn):
         def update_many_fn(
-            params, opt_state, rng_key, obs_features, actions,
+            params, opt_state, rng_key, obs_inputs, actions,
             loss_coeff, action_pad_mask, ema_params, ema_optimization_step,
         ):
             def body_fn(carry, xs):
                 current_params, current_opt_state, current_key, current_ema, current_ema_step = carry
                 if action_pad_mask is None:
-                    step_obs, step_actions, step_loss_coeff = xs
+                    step_obs_inputs, step_actions, step_loss_coeff = xs
                     step_action_pad_mask = None
                 else:
-                    step_obs, step_actions, step_loss_coeff, step_action_pad_mask = xs
+                    step_obs_inputs, step_actions, step_loss_coeff, step_action_pad_mask = xs
                 (
                     next_params,
                     next_opt_state,
@@ -623,7 +787,7 @@ class Diffusion(JaxMethodBase):
                     current_params,
                     current_opt_state,
                     current_key,
-                    step_obs,
+                    step_obs_inputs,
                     step_actions,
                     step_loss_coeff,
                     step_action_pad_mask,
@@ -639,7 +803,7 @@ class Diffusion(JaxMethodBase):
                 )
                 return next_carry, (loss, priority)
 
-            xs = (obs_features, actions, loss_coeff)
+            xs = (obs_inputs, actions, loss_coeff)
             if action_pad_mask is not None:
                 xs = (*xs, action_pad_mask)
             (
@@ -668,7 +832,8 @@ class Diffusion(JaxMethodBase):
     def _build_sample_fn(self):
         actor_model = self.actor_model
 
-        def sample_fn(params, rng_key, obs_features):
+        def sample_fn(params, rng_key, obs_inputs):
+            obs_features = self._features_from_inputs(params, obs_inputs)
             batch_size = obs_features.shape[0]
             init_key, loop_key = jax.random.split(rng_key)
             sample = jax.random.normal(
@@ -677,16 +842,17 @@ class Diffusion(JaxMethodBase):
             )
 
             def _predict_noise(current_params, current_sample, timestep_batch):
+                actor_params = self._actor_params(current_params)
                 if self._condition_as_sequence:
                     return actor_model.apply(
-                        current_params,
+                        actor_params,
                         current_sample,
                         timestep_batch,
                         obs_features,
                         train=False,
                     )
                 return actor_model.apply(
-                    current_params,
+                    actor_params,
                     current_sample,
                     timestep_batch,
                     obs_features,
@@ -781,10 +947,13 @@ class Diffusion(JaxMethodBase):
 
     def act(self, observations: dict, step: int, eval_mode: bool):
         del step
-        obs_features, _ = self._prepare_obs_features(observations)
+        if self._trainable_encoder:
+            obs_inputs = self._prepare_trainable_obs_inputs(observations)
+        else:
+            obs_inputs, _ = self._prepare_obs_features(observations)
         self.rng_key, sample_key = jax.random.split(self.rng_key)
         sample_params = self.ema_params if (eval_mode and self.use_ema) else self.params
-        actions = self._sample_impl(sample_params, sample_key, obs_features)
+        actions = self._sample_impl(sample_params, sample_key, obs_inputs)
         self._block(actions)
         return np.asarray(jax.device_get(actions), dtype=np.float32)
 
@@ -799,7 +968,11 @@ class Diffusion(JaxMethodBase):
         actions = self._as_jax_array(batch["action"], self.jnp.float32)
         action_pad_mask = self._extract_action_pad_mask(batch)
         loss_coeff = self._loss_weights(batch)
-        obs_features, metrics = self._prepare_obs_features(batch)
+        if self._trainable_encoder:
+            obs_inputs = self._prepare_trainable_obs_inputs(batch)
+            metrics = {}
+        else:
+            obs_inputs, metrics = self._prepare_obs_features(batch)
 
         start_time = time.perf_counter()
         (
@@ -814,7 +987,7 @@ class Diffusion(JaxMethodBase):
             self.params,
             self.opt_state,
             self.rng_key,
-            obs_features,
+            obs_inputs,
             actions,
             loss_coeff,
             action_pad_mask,
@@ -836,7 +1009,7 @@ class Diffusion(JaxMethodBase):
                 dtype=np.float32,
             )
             self._maybe_update_priorities(replay_buffer, batch, new_priority_np)
-        self._maybe_log_update_metrics(metrics, actor_loss, obs_features, elapsed)
+        self._maybe_log_update_metrics(metrics, actor_loss, obs_inputs, elapsed)
         self._first_update_completed = True
         return metrics
 
@@ -853,7 +1026,7 @@ class Diffusion(JaxMethodBase):
                 metrics.update(self.update(replay_iter, 0, replay_buffer))
             return metrics
 
-        obs_features = []
+        obs_inputs_list = []
         actions = []
         loss_coeffs = []
         action_pad_masks = []
@@ -862,8 +1035,11 @@ class Diffusion(JaxMethodBase):
             batch = next(replay_iter)
             actions.append(self._as_jax_array(batch["action"], self.jnp.float32))
             loss_coeffs.append(self._loss_weights(batch))
-            obs, _ = self._prepare_obs_features(batch)
-            obs_features.append(obs)
+            if self._trainable_encoder:
+                obs = self._prepare_trainable_obs_inputs(batch)
+            else:
+                obs, _ = self._prepare_obs_features(batch)
+            obs_inputs_list.append(obs)
             action_pad_mask = self._extract_action_pad_mask(batch)
             current_has_mask = action_pad_mask is not None
             if has_action_pad_mask is None:
@@ -875,7 +1051,10 @@ class Diffusion(JaxMethodBase):
             if current_has_mask:
                 action_pad_masks.append(action_pad_mask)
 
-        obs_features = self.jnp.stack(obs_features, axis=0)
+        obs_inputs = self.jax.tree_util.tree_map(
+            lambda *values: self.jnp.stack(values, axis=0),
+            *obs_inputs_list,
+        )
         actions = self.jnp.stack(actions, axis=0)
         loss_coeffs = self.jnp.stack(loss_coeffs, axis=0)
         action_pad_mask = (
@@ -897,7 +1076,7 @@ class Diffusion(JaxMethodBase):
             self.params,
             self.opt_state,
             self.rng_key,
-            obs_features,
+            obs_inputs,
             actions,
             loss_coeffs,
             action_pad_mask,
@@ -920,7 +1099,7 @@ class Diffusion(JaxMethodBase):
         self._maybe_log_update_metrics(
             metrics,
             actor_loss,
-            obs_features[-1],
+            self._last_obs_inputs(obs_inputs),
             elapsed / max(num_updates, 1),
         )
         return metrics
@@ -946,14 +1125,31 @@ class Diffusion(JaxMethodBase):
         return state
 
     def load_state_dict(self, state_dict: dict):
-        self.params = self._tree_from_numpy(state_dict["params"])
+        params = self._tree_from_numpy(state_dict["params"])
+        if self._trainable_encoder and not (
+            isinstance(params, dict) and "actor" in params
+        ):
+            params = {
+                "actor": params,
+                "encoder": self.encoder.trainable_params,
+            }
+        self.params = params
         if not self.use_ema:
             return
         ema_params = state_dict.get("_ema_params")
         ema_state = state_dict.get("_ema_state")
-        self.ema_params = (
-            self._tree_from_numpy(ema_params) if ema_params is not None else self.params
-        )
+        if ema_params is not None:
+            ema_params = self._tree_from_numpy(ema_params)
+            if self._trainable_encoder and not (
+                isinstance(ema_params, dict) and "actor" in ema_params
+            ):
+                ema_params = {
+                    "actor": ema_params,
+                    "encoder": self.encoder.trainable_params,
+                }
+            self.ema_params = ema_params
+        else:
+            self.ema_params = self.params
         if ema_state is None:
             self._ema_optimization_step = 0
             return

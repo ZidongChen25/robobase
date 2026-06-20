@@ -85,7 +85,11 @@ class ReplayBuffer:
         raise NotImplementedError
 
     def load_all_episodes(self):
-        """Eagerly load all episode data needed for deterministic iteration."""
+        """Eagerly load all episode data.
+
+        Offline iterators should prefer explicit-index sampling so datasets can
+        remain disk-backed with a bounded in-memory cache.
+        """
         raise NotImplementedError
 
     def shutdown(self):
