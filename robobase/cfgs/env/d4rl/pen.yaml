@@ -1,0 +1,13 @@
+# @package _global_
+
+defaults:
+  - d4rl
+  - _self_
+
+env:
+  task_name: pen
+  dataset_format: minari
+  dataset_id: D4RL/pen/expert-v2
+  episode_length: 200
+
+# demos: 4958 # Full size = 4958

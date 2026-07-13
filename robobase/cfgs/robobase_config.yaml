@@ -83,7 +83,7 @@ replay:
   action_padding: zero
 
 lazy_replay:
-  use: false
+  use: auto
   observation_timing: pre_action
   drop_reset_frame: false
   num_workers: 1

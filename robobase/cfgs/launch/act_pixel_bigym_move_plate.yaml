@@ -38,8 +38,15 @@ update_every_steps: 1
 log_eval_video: false
 save_csv: true
 
+method:
+  use_lang_cond: true
+  actor_model:
+    gripper_dims: 2
+
 env:
+  camera_conditioning: ${method.encoder_model.use_plucker}
   demo_alignment: reference_post_action
+  eval_seed_start: 60
 
 replay:
   nstep: 1
@@ -56,7 +63,6 @@ replay:
   cache_frozen_image_features: false
 
 lazy_replay:
-  use: true
   observation_timing: post_action
   num_workers: 8
   prefetch_factor: 2

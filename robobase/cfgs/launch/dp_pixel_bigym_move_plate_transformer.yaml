@@ -46,6 +46,7 @@ log_eval_video: false
 
 env:
   cameras: ["head", "left_wrist", "right_wrist"]
+  camera_conditioning: ${method.encoder_model.use_plucker}
   demo_alignment: reference_post_action
   eval_seed_start: 0
   episode_length_is_env_steps: false
@@ -64,7 +65,6 @@ replay:
   cache_frozen_image_features: false
 
 lazy_replay:
-  use: true
   observation_timing: post_action
   num_workers: 8
   prefetch_factor: 2

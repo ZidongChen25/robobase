@@ -1,4 +1,4 @@
-from robobase.models.act import JaxACTTransformer
+from robobase.models.act import ACTImageProjection, JaxACTPolicy, JaxACTTransformer
 from robobase.models.backbone import DiffusionBackboneSpec, build_diffusion_backbone
 from robobase.models.backbones import (
     JaxChiTransformerBackbone,
@@ -12,6 +12,8 @@ from robobase.models.diffusion import JaxConditionalUnet1D
 
 __all__ = [
     "DiffusionBackboneSpec",
+    "ACTImageProjection",
+    "JaxACTPolicy",
     "JaxACTTransformer",
     "JaxChiTransformerBackbone",
     "JaxDiT1DBackbone",

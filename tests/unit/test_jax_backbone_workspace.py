@@ -54,6 +54,15 @@ class _TinyTrainEnv(_TinyEvalEnv):
 
 
 class _TinyTrainAndEvalFactory(EnvFactory):
+    def __init__(self):
+        self.eval_env_calls = 0
+        self.vector_eval_env_calls = 0
+
+    def get_spaces(self, cfg):
+        del cfg
+        env = _TinyEvalEnv()
+        return env.observation_space, env.action_space
+
     def make_train_env(self, cfg):
         return gym.vector.SyncVectorEnv(
             [lambda: _TinyTrainEnv() for _ in range(cfg.num_train_envs)]
@@ -61,9 +70,11 @@ class _TinyTrainAndEvalFactory(EnvFactory):
 
     def make_eval_env(self, cfg):
         del cfg
+        self.eval_env_calls += 1
         return _TinyEvalEnv()
 
     def make_eval_envs(self, cfg):
+        self.vector_eval_env_calls += 1
         return gym.vector.SyncVectorEnv(
             [lambda: _TinyEvalEnv() for _ in range(cfg.num_eval_envs)]
         )
@@ -83,7 +94,7 @@ def test_transformer_and_dit_backbones_train_through_workspace(
         "pixels=false",
         "demos=0",
         "num_train_envs=1",
-        "num_eval_envs=1",
+        "num_eval_envs=0",
         "num_eval_episodes=0",
         "num_pretrain_steps=0",
         "num_train_frames=4",
@@ -134,12 +145,17 @@ def test_transformer_and_dit_backbones_train_through_workspace(
     ):
         cfg = compose(config_name="robobase_config", overrides=overrides)
 
+    env_factory = _TinyTrainAndEvalFactory()
     workspace = Workspace(
         cfg,
-        env_factory=_TinyTrainAndEvalFactory(),
+        env_factory=env_factory,
         work_dir=tmp_path / method_name / backbone_type,
     )
     try:
+        assert env_factory.eval_env_calls == 0
+        assert env_factory.vector_eval_env_calls == 0
+        assert workspace.eval_env is None
+        assert workspace.eval_envs is None
         workspace.train()
     finally:
         GlobalHydra.instance().clear()

@@ -10,6 +10,7 @@ import numpy as np
 from gymnasium import spaces
 from omegaconf import DictConfig
 
+from robobase.language import lang_token_rows, tokens_to_feature_jax
 from robobase.method.bc import BCEncoderModelSpec, BCViewFusionModelSpec
 from robobase.method.bc_runtime import bc_observation_layout
 from robobase.method.jax_base import JaxMethodBase
@@ -125,6 +126,14 @@ def diffusion_model_spec_from_cfg(cfg: DictConfig) -> DiffusionModelSpec:
             type=encoder_model_type,
             model=str(encoder_model_cfg.get("model", "resnet18")),
             trainable=bool(encoder_model_cfg.get("trainable", False)),
+            pretrained=bool(encoder_model_cfg.get("pretrained", True)),
+            use_plucker=bool(encoder_model_cfg.get("use_plucker", False)),
+            plucker_hidden_channels=int(
+                encoder_model_cfg.get("plucker_hidden_channels", 64)
+            ),
+            plucker_identity_init=bool(
+                encoder_model_cfg.get("plucker_identity_init", False)
+            ),
         )
 
     view_fusion_model_cfg = method_cfg.get("view_fusion_model", None)
@@ -237,10 +246,25 @@ def _build_encoder_and_fusion(
             )
         if obs_layout.rgb_input_shape is None:
             raise ValueError("Pixel diffusion expected a valid RGB input shape.")
+        if model_spec.encoder_model.use_plucker:
+            if not model_spec.encoder_model.trainable:
+                raise ValueError(
+                    "Diffusion encoder_model.use_plucker=true requires "
+                    "encoder_model.trainable=true so the Plucker adapter is trained."
+                )
+            if not obs_layout.has_camera_conditioning:
+                raise ValueError(
+                    "Diffusion encoder_model.use_plucker=true requires raymap or "
+                    "camera parameter observations paired with every RGB observation."
+                )
         encoder_model = JaxResNetEncoder(
             input_shape=obs_layout.rgb_input_shape,
             model=model_spec.encoder_model.model,
             jit=encoder_jit,
+            pretrained=model_spec.encoder_model.pretrained,
+            use_plucker=model_spec.encoder_model.use_plucker,
+            plucker_hidden_channels=model_spec.encoder_model.plucker_hidden_channels,
+            plucker_identity_init=model_spec.encoder_model.plucker_identity_init,
         )
         if obs_layout.use_multicam_fusion:
             if model_spec.view_fusion_model is None:
@@ -392,7 +416,6 @@ class Diffusion(JaxMethodBase):
         self.model_spec = model
         self.use_lang_cond = bool(model.use_lang_cond)
         self.lang_feature_dim = int(model.lang_feature_dim) if self.use_lang_cond else 0
-        self._clip_text_cache: dict[tuple[int, ...], np.ndarray] = {}
         self._backbone_type = backbone_type
         self._condition_as_sequence = backbone_type == "transformer"
         self._init_cached_pixel_feature_key("diffusion")
@@ -559,68 +582,24 @@ class Diffusion(JaxMethodBase):
             return params["actor"]
         return params
 
-    def _lang_token_rows(self, batch_or_obs: dict) -> np.ndarray:
-        if "lang_tokens" not in batch_or_obs:
-            raise ValueError(
-                "Language-conditioned diffusion requires 'lang_tokens' observations."
-            )
-        tokens = np.asarray(batch_or_obs["lang_tokens"], dtype=np.int32)
-        if tokens.ndim == 1:
-            tokens = tokens[None, :]
-        elif tokens.ndim >= 3:
-            tokens = tokens.reshape(tokens.shape[0], -1, tokens.shape[-1])[:, -1, :]
-        return tokens
+    def _lang_token_rows(self, batch_or_obs: dict):
+        return lang_token_rows(
+            batch_or_obs,
+            context="Language-conditioned diffusion",
+        )
 
-    def _encode_clip_text(self, tokens: np.ndarray) -> np.ndarray:
-        token_rows = np.asarray(tokens, dtype=np.int32)
-        features = []
-        missing = []
-        missing_keys = []
-        for row in token_rows:
-            key = tuple(int(v) for v in row.tolist())
-            cached = self._clip_text_cache.get(key)
-            if cached is None:
-                missing.append(row)
-                missing_keys.append(key)
-            features.append((key, cached))
-
-        if missing:
-            import torch
-            import clip
-
-            if not hasattr(self, "clip_model"):
-                clip_model, _ = clip.load("ViT-B/32", device="cpu")
-                clip_model.eval()
-                for param in clip_model.parameters():
-                    param.requires_grad_(False)
-                self.__dict__["clip_model"] = clip_model
-
-            with torch.no_grad():
-                token_tensor = torch.as_tensor(
-                    np.stack(missing),
-                    dtype=torch.long,
-                    device="cpu",
-                )
-                encoded = self.clip_model.encode_text(token_tensor).float().cpu().numpy()
-            if encoded.shape[-1] != self.lang_feature_dim:
-                raise ValueError(
-                    "CLIP text feature dimension does not match "
-                    f"method.lang_feature_dim: {encoded.shape[-1]} != "
-                    f"{self.lang_feature_dim}."
-                )
-            for key, value in zip(missing_keys, encoded):
-                self._clip_text_cache[key] = value.astype(np.float32, copy=False)
-
-        return np.stack(
-            [self._clip_text_cache[key] for key, _ in features],
-            axis=0,
-        ).astype(np.float32, copy=False)
+    def _encode_lang_tokens(self, tokens):
+        return tokens_to_feature_jax(tokens, feature_dim=self.lang_feature_dim)
 
     def _extract_lang_features(self, batch_or_obs: dict):
         if not self.use_lang_cond:
             return None
+        tokens = self._as_jax_array(
+            self._lang_token_rows(batch_or_obs),
+            self.jnp.float32,
+        )
         return self._as_jax_array(
-            self._encode_clip_text(self._lang_token_rows(batch_or_obs)),
+            self._encode_lang_tokens(tokens),
             self.jnp.float32,
         )
 
@@ -637,6 +616,15 @@ class Diffusion(JaxMethodBase):
                 )
             rgb_obs, _ = self._extract_rgb_obs(batch_or_obs)
             inputs["rgb"] = rgb_obs
+            raymap_obs = self._extract_raymap_obs(batch_or_obs)
+            if raymap_obs is not None:
+                inputs["raymap"] = raymap_obs
+            camera_intrinsic_obs, camera_c2w_obs = self._extract_camera_param_obs(
+                batch_or_obs
+            )
+            if camera_intrinsic_obs is not None:
+                inputs["camera_intrinsic"] = camera_intrinsic_obs
+                inputs["camera_c2w"] = camera_c2w_obs
         if self.use_lang_cond:
             inputs["lang"] = self._extract_lang_features(batch_or_obs)
         return inputs
@@ -651,6 +639,9 @@ class Diffusion(JaxMethodBase):
             rgb_feats = self.encoder.apply_trainable(
                 params["encoder"],
                 obs_inputs["rgb"],
+                raymap_obs=obs_inputs.get("raymap", None),
+                camera_intrinsic_obs=obs_inputs.get("camera_intrinsic", None),
+                camera_c2w_obs=obs_inputs.get("camera_c2w", None),
             )
             features.append(self._fuse_multi_view(rgb_feats))
         if "lang" in obs_inputs:
@@ -730,6 +721,7 @@ class Diffusion(JaxMethodBase):
                     )
                     while valid_mask.ndim < per_token_mse.ndim:
                         valid_mask = valid_mask[..., None]
+                    valid_mask = jnp.broadcast_to(valid_mask, per_token_mse.shape)
                     masked_loss = per_token_mse * valid_mask
                     denom = jnp.clip(valid_mask.sum(axis=reduce_dims), min=1.0)
                     mse_loss = masked_loss.sum(axis=reduce_dims) / denom
@@ -991,7 +983,7 @@ class Diffusion(JaxMethodBase):
             actions,
             loss_coeff,
             action_pad_mask,
-            self.params if self.ema_params is None else self.ema_params,
+            self.ema_params,
             self._ema_optimization_step,
         )
         uses_priorities = self._uses_replay_priorities(replay_buffer)
@@ -1080,7 +1072,7 @@ class Diffusion(JaxMethodBase):
             actions,
             loss_coeffs,
             action_pad_mask,
-            self.params if self.ema_params is None else self.ema_params,
+            self.ema_params,
             self._ema_optimization_step,
         )
         if (

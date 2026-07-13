@@ -130,6 +130,11 @@ class JaxMethodBase(Method):
         self.use_pixels = self.obs_layout.use_pixels
         self.use_multicam_fusion = self.obs_layout.use_multicam_fusion
         self._rgb_batch_keys = tuple(self.obs_layout.rgb_keys)
+        self._raymap_batch_keys = tuple(self.obs_layout.raymap_keys)
+        self._camera_intrinsic_batch_keys = tuple(
+            self.obs_layout.camera_intrinsic_keys
+        )
+        self._camera_c2w_batch_keys = tuple(self.obs_layout.camera_c2w_keys)
         self.action_sequence = int(action_space.shape[0])
         self.action_dim = int(action_space.shape[1])
 
@@ -178,6 +183,50 @@ class JaxMethodBase(Method):
         )
         return rgb_obs, metrics
 
+    def _extract_raymap_obs(self, batch_or_obs: dict):
+        if not self._raymap_batch_keys:
+            return None
+        raymap_obs_dict = {}
+        for key in self._raymap_batch_keys:
+            if key not in batch_or_obs:
+                raise ValueError(f"Missing raymap observation key '{key}'.")
+            raymap_obs_dict[key] = batch_or_obs[key]
+        return flatten_time_into_channel(
+            self.jnp.stack(
+                [
+                    self._as_jax_array(value, self.jnp.float32)
+                    for value in raymap_obs_dict.values()
+                ],
+                axis=1,
+            ),
+            has_view_axis=True,
+        )
+
+    def _extract_camera_param_obs(self, batch_or_obs: dict):
+        if not self._camera_intrinsic_batch_keys:
+            return None, None
+        intrinsic_values = []
+        c2w_values = []
+        for intrinsic_key, c2w_key in zip(
+            self._camera_intrinsic_batch_keys,
+            self._camera_c2w_batch_keys,
+            strict=True,
+        ):
+            if intrinsic_key not in batch_or_obs:
+                raise ValueError(f"Missing camera intrinsic observation key '{intrinsic_key}'.")
+            if c2w_key not in batch_or_obs:
+                raise ValueError(f"Missing camera c2w observation key '{c2w_key}'.")
+            intrinsic_values.append(
+                self._as_jax_array(batch_or_obs[intrinsic_key], self.jnp.float32)
+            )
+            c2w_values.append(
+                self._as_jax_array(batch_or_obs[c2w_key], self.jnp.float32)
+            )
+        return (
+            self.jnp.stack(intrinsic_values, axis=1),
+            self.jnp.stack(c2w_values, axis=1),
+        )
+
     def _has_cached_pixel_features(self, batch_or_obs: dict) -> bool:
         return (
             self._cached_pixel_feature_key is not None
@@ -209,10 +258,21 @@ class JaxMethodBase(Method):
         batch_size = int(batch["action"].shape[0])
         return self.jnp.ones((batch_size,), dtype=self.jnp.float32)
 
-    def _encode_pixels(self, rgb_obs):
+    def _encode_pixels(
+        self,
+        rgb_obs,
+        raymap_obs=None,
+        camera_intrinsic_obs=None,
+        camera_c2w_obs=None,
+    ):
         if self.encoder is None:
             return None
-        return self.encoder.encode(rgb_obs)
+        return self.encoder.encode(
+            rgb_obs,
+            raymap_obs=raymap_obs,
+            camera_intrinsic_obs=camera_intrinsic_obs,
+            camera_c2w_obs=camera_c2w_obs,
+        )
 
     def _fuse_multi_view(self, rgb_feats):
         if rgb_feats is None:
@@ -245,8 +305,19 @@ class JaxMethodBase(Method):
         metrics = {}
         if self.use_pixels and fused_view_feats is None:
             rgb_obs, pixel_metrics = self._extract_rgb_obs(batch_or_obs)
+            raymap_obs = self._extract_raymap_obs(batch_or_obs)
+            camera_intrinsic_obs, camera_c2w_obs = self._extract_camera_param_obs(
+                batch_or_obs
+            )
             metrics.update(pixel_metrics)
-            fused_view_feats = self._fuse_multi_view(self._encode_pixels(rgb_obs))
+            fused_view_feats = self._fuse_multi_view(
+                self._encode_pixels(
+                    rgb_obs,
+                    raymap_obs=raymap_obs,
+                    camera_intrinsic_obs=camera_intrinsic_obs,
+                    camera_c2w_obs=camera_c2w_obs,
+                )
+            )
         obs_features = self._combine_features(low_dim_obs, fused_view_feats)
         return obs_features, metrics
 

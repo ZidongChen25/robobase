@@ -16,6 +16,11 @@ from robobase.envs.wrappers import (
     ConcatDim,
     RecedingHorizonControl,
 )
+from robobase.envs.camera_conditioning import (
+    camera_conditioning_enabled,
+    intrinsic_from_fovy,
+)
+from robobase.language import clip_text_feature_array, clip_tokenize_text, tokenize_text
 from omegaconf import DictConfig
 from bigym.utils.observation_config import ObservationConfig, CameraConfig
 from bigym.action_modes import PelvisDof
@@ -48,6 +53,17 @@ BIGYM_TASK_DESCRIPTIONS = {
 }
 
 
+def bigym_task_description(task_name: str) -> str:
+    task_name = str(task_name)
+    description = BIGYM_TASK_DESCRIPTIONS.get(task_name)
+    if description is not None:
+        return description
+    description = " ".join(task_name.replace("_", " ").split())
+    if not description:
+        return "Reach the target."
+    return f"{description.capitalize()}."
+
+
 def _episode_limit_steps(cfg: DictConfig) -> int:
     episode_length = int(cfg.env.episode_length)
     if bool(cfg.env.get("episode_length_is_env_steps", False)):
@@ -63,16 +79,36 @@ def _demo_observation_array(value):
 
 
 class AddBiGymLanguageTokens(gym.ObservationWrapper):
-    def __init__(self, env: gym.Env, task_name: str):
+    def __init__(
+        self,
+        env: gym.Env,
+        task_name: str,
+        *,
+        lang_feature_source: str = "tokens",
+        lang_feature_device: str = "cpu",
+        description: str | None = None,
+    ):
         gym.ObservationWrapper.__init__(self, env)
-        description = BIGYM_TASK_DESCRIPTIONS.get(str(task_name), "reach the target")
-        try:
-            import clip
-
-            tokens = clip.tokenize([description]).numpy().astype(np.int32)
-        except Exception:
-            tokens = np.zeros((1, 77), dtype=np.int32)
-        self._lang_tokens = tokens
+        description = (
+            bigym_task_description(task_name)
+            if description is None
+            else str(description)
+        )
+        source = str(lang_feature_source).lower()
+        if source in {"clip", "clip_text"}:
+            self._lang_tokens = clip_tokenize_text(description)
+            self._lang_features = clip_text_feature_array(
+                description,
+                device=str(lang_feature_device),
+            )
+        elif source in {"tokens", "jax", "hash"}:
+            self._lang_tokens = tokenize_text(description).astype(np.int32, copy=False)
+            self._lang_features = None
+        else:
+            raise ValueError(
+                "lang_feature_source must be one of 'clip', 'tokens', 'jax', or "
+                f"'hash'; got {lang_feature_source!r}."
+            )
         obs_spaces = dict(self.observation_space.spaces)
         obs_spaces["lang_tokens"] = spaces.Box(
             low=0,
@@ -80,11 +116,81 @@ class AddBiGymLanguageTokens(gym.ObservationWrapper):
             shape=(1, 77),
             dtype=np.int32,
         )
+        if self._lang_features is not None:
+            obs_spaces["lang_features"] = spaces.Box(
+                low=-np.inf,
+                high=np.inf,
+                shape=self._lang_features.shape,
+                dtype=np.float32,
+            )
         self.observation_space = spaces.Dict(obs_spaces)
 
     def observation(self, observation):
         obs = dict(observation)
         obs["lang_tokens"] = self._lang_tokens.copy()
+        if self._lang_features is not None:
+            obs["lang_features"] = self._lang_features.copy()
+        return obs
+
+
+class AddBiGymCameraConditioning(gym.ObservationWrapper):
+    """Expose per-frame camera parameters for model-side Plucker generation."""
+
+    def __init__(
+        self,
+        env: gym.Env,
+        cameras: list[str],
+        image_size: tuple[int, int],
+    ):
+        gym.ObservationWrapper.__init__(self, env)
+        self._cameras = tuple(str(camera) for camera in cameras)
+        self._image_size = tuple(int(dim) for dim in image_size)
+        obs_spaces = dict(self.observation_space.spaces)
+        for camera in self._cameras:
+            obs_spaces[f"camera_intrinsic_{camera}"] = spaces.Box(
+                low=-np.inf,
+                high=np.inf,
+                shape=(3, 3),
+                dtype=np.float32,
+            )
+            obs_spaces[f"camera_c2w_{camera}"] = spaces.Box(
+                low=-np.inf,
+                high=np.inf,
+                shape=(4, 4),
+                dtype=np.float32,
+            )
+        self.observation_space = spaces.Dict(obs_spaces)
+
+    def _find_camera_id(self, camera_name: str) -> int:
+        physics = self.env.unwrapped.mojo.physics
+        try:
+            return int(physics.model.name2id(camera_name, "camera"))
+        except Exception:
+            for camera_id in range(int(physics.model.ncam)):
+                name = physics.model.id2name(camera_id, "camera")
+                if name == camera_name or str(name).endswith(f"/{camera_name}"):
+                    return int(camera_id)
+        raise ValueError(f"Camera {camera_name!r} not found in BiGym physics model.")
+
+    def _camera_params(self, camera_name: str) -> tuple[np.ndarray, np.ndarray]:
+        physics = self.env.unwrapped.mojo.physics
+        camera_id = self._find_camera_id(camera_name)
+        c2w = np.eye(4, dtype=np.float32)
+        c2w[:3, 3] = np.asarray(physics.data.cam_xpos[camera_id], dtype=np.float32)
+        c2w[:3, :3] = np.asarray(
+            physics.data.cam_xmat[camera_id],
+            dtype=np.float32,
+        ).reshape(3, 3)
+        height, width = self._image_size
+        fovy = float(physics.model.cam_fovy[camera_id])
+        return intrinsic_from_fovy(fovy, height, width), c2w
+
+    def observation(self, observation):
+        obs = dict(observation)
+        for camera in self._cameras:
+            intrinsic, c2w = self._camera_params(camera)
+            obs[f"camera_intrinsic_{camera}"] = intrinsic
+            obs[f"camera_c2w_{camera}"] = c2w
         return obs
 
 
@@ -164,8 +270,37 @@ class BiGymEnvFactory(EnvFactory):
                 "proprioception_floating_base_actions",
             ],
         )
+        if (
+            bool(cfg.get("pixels", False))
+            and camera_conditioning_enabled(cfg.env.get("camera_conditioning", "none"))
+        ):
+            env = AddBiGymCameraConditioning(
+                env,
+                cameras=list(cfg.env.cameras),
+                image_size=tuple(cfg.visual_observation_shape),
+            )
         if bool(cfg.method.get("use_lang_cond", False)):
-            env = AddBiGymLanguageTokens(env, cfg.env.task_name)
+            lang_feature_source = cfg.method.get("lang_feature_source", None)
+            lang_description = cfg.method.get("lang_description", None)
+            if lang_feature_source is None:
+                # Legacy BiGym runs supplied CLIP tokens and used this exact
+                # fallback for tasks missing from BIGYM_TASK_DESCRIPTIONS.
+                # Their snapshots condition on that vector, so silently
+                # switching to hashed tokens or humanized text invalidates the
+                # checkpoint even though all parameter shapes still load.
+                lang_feature_source = "clip"
+                if lang_description is None:
+                    lang_description = BIGYM_TASK_DESCRIPTIONS.get(
+                        str(cfg.env.task_name),
+                        "reach the target",
+                    )
+            env = AddBiGymLanguageTokens(
+                env,
+                cfg.env.task_name,
+                lang_feature_source=lang_feature_source,
+                lang_feature_device=cfg.method.get("lang_feature_device", "cpu"),
+                description=lang_description,
+            )
         episode_limit_steps = _episode_limit_steps(cfg)
         if cfg.use_onehot_time_and_no_bootstrap:
             env = OnehotTime(env, episode_limit_steps)

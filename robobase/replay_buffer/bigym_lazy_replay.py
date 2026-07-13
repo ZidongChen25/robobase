@@ -20,6 +20,12 @@ from safetensors import safe_open
 
 from robobase.envs.utils.bigym_utils import TASK_MAP
 from robobase.envs.wrappers import RescaleFromStandardization, RescaleFromTanhWithMinMax
+from robobase.language import (
+    clip_text_feature_array,
+    clip_tokenize_text,
+    tokenize_text,
+    tokens_to_feature_array,
+)
 from robobase.replay_buffer.replay_buffer import ReplayBuffer
 from robobase.replay_buffer.uniform_replay_buffer import (
     ACTION,
@@ -52,7 +58,37 @@ class LazyBiGymManifest:
 
 
 def lazy_replay_enabled(cfg: DictConfig) -> bool:
-    return bool(cfg.get("lazy_replay", {}).get("use", False))
+    env_cfg = cfg.get("env", {})
+    lazy_cfg = cfg.get("lazy_replay", None)
+    is_bigym_imitation = bool(
+        cfg.get("is_imitation_learning", False)
+        and env_cfg is not None
+        and str(env_cfg.get("env_name", "")).lower() == "bigym"
+    )
+    if not is_bigym_imitation or lazy_cfg is None:
+        return False
+
+    setting = lazy_cfg.get("use", "auto")
+    if isinstance(setting, bool):
+        mode = "true" if setting else "false"
+    else:
+        mode = str(setting).strip().lower()
+    if mode in {"false", "0", "off", "no"}:
+        return False
+    if mode in {"true", "1", "on", "yes"}:
+        return True
+    if mode != "auto":
+        raise ValueError(
+            "lazy_replay.use must be one of true, false, or auto; "
+            f"got {setting!r}."
+        )
+
+    demos = cfg.get("demos", 0)
+    try:
+        has_demos = float(demos) != 0.0
+    except (TypeError, ValueError):
+        has_demos = bool(demos)
+    return bool(cfg.get("pixels", False) and has_demos)
 
 
 def _lazy_observation_timing(cfg: DictConfig) -> str:
@@ -119,13 +155,26 @@ def _metadata_dirs(cfg: DictConfig) -> tuple[Path, Path]:
     finally:
         env.close()
 
-    demo_store = DemoStore()
+    def cache_root(key: str, fallback):
+        value = cfg.env.get(key, fallback)
+        value = str(value).strip() if value is not None else ""
+        return Path(value).expanduser() if value else None
+
+    dataset_root = cfg.env.get("dataset_root", "")
+    pixel_root = cache_root("pixel_dataset_root", dataset_root)
+    state_root = cache_root("state_dataset_root", dataset_root)
+    pixel_store = DemoStore(cache_root=pixel_root)
+    state_store = (
+        pixel_store
+        if state_root == pixel_root
+        else DemoStore(cache_root=state_root)
+    )
     pixel_metadata = copy.deepcopy(metadata)
     pixel_metadata.observation_mode = ObservationMode.Pixel
     state_metadata = copy.deepcopy(metadata)
     state_metadata.observation_mode = ObservationMode.State
-    pixel_dir = demo_store._create_path(pixel_metadata, frequency).parent
-    state_dir = demo_store._create_path(state_metadata, frequency).parent
+    pixel_dir = pixel_store._create_path(pixel_metadata, frequency).parent
+    state_dir = state_store._create_path(state_metadata, frequency).parent
     return pixel_dir, state_dir
 
 
@@ -159,8 +208,44 @@ def _rgb_key(camera_name: str) -> str:
     return f"rgb_{camera_name}"
 
 
+def _camera_intrinsic_obs_key(camera_name: str) -> str:
+    return f"camera_intrinsic_{camera_name}"
+
+
+def _camera_c2w_obs_key(camera_name: str) -> str:
+    return f"camera_c2w_{camera_name}"
+
+
+def _camera_intrinsic_key(camera_name: str) -> str:
+    return f"obs_camera_intrinsic_{camera_name}"
+
+
+def _camera_c2w_key(camera_name: str) -> str:
+    return f"obs_camera_c2w_{camera_name}"
+
+
 def _state_rgb_key(camera_name: str) -> str:
     return f"obs_rgb_{camera_name}"
+
+
+def _supported_observation_keys(cameras: tuple[str, ...]) -> set[str]:
+    keys = {
+        "low_dim_state",
+        "proprioception_floating_base",
+        "proprioception_floating_base_actions",
+        "lang_tokens",
+        "lang_features",
+        "time",
+    }
+    for camera in cameras:
+        keys.update(
+            {
+                _rgb_key(camera),
+                _camera_intrinsic_obs_key(camera),
+                _camera_c2w_obs_key(camera),
+            }
+        )
+    return keys
 
 
 def _load_non_rgb_episode(path: Path) -> dict[str, np.ndarray]:
@@ -170,6 +255,26 @@ def _load_non_rgb_episode(path: Path) -> dict[str, np.ndarray]:
             if key.startswith("obs_rgb_"):
                 continue
             arrays[key] = np.asarray(handle.get_tensor(key))
+    return arrays
+
+
+def _load_camera_params_episode(path: Path, cameras: tuple[str, ...]) -> dict[str, np.ndarray]:
+    arrays = {}
+    required_keys = []
+    for camera in cameras:
+        required_keys.extend((_camera_intrinsic_key(camera), _camera_c2w_key(camera)))
+    with safe_open(path, framework="numpy") as handle:
+        available_keys = set(handle.keys())
+        missing_keys = [key for key in required_keys if key not in available_keys]
+        if missing_keys:
+            raise ValueError(
+                "BiGym lazy replay Plucker conditioning needs per-frame camera "
+                f"parameters in {path}; missing {missing_keys}. Rebuild the pixel "
+                "demo cache with scripts/cache_bigym_pixel_demos.py "
+                "--include-camera-params --force-recache."
+            )
+        for key in required_keys:
+            arrays[key] = np.asarray(handle.get_tensor(key), dtype=np.float32)
     return arrays
 
 
@@ -339,6 +444,66 @@ class LazyBiGymReplayBuffer(ReplayBuffer):
     ):
         self.cfg = cfg
         self.observation_elements = observation_space.spaces
+        self._camera_param_cameras = tuple(
+            str(camera)
+            for camera in cfg.env.cameras
+            if _camera_intrinsic_obs_key(str(camera)) in self.observation_elements
+            or _camera_c2w_obs_key(str(camera)) in self.observation_elements
+        )
+        supported_camera_param_keys = {
+            key
+            for camera in self._camera_param_cameras
+            for key in (
+                _camera_intrinsic_obs_key(camera),
+                _camera_c2w_obs_key(camera),
+            )
+        }
+        camera_param_keys = {
+            key
+            for key in self.observation_elements
+            if str(key).startswith("camera_intrinsic_")
+            or str(key).startswith("camera_c2w_")
+        }
+        missing_or_unsupported_camera_params = [
+            key for key in camera_param_keys if key not in supported_camera_param_keys
+        ]
+        if missing_or_unsupported_camera_params:
+            raise ValueError(
+                "BiGym lazy replay camera parameter observation keys must match "
+                "env.cameras and include both intrinsic/c2w for each conditioned "
+                f"camera; unsupported keys {missing_or_unsupported_camera_params}."
+            )
+        for camera in self._camera_param_cameras:
+            missing_pair = [
+                key
+                for key in (
+                    _camera_intrinsic_obs_key(camera),
+                    _camera_c2w_obs_key(camera),
+                )
+                if key not in self.observation_elements
+            ]
+            if missing_pair:
+                raise ValueError(
+                    "BiGym lazy replay camera conditioning requires both "
+                    f"intrinsic and c2w observations for camera {camera!r}; "
+                    f"missing {missing_pair}."
+                )
+        raymap_keys = [key for key in self.observation_elements if "raymap" in str(key)]
+        if raymap_keys:
+            raise ValueError(
+                "BiGym lazy replay no longer generates raymap observations in CPU "
+                "workers. Expose camera_intrinsic_* and camera_c2w_* observations "
+                f"instead of {raymap_keys}."
+            )
+        unsupported_observation_keys = sorted(
+            set(self.observation_elements)
+            - _supported_observation_keys(tuple(str(camera) for camera in cfg.env.cameras))
+        )
+        if unsupported_observation_keys:
+            raise ValueError(
+                "BiGym lazy replay does not know how to populate observation keys "
+                f"{unsupported_observation_keys}."
+            )
         self.extra_replay_elements = (
             spaces.Dict({}) if extra_replay_elements is None else extra_replay_elements
         )
@@ -379,6 +544,7 @@ class LazyBiGymReplayBuffer(ReplayBuffer):
         self._include_tp1 = bool(cfg.get("lazy_replay", {}).get("include_tp1", False))
 
         self._lang_tokens = self._build_lang_tokens()
+        self._lang_features = self._build_lang_features()
         logging.info(
             "LazyBiGymReplayBuffer streams %d transitions from %d episode files "
             "(observation_timing=%s).",
@@ -419,21 +585,49 @@ class LazyBiGymReplayBuffer(ReplayBuffer):
     def replay_capacity(self):
         return self._size
 
-    def _build_lang_tokens(self) -> np.ndarray:
-        if "lang_tokens" not in self.observation_elements:
-            return np.zeros((1, 77), dtype=np.int32)
-        try:
-            import clip
+    def _task_description(self) -> str:
+        from robobase.envs.bigym import BIGYM_TASK_DESCRIPTIONS, bigym_task_description
 
-            from robobase.envs.bigym import BIGYM_TASK_DESCRIPTIONS
-
-            description = BIGYM_TASK_DESCRIPTIONS.get(
+        method_cfg = self.cfg.get("method", {})
+        explicit_description = method_cfg.get("lang_description", None)
+        if explicit_description is not None:
+            return str(explicit_description)
+        if "lang_feature_source" not in method_cfg:
+            return BIGYM_TASK_DESCRIPTIONS.get(
                 str(self.cfg.env.task_name),
                 "reach the target",
             )
-            return clip.tokenize([description]).numpy().astype(np.int32)
-        except Exception:
+        return bigym_task_description(self.cfg.env.task_name)
+
+    def _lang_feature_source(self) -> str:
+        method_cfg = self.cfg.get("method", {})
+        # Missing means a legacy config. Those runs used CLIP features; using
+        # the new hashed-token path here would also make replay conditioning
+        # disagree with the live evaluation environment.
+        return str(method_cfg.get("lang_feature_source", "clip")).lower()
+
+    def _lang_feature_device(self) -> str:
+        method_cfg = self.cfg.get("method", {})
+        return str(method_cfg.get("lang_feature_device", "cpu"))
+
+    def _build_lang_tokens(self) -> np.ndarray:
+        if "lang_tokens" not in self.observation_elements:
             return np.zeros((1, 77), dtype=np.int32)
+        description = self._task_description()
+        if self._lang_feature_source() in {"clip", "clip_text"}:
+            return clip_tokenize_text(description)
+        return tokenize_text(description).astype(np.int32, copy=False)
+
+    def _build_lang_features(self) -> np.ndarray:
+        if "lang_features" not in self.observation_elements:
+            return np.zeros((1, 512), dtype=np.float32)
+        description = self._task_description()
+        if self._lang_feature_source() in {"clip", "clip_text"}:
+            return clip_text_feature_array(
+                description,
+                device=self._lang_feature_device(),
+            )
+        return tokens_to_feature_array(self._lang_tokens)
 
     def _cached_episode(self, episode_idx: int) -> dict[str, np.ndarray]:
         with self._episode_cache_lock:
@@ -441,7 +635,16 @@ class LazyBiGymReplayBuffer(ReplayBuffer):
             if cached is not None:
                 self._episode_cache[episode_idx] = cached
                 return cached
-            episode = _load_non_rgb_episode(self._episodes[episode_idx].state_path)
+            episode_meta = self._episodes[episode_idx]
+            episode = _load_non_rgb_episode(episode_meta.state_path)
+            camera_param_cameras = getattr(self, "_camera_param_cameras", ())
+            if camera_param_cameras:
+                episode.update(
+                    _load_camera_params_episode(
+                        episode_meta.pixel_path,
+                        tuple(camera_param_cameras),
+                    )
+                )
             self._episode_cache[episode_idx] = episode
             while (
                 self._max_cached_episodes >= 0
@@ -484,6 +687,21 @@ class LazyBiGymReplayBuffer(ReplayBuffer):
             self._manifest.action_stats,
             float(self.cfg.min_max_margin),
         )
+
+    def _time_observations(self, observation_indices: np.ndarray) -> np.ndarray:
+        time_space = self.observation_elements["time"]
+        if len(time_space.shape) != 2 or time_space.shape[0] != self._frame_stacks:
+            raise ValueError(
+                "BiGym lazy replay expected time observation shape "
+                f"({self._frame_stacks}, T), got {time_space.shape}."
+            )
+        time_dim = int(time_space.shape[-1])
+        time_indices = np.clip(
+            observation_indices + self._action_index_offset,
+            0,
+            time_dim - 1,
+        )
+        return np.eye(time_dim, dtype=time_space.dtype)[time_indices]
 
     def episode_index_metadata(self) -> list[tuple[int, int]]:
         return [
@@ -545,16 +763,42 @@ class LazyBiGymReplayBuffer(ReplayBuffer):
                 0,
                 ep_len,
             )
-            for camera in self.cfg.env.cameras:
-                key = _rgb_key(camera)
-                if key not in self.observation_elements:
-                    continue
-                tensor_key = _state_rgb_key(camera)
+            rgb_cameras = [
+                camera
+                for camera in self.cfg.env.cameras
+                if _rgb_key(camera) in self.observation_elements
+            ]
+            if rgb_cameras:
                 with safe_open(episode_meta.pixel_path, framework="numpy") as handle:
-                    tensor = handle.get_slice(tensor_key)
-                    batch[key][out_idxs] = _take_rows(tensor, obs_idxs)
+                    for camera in rgb_cameras:
+                        key = _rgb_key(camera)
+                        tensor_key = _state_rgb_key(camera)
+                        tensor = handle.get_slice(tensor_key)
+                        batch[key][out_idxs] = _take_rows(tensor, obs_idxs)
+                        if self._include_tp1:
+                            batch[key + "_tp1"][out_idxs] = _take_rows(
+                                tensor, next_idxs
+                            )
+
+            for camera in self.cfg.env.cameras:
+                intrinsic_obs_key = _camera_intrinsic_obs_key(camera)
+                c2w_obs_key = _camera_c2w_obs_key(camera)
+                if intrinsic_obs_key in batch:
+                    batch[intrinsic_obs_key][out_idxs] = episode[
+                        _camera_intrinsic_key(camera)
+                    ][obs_idxs]
                     if self._include_tp1:
-                        batch[key + "_tp1"][out_idxs] = _take_rows(tensor, next_idxs)
+                        batch[intrinsic_obs_key + "_tp1"][out_idxs] = episode[
+                            _camera_intrinsic_key(camera)
+                        ][next_idxs]
+                if c2w_obs_key in batch:
+                    batch[c2w_obs_key][out_idxs] = episode[_camera_c2w_key(camera)][
+                        obs_idxs
+                    ]
+                    if self._include_tp1:
+                        batch[c2w_obs_key + "_tp1"][out_idxs] = episode[
+                            _camera_c2w_key(camera)
+                        ][next_idxs]
 
             low_dim_parts = []
             for obs_key in ("proprioception", "proprioception_grippers"):
@@ -580,6 +824,11 @@ class LazyBiGymReplayBuffer(ReplayBuffer):
                         ],
                         axis=-1,
                     )
+            elif "low_dim_state" in batch:
+                raise ValueError(
+                    "BiGym lazy replay could not populate low_dim_state because the "
+                    "cached episode has no proprioception observations."
+                )
 
             for obs_key in (
                 "proprioception_floating_base",
@@ -589,7 +838,10 @@ class LazyBiGymReplayBuffer(ReplayBuffer):
                     continue
                 tensor_key = _state_key(obs_key)
                 if tensor_key not in episode:
-                    continue
+                    raise ValueError(
+                        "BiGym lazy replay could not populate observation "
+                        f"{obs_key!r}; cached tensor {tensor_key!r} is missing."
+                    )
                 batch[obs_key][out_idxs] = episode[tensor_key][obs_idxs].astype(
                     np.float32,
                     copy=False,
@@ -603,6 +855,16 @@ class LazyBiGymReplayBuffer(ReplayBuffer):
                 batch["lang_tokens"][out_idxs] = self._lang_tokens[None, :, :]
                 if self._include_tp1:
                     batch["lang_tokens_tp1"][out_idxs] = self._lang_tokens[None, :, :]
+            if "lang_features" in batch:
+                batch["lang_features"][out_idxs] = self._lang_features[None, :, :]
+                if self._include_tp1:
+                    batch["lang_features_tp1"][out_idxs] = (
+                        self._lang_features[None, :, :]
+                    )
+            if "time" in batch:
+                batch["time"][out_idxs] = self._time_observations(obs_idxs)
+                if self._include_tp1:
+                    batch["time_tp1"][out_idxs] = self._time_observations(next_idxs)
 
             action_start_idxs = (
                 idxs + self._action_index_offset - self._action_sequence_start_offset

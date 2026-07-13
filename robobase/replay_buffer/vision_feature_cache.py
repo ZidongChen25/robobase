@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -12,10 +14,12 @@ from omegaconf import DictConfig
 from robobase.method.bc_runtime import bc_observation_layout
 
 
-JAX_BC_FEATURE_KEY = "vision_features_jax_bc"
-JAX_DIFFUSION_FEATURE_KEY = "vision_features_jax_diffusion"
-JAX_FLOW_MATCHING_FEATURE_KEY = "vision_features_jax_flow_matching"
-JAX_ACT_FEATURE_KEY = "vision_features_jax_act"
+# v3 requires a fingerprint for the encoder, weights, inputs, and fusion mode.
+JAX_BC_FEATURE_KEY = "vision_features_jax_bc_v3"
+JAX_DIFFUSION_FEATURE_KEY = "vision_features_jax_diffusion_v3"
+JAX_FLOW_MATCHING_FEATURE_KEY = "vision_features_jax_flow_matching_v3"
+JAX_ACT_FEATURE_KEY = "vision_features_jax_act_v3"
+VISION_CACHE_FINGERPRINT_KEY = "vision_feature_cache_fingerprint_v1"
 DEFAULT_CACHE_BACKENDS = ("jax",)
 _SUPPORTED_FUSION_MODES = {"flatten", "average", "sum"}
 _SUPPORTED_RESNETS = {"resnet18": 512, "resnet34": 512}
@@ -43,22 +47,23 @@ class VisionFeatureCachePlan:
     preprocessing_fn: list[Any]
     feature_keys: tuple[str, ...]
     feature_dim: int
+    fingerprint: str
 
 
 @dataclass
 class FrozenVisionFeaturePreprocessor:
     rgb_keys: tuple[str, ...]
     encoder_model: str
+    pretrained: bool
     fusion_mode: str
     feature_keys: tuple[str, ...]
     method_name: str
     input_shape: tuple[int, int, int, int]
-    _torch_encoder: Any = field(default=None, init=False, repr=False)
+    fingerprint: str
     _jax_encoder: Any = field(default=None, init=False, repr=False)
 
     def __getstate__(self):
         state = dict(self.__dict__)
-        state["_torch_encoder"] = None
         state["_jax_encoder"] = None
         return state
 
@@ -92,6 +97,10 @@ class FrozenVisionFeaturePreprocessor:
             }
             for feature_key, feature_batch in cached_batches.items():
                 new_transition[feature_key] = feature_batch[index]
+            new_transition[VISION_CACHE_FINGERPRINT_KEY] = np.frombuffer(
+                bytes.fromhex(self.fingerprint),
+                dtype=np.uint8,
+            ).copy()
             processed.append(new_transition)
         return processed
 
@@ -107,16 +116,17 @@ class FrozenVisionFeaturePreprocessor:
         raise ValueError(f"Unsupported fusion mode '{self.fusion_mode}'.")
 
     def _encode_jax(self, rgb_batch: np.ndarray) -> np.ndarray:
+        import jax
+
         if self._jax_encoder is None:
-            import jax
             from robobase.models.encoder import JaxResNetEncoder
 
             self._jax_encoder = JaxResNetEncoder(
                 input_shape=self.input_shape,
                 model=self.encoder_model,
                 jit=True,
+                pretrained=self.pretrained,
             )
-        import jax
         feats = self._jax_encoder.encode(rgb_batch)
         return self._fuse_multi_view(np.asarray(jax.device_get(feats)))
 
@@ -189,6 +199,15 @@ def build_vision_feature_cache_plan(
             logging.info("%s Falling back to raw replay images.", message)
             return None
         raise ValueError(message)
+    if getattr(model_spec.encoder_model, "use_plucker", False):
+        message = (
+            "Frozen image-feature replay caching does not support Plucker "
+            "camera conditioning yet."
+        )
+        if cache_setting == "auto":
+            logging.info("%s Falling back to raw replay images.", message)
+            return None
+        raise ValueError(message)
     if getattr(model_spec.encoder_model, "trainable", False):
         message = "Frozen image-feature replay caching is incompatible with trainable encoders."
         if cache_setting == "auto":
@@ -247,18 +266,58 @@ def build_vision_feature_cache_plan(
     if obs_layout.use_multicam_fusion and fusion_mode == "flatten":
         feature_dim *= len(obs_layout.rgb_keys)
 
+    from robobase.models.encoder import resnet_weight_fingerprint
+
+    fingerprint_payload = {
+        "schema": 3,
+        "method": method_name,
+        "backends": requested_backends,
+        "encoder_model": model_spec.encoder_model.model,
+        "pretrained": bool(model_spec.encoder_model.pretrained),
+        "weight_fingerprint": resnet_weight_fingerprint(
+            model_spec.encoder_model.model,
+            bool(model_spec.encoder_model.pretrained),
+        ),
+        "fusion_mode": fusion_mode,
+        "rgb_keys": obs_layout.rgb_keys,
+        "rgb_input_shape": obs_layout.rgb_input_shape,
+        "feature_dim": feature_dim,
+    }
+    fingerprint = hashlib.sha256(
+        json.dumps(
+            fingerprint_payload,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+
     if reuse_saved and save_dir is not None:
         existing_replay = Path(save_dir)
-        saved_keys = _first_saved_episode_keys(existing_replay)
+        saved_keys, saved_fingerprint = _first_saved_episode_cache_info(existing_replay)
         if saved_keys is not None and not all(key in saved_keys for key in feature_keys):
             message = (
                 "Saved replay does not contain cached image features for "
                 f"{sorted(feature_keys)} in {existing_replay}."
             )
-            if cache_setting == "auto":
+            has_raw_rgb = all(key in saved_keys for key in obs_layout.rgb_keys)
+            if cache_setting == "auto" and has_raw_rgb:
                 logging.info("%s Reusing raw replay instead.", message)
                 return None
-            raise ValueError(message)
+            if has_raw_rgb:
+                raise ValueError(f"{message} Rebuild it with the current cache schema.")
+            raise ValueError(f"{message} The replay also lacks raw RGB for fallback.")
+        if saved_keys is not None and saved_fingerprint != fingerprint:
+            message = (
+                "Saved replay image-feature fingerprint is missing or does not "
+                f"match the current encoder configuration in {existing_replay}."
+            )
+            has_raw_rgb = all(key in saved_keys for key in obs_layout.rgb_keys)
+            if cache_setting == "auto" and has_raw_rgb:
+                logging.info("%s Reusing raw replay instead.", message)
+                return None
+            if has_raw_rgb:
+                raise ValueError(f"{message} Rebuild it to refresh cached features.")
+            raise ValueError(f"{message} The replay also lacks raw RGB for fallback.")
 
     replay_observation_space = spaces.Dict(
         {
@@ -274,28 +333,49 @@ def build_vision_feature_cache_plan(
             shape=(1, feature_dim),
             dtype=np.float32,
         )
+    replay_observation_space[VISION_CACHE_FINGERPRINT_KEY] = spaces.Box(
+        low=0,
+        high=255,
+        shape=(1, hashlib.sha256().digest_size),
+        dtype=np.uint8,
+    )
 
     preprocessor = FrozenVisionFeaturePreprocessor(
         rgb_keys=obs_layout.rgb_keys,
         encoder_model=model_spec.encoder_model.model,
+        pretrained=bool(model_spec.encoder_model.pretrained),
         fusion_mode=fusion_mode,
         feature_keys=feature_keys,
         method_name=method_name,
         input_shape=obs_layout.rgb_input_shape,
+        fingerprint=fingerprint,
     )
     return VisionFeatureCachePlan(
         observation_space=replay_observation_space,
         preprocessing_fn=[preprocessor],
         feature_keys=feature_keys,
         feature_dim=feature_dim,
+        fingerprint=fingerprint,
     )
 
 
-def _first_saved_episode_keys(replay_dir: Path) -> set[str] | None:
+def _first_saved_episode_cache_info(
+    replay_dir: Path,
+) -> tuple[set[str] | None, str | None]:
     if not replay_dir.exists():
-        return None
+        return None, None
     episode_files = sorted(replay_dir.glob("*.npz"))
     if not episode_files:
-        return None
+        return None, None
     with np.load(episode_files[0], allow_pickle=False) as episode:
-        return set(episode.files)
+        keys = set(episode.files)
+        if VISION_CACHE_FINGERPRINT_KEY not in keys:
+            return keys, None
+        encoded = np.asarray(episode[VISION_CACHE_FINGERPRINT_KEY], dtype=np.uint8)
+    digest_size = hashlib.sha256().digest_size
+    if encoded.size == 0 or encoded.shape[-1] != digest_size:
+        return keys, None
+    rows = encoded.reshape((-1, digest_size))
+    if not np.all(rows == rows[0]):
+        return keys, None
+    return keys, rows[0].tobytes().hex()

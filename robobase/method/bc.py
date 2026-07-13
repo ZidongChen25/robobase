@@ -43,6 +43,10 @@ class BCEncoderModelSpec:
     type: str
     model: str
     trainable: bool = False
+    pretrained: bool = True
+    use_plucker: bool = False
+    plucker_hidden_channels: int = 64
+    plucker_identity_init: bool = False
 
 
 @dataclass(frozen=True)
@@ -141,6 +145,18 @@ def bc_model_spec_from_cfg(cfg: DictConfig) -> BCModelSpec:
             type=encoder_model_type,
             model=str(encoder_model_cfg.get("model", "resnet18")),
             trainable=bool(encoder_model_cfg.get("trainable", False)),
+            # The original JAX ResNet path was always pretrained. Treat a
+            # missing key as the legacy behavior so old run configs and their
+            # snapshots retain the frozen batch statistics they were trained
+            # with. Random initialization remains available explicitly.
+            pretrained=bool(encoder_model_cfg.get("pretrained", True)),
+            use_plucker=bool(encoder_model_cfg.get("use_plucker", False)),
+            plucker_hidden_channels=int(
+                encoder_model_cfg.get("plucker_hidden_channels", 64)
+            ),
+            plucker_identity_init=bool(
+                encoder_model_cfg.get("plucker_identity_init", False)
+            ),
         )
 
     view_fusion_model_cfg = method_cfg.get("view_fusion_model", None)
@@ -226,10 +242,25 @@ def _build_model(
             )
         if obs_layout.rgb_input_shape is None:
             raise ValueError("Pixel BC expected a valid RGB input shape.")
+        if model_spec.encoder_model.use_plucker:
+            if not model_spec.encoder_model.trainable:
+                raise ValueError(
+                    "BC encoder_model.use_plucker=true requires "
+                    "encoder_model.trainable=true so the Plucker adapter is trained."
+                )
+            if not obs_layout.has_camera_conditioning:
+                raise ValueError(
+                    "BC encoder_model.use_plucker=true requires raymap or camera "
+                    "parameter observations paired with every RGB observation."
+                )
         encoder_model = JaxResNetEncoder(
             input_shape=obs_layout.rgb_input_shape,
             model=model_spec.encoder_model.model,
             jit=encoder_jit,
+            pretrained=model_spec.encoder_model.pretrained,
+            use_plucker=model_spec.encoder_model.use_plucker,
+            plucker_hidden_channels=model_spec.encoder_model.plucker_hidden_channels,
+            plucker_identity_init=model_spec.encoder_model.plucker_identity_init,
         )
         if obs_layout.use_multicam_fusion:
             if model_spec.view_fusion_model is None:
@@ -341,6 +372,11 @@ class BC(JaxMethodBase):
         self.actor_model = built_model.actor_model
         self.encoder = built_model.encoder_model
         self.view_fusion = built_model.view_fusion_model
+        self._trainable_encoder = (
+            self.encoder is not None
+            and self.model_spec.encoder_model is not None
+            and bool(self.model_spec.encoder_model.trainable)
+        )
         self.rgb_latent_size = 0
         if self.encoder is not None:
             self.rgb_latent_size = int(
@@ -356,7 +392,12 @@ class BC(JaxMethodBase):
         )
 
         dummy_input = jnp.zeros((1, input_dim), dtype=jnp.float32)
-        self.params = self.actor_model.init(self.rng_key, dummy_input)
+        actor_params = self.actor_model.init(self.rng_key, dummy_input)
+        self.params = (
+            {"actor": actor_params, "encoder": self.encoder.trainable_params}
+            if self._trainable_encoder
+            else actor_params
+        )
 
         learning_rate = lr
         if adaptive_lr:
@@ -378,16 +419,71 @@ class BC(JaxMethodBase):
         self._update_impl = update_fn
         self._predict = predict_fn
 
-    def _predict_impl(self, params, obs_features):
-        return self.actor_model.apply(params, obs_features)
+    def _actor_params(self, params):
+        if self._trainable_encoder:
+            return params["actor"]
+        return params
+
+    def _prepare_trainable_obs_inputs(self, batch_or_obs: dict):
+        inputs = {}
+        low_dim_obs = self._extract_low_dim_batch(batch_or_obs)
+        if low_dim_obs is not None:
+            inputs["low_dim"] = low_dim_obs
+        if self.use_pixels:
+            if self._has_cached_pixel_features(batch_or_obs):
+                raise ValueError(
+                    "Trainable JAX BC encoder requires raw RGB observations; "
+                    "disable replay.cache_frozen_image_features."
+                )
+            rgb_obs, _ = self._extract_rgb_obs(batch_or_obs)
+            inputs["rgb"] = rgb_obs
+            raymap_obs = self._extract_raymap_obs(batch_or_obs)
+            if raymap_obs is not None:
+                inputs["raymap"] = raymap_obs
+            camera_intrinsic_obs, camera_c2w_obs = self._extract_camera_param_obs(
+                batch_or_obs
+            )
+            if camera_intrinsic_obs is not None:
+                inputs["camera_intrinsic"] = camera_intrinsic_obs
+                inputs["camera_c2w"] = camera_c2w_obs
+        return inputs
+
+    def _features_from_inputs(self, params, obs_inputs):
+        if not self._trainable_encoder:
+            return obs_inputs
+        features = []
+        if "low_dim" in obs_inputs:
+            features.append(obs_inputs["low_dim"])
+        if "rgb" in obs_inputs:
+            rgb_feats = self.encoder.apply_trainable(
+                params["encoder"],
+                obs_inputs["rgb"],
+                raymap_obs=obs_inputs.get("raymap", None),
+                camera_intrinsic_obs=obs_inputs.get("camera_intrinsic", None),
+                camera_c2w_obs=obs_inputs.get("camera_c2w", None),
+            )
+            features.append(self._fuse_multi_view(rgb_feats))
+        if not features:
+            raise ValueError("BC requires at least one observation feature.")
+        if len(features) == 1:
+            return features[0]
+        return self.jnp.concatenate(features, axis=-1)
+
+    def _predict_impl(self, params, obs_inputs):
+        obs_features = self._features_from_inputs(params, obs_inputs)
+        return self.actor_model.apply(self._actor_params(params), obs_features)
 
     def _build_update_fn(self):
         optimizer = self.optimizer
         optax = self.optax
 
-        def update_fn(params, opt_state, obs_features, actions, loss_coeff, action_pad_mask):
+        def update_fn(params, opt_state, obs_inputs, actions, loss_coeff, action_pad_mask):
             def loss_fn(current_params):
-                action_pred = self.actor_model.apply(current_params, obs_features)
+                obs_features = self._features_from_inputs(current_params, obs_inputs)
+                action_pred = self.actor_model.apply(
+                    self._actor_params(current_params),
+                    obs_features,
+                )
                 per_token_mse = jnp.square(action_pred - actions)
                 reduce_dims = tuple(range(1, per_token_mse.ndim))
                 if action_pad_mask is None:
@@ -396,6 +492,7 @@ class BC(JaxMethodBase):
                     valid_mask = jnp.logical_not(action_pad_mask).astype(per_token_mse.dtype)
                     while valid_mask.ndim < per_token_mse.ndim:
                         valid_mask = valid_mask[..., None]
+                    valid_mask = jnp.broadcast_to(valid_mask, per_token_mse.shape)
                     masked_loss = per_token_mse * valid_mask
                     denom = jnp.clip(valid_mask.sum(axis=reduce_dims), min=1.0)
                     mse_loss = masked_loss.sum(axis=reduce_dims) / denom
@@ -420,8 +517,11 @@ class BC(JaxMethodBase):
 
     def act(self, observations: dict, step: int, eval_mode: bool):
         del step, eval_mode
-        obs_features, _ = self._prepare_obs_features(observations)
-        actions = self._predict(self.params, obs_features)
+        if self._trainable_encoder:
+            obs_inputs = self._prepare_trainable_obs_inputs(observations)
+        else:
+            obs_inputs, _ = self._prepare_obs_features(observations)
+        actions = self._predict(self.params, obs_inputs)
         self._block(actions)
         return np.asarray(jax.device_get(actions), dtype=np.float32)
 
@@ -436,13 +536,17 @@ class BC(JaxMethodBase):
         actions = self._as_jax_array(batch["action"], self.jnp.float32)
         action_pad_mask = self._extract_action_pad_mask(batch)
         loss_coeff = self._loss_weights(batch)
-        obs_features, metrics = self._prepare_obs_features(batch)
+        if self._trainable_encoder:
+            obs_inputs = self._prepare_trainable_obs_inputs(batch)
+            metrics = {}
+        else:
+            obs_inputs, metrics = self._prepare_obs_features(batch)
 
         start_time = time.perf_counter()
         self.params, self.opt_state, actor_loss, new_priority = self._update_impl(
             self.params,
             self.opt_state,
-            obs_features,
+            obs_inputs,
             actions,
             loss_coeff,
             action_pad_mask,
@@ -462,7 +566,7 @@ class BC(JaxMethodBase):
                 dtype=np.float32,
             )
             self._maybe_update_priorities(replay_buffer, batch, new_priority_np)
-        self._maybe_log_update_metrics(metrics, actor_loss, obs_features, elapsed)
+        self._maybe_log_update_metrics(metrics, actor_loss, obs_inputs, elapsed)
         self._first_update_completed = True
         return metrics
 

@@ -12,7 +12,7 @@ Commit source code, configs, launch scripts, tests, and documentation:
 - `tests/**`
 - `BiGym/*.sh`
 - `RoboMimic/*.py` and `RoboMimic/*.sh`
-- `pyproject.toml`, `uv.lock`, `setup.py`, `requirements*.txt`
+- `pyproject.toml`, `uv.lock`, `setup.py`
 - project docs such as `README.md`, `backend.md`, and reports you want preserved
 
 For the current working tree, the untracked files that look commit-worthy are:
@@ -67,12 +67,6 @@ Use CPU JAX instead:
 uv sync --extra jax
 ```
 
-ACT/PyTorch development adds:
-
-```bash
-uv sync --extra jax-cuda12 --extra torch
-```
-
 `dev` is a default uv dependency group and installs `pytest` and `pre-commit`.
 
 ## Benchmark Extras
@@ -98,7 +92,7 @@ Notes:
 - `rlbench` still needs CoppeliaSim/PyRep system setup.
 - `d4rl` still needs MuJoCo-compatible local setup.
 
-## Lock and Export
+## Lockfile
 
 Update the uv lockfile after dependency changes:
 
@@ -106,9 +100,11 @@ Update the uv lockfile after dependency changes:
 uv lock
 ```
 
-Export a requirements file for a deployment target when needed:
+Do not maintain checked-in `requirements*.txt` files. Use `pyproject.toml` and
+`uv.lock` as the canonical environment definition. If a one-off deployment
+target requires a requirements file, generate it outside the repo or keep it
+untracked:
 
 ```bash
-uv export --no-hashes --no-emit-project --extra jax-cuda12 -o requirements.txt
-uv export --no-hashes --no-emit-project --extra jax-cuda12 --extra pusht -o requirements.pusht.txt
+uv export --no-hashes --no-emit-project --extra jax-cuda12
 ```

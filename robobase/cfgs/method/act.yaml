@@ -5,14 +5,20 @@ method:
   name: act
   is_rl: false
   lr: 1e-5
-  weight_decay: 1e-4
   lr_backbone: 1e-5
+  weight_decay: 1e-4
+  lang_feature_source: tokens
+  lang_feature_device: cpu
   num_train_steps: ${num_pretrain_steps}
   adaptive_lr: false
   actor_grad_clip: 1.0
   noise_mask_steps: 0
   repeat_action: false
-  use_lang_cond: true
+  horizon_dropout_lengths: null
+  horizon_dropout_probs: null
+  # Language conditioning is enabled by task-specific launches that provide
+  # language observations. Generic state-only datasets do not.
+  use_lang_cond: false
 
   actor_model:
     type: transformer
@@ -24,12 +30,22 @@ method:
     nheads: 8
     num_queries: ${action_sequence}
     pre_norm: false
+    latent_dim: 32
+    kl_weight: 10.0
+    gripper_loss_weight: 0.05
+    gripper_dims: 0
     data_augmentation: true
     use_lang_cond: ${method.use_lang_cond}
+    lang_feature_dim: 512
 
   encoder_model:
     type: resnet
     model: resnet18
+    trainable: true
+    pretrained: true
+    use_plucker: false
+    plucker_hidden_channels: 64
+    plucker_identity_init: false
 
   view_fusion_model:
     type: multicam_feature

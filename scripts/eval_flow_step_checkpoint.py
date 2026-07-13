@@ -22,6 +22,8 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--gpu-id", type=int, default=None)
     parser.add_argument("--num-eval-episodes", type=int, default=None)
     parser.add_argument("--num-eval-envs", type=int, default=1)
+    parser.add_argument("--action-sequence", type=int, default=None)
+    parser.add_argument("--backbone-sequence-length", type=int, default=None)
     parser.add_argument("--execution-length", type=int, default=None)
     parser.add_argument("--flow-schedule", type=str, default=None)
     return parser.parse_args()
@@ -80,6 +82,15 @@ def _run_eval(args: argparse.Namespace) -> dict:
     cfg.gpu_id = None
     if args.execution_length is not None:
         cfg.execution_length = int(args.execution_length)
+    if args.action_sequence is not None:
+        cfg.action_sequence = int(args.action_sequence)
+        _set_if_present(cfg, "method.backbone.sequence_length", int(args.action_sequence))
+        cfg.method.backbone.sequence_length = int(args.action_sequence)
+    if args.backbone_sequence_length is not None:
+        _set_if_present(
+            cfg, "method.backbone.sequence_length", int(args.backbone_sequence_length)
+        )
+        cfg.method.backbone.sequence_length = int(args.backbone_sequence_length)
 
     _set_if_present(cfg, "wandb.use", False)
     _set_if_present(cfg, "tb.use", False)
@@ -118,8 +129,15 @@ def _run_eval(args: argparse.Namespace) -> dict:
         "flow_steps": int(args.flow_steps),
         "num_eval_episodes": int(cfg.num_eval_episodes),
         "num_eval_envs": int(cfg.num_eval_envs),
+        "action_sequence": int(cfg.action_sequence),
         "execution_length": int(cfg.execution_length),
         "flow_schedule": str(cfg.method.get("sample_schedule", "uniform")),
+        "train_time_schedule": str(
+            cfg.method.get("objective", {}).get(
+                "train_time_schedule",
+                cfg.method.get("train_time_schedule", "uniform"),
+            )
+        ),
         "gpu_id": args.gpu_id,
         "metrics": {
             key: float(value)

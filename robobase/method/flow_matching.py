@@ -12,6 +12,7 @@ import numpy as np
 from gymnasium import spaces
 from omegaconf import DictConfig
 
+from robobase.language import lang_feature_rows, lang_token_rows, tokens_to_feature_jax
 from robobase.method.bc import BCEncoderModelSpec, BCViewFusionModelSpec
 from robobase.method.bc_runtime import bc_observation_layout
 from robobase.method.jax_base import JaxMethodBase
@@ -49,6 +50,10 @@ class FlowMatchingSpec:
     num_flow_steps: int
     sampler: str
     sample_schedule: str
+    train_time_schedule: str
+    horizon_dropout_lengths: tuple[int, ...] | None
+    horizon_dropout_probs: tuple[float, ...] | None
+    horizon_loss_weights: tuple[float, ...] | None
     use_ema: bool
     ema_decay: float
     weight_decay: float
@@ -91,6 +96,37 @@ def _sample_schedule_jump_point(sample_schedule: str) -> float | None:
     )
 
 
+def _parse_schedule_float(value: str) -> float:
+    return float(value.replace("p", "."))
+
+
+def _train_time_beta_params(train_time_schedule: str) -> tuple[float, float] | None:
+    if train_time_schedule in {"uniform", "linear"}:
+        return None
+    if train_time_schedule in {"beta", "u_shaped", "u_shaped_beta"}:
+        return 0.5, 0.5
+    for prefix in ("beta_", "u_shaped_beta_"):
+        if not train_time_schedule.startswith(prefix):
+            continue
+        parts = train_time_schedule[len(prefix):].split("_")
+        try:
+            if len(parts) == 1:
+                alpha = beta = _parse_schedule_float(parts[0])
+            elif len(parts) == 2:
+                alpha = _parse_schedule_float(parts[0])
+                beta = _parse_schedule_float(parts[1])
+            else:
+                break
+        except ValueError:
+            break
+        if alpha > 0.0 and beta > 0.0:
+            return alpha, beta
+        break
+    raise NotImplementedError(
+        f"Unsupported Flow Matching train_time_schedule '{train_time_schedule}'."
+    )
+
+
 def flow_matching_model_spec_from_cfg(cfg: DictConfig) -> FlowMatchingModelSpec:
     method_cfg = cfg.method
     backbone_cfg = method_cfg.get("backbone", None)
@@ -117,6 +153,14 @@ def flow_matching_model_spec_from_cfg(cfg: DictConfig) -> FlowMatchingModelSpec:
             type=encoder_model_type,
             model=str(encoder_model_cfg.get("model", "resnet18")),
             trainable=bool(encoder_model_cfg.get("trainable", False)),
+            pretrained=bool(encoder_model_cfg.get("pretrained", True)),
+            use_plucker=bool(encoder_model_cfg.get("use_plucker", False)),
+            plucker_hidden_channels=int(
+                encoder_model_cfg.get("plucker_hidden_channels", 64)
+            ),
+            plucker_identity_init=bool(
+                encoder_model_cfg.get("plucker_identity_init", False)
+            ),
         )
 
     view_fusion_model_cfg = method_cfg.get("view_fusion_model", None)
@@ -170,6 +214,31 @@ def flow_matching_spec_from_cfg(cfg: DictConfig) -> FlowMatchingSpec:
         if objective_cfg is not None
         else str(cfg.method.get("sample_schedule", "uniform")).lower()
     )
+    train_time_schedule = (
+        str(
+            objective_cfg.get(
+                "train_time_schedule",
+                cfg.method.get("train_time_schedule", "uniform"),
+            )
+        ).lower()
+        if objective_cfg is not None
+        else str(cfg.method.get("train_time_schedule", "uniform")).lower()
+    )
+    horizon_dropout_lengths = cfg.method.get("horizon_dropout_lengths", None)
+    horizon_dropout_probs = cfg.method.get("horizon_dropout_probs", None)
+    if horizon_dropout_lengths is not None:
+        horizon_dropout_lengths = tuple(int(v) for v in horizon_dropout_lengths)
+        if len(horizon_dropout_lengths) == 0:
+            horizon_dropout_lengths = None
+    if horizon_dropout_probs is not None:
+        horizon_dropout_probs = tuple(float(v) for v in horizon_dropout_probs)
+        if len(horizon_dropout_probs) == 0:
+            horizon_dropout_probs = None
+    horizon_loss_weights = cfg.method.get("horizon_loss_weights", None)
+    if horizon_loss_weights is not None:
+        horizon_loss_weights = tuple(float(v) for v in horizon_loss_weights)
+        if len(horizon_loss_weights) == 0:
+            horizon_loss_weights = None
     return FlowMatchingSpec(
         lr=float(cfg.method.lr),
         adaptive_lr=bool(cfg.method.adaptive_lr),
@@ -184,6 +253,10 @@ def flow_matching_spec_from_cfg(cfg: DictConfig) -> FlowMatchingSpec:
         num_flow_steps=num_flow_steps,
         sampler=sampler,
         sample_schedule=sample_schedule,
+        train_time_schedule=train_time_schedule,
+        horizon_dropout_lengths=horizon_dropout_lengths,
+        horizon_dropout_probs=horizon_dropout_probs,
+        horizon_loss_weights=horizon_loss_weights,
         use_ema=bool(cfg.method.get("use_ema", False)),
         ema_decay=float(cfg.method.get("ema_decay", 0.9999)),
         weight_decay=float(cfg.method.get("weight_decay", 1e-6)),
@@ -220,10 +293,25 @@ def _build_encoder_and_fusion(
             )
         if obs_layout.rgb_input_shape is None:
             raise ValueError("Pixel Flow Matching expected a valid RGB input shape.")
+        if model_spec.encoder_model.use_plucker:
+            if not model_spec.encoder_model.trainable:
+                raise ValueError(
+                    "Flow Matching encoder_model.use_plucker=true requires "
+                    "encoder_model.trainable=true so the Plucker adapter is trained."
+                )
+            if not obs_layout.has_camera_conditioning:
+                raise ValueError(
+                    "Flow Matching encoder_model.use_plucker=true requires raymap or "
+                    "camera parameter observations paired with every RGB observation."
+                )
         encoder_model = JaxResNetEncoder(
             input_shape=obs_layout.rgb_input_shape,
             model=model_spec.encoder_model.model,
             jit=encoder_jit,
+            pretrained=model_spec.encoder_model.pretrained,
+            use_plucker=model_spec.encoder_model.use_plucker,
+            plucker_hidden_channels=model_spec.encoder_model.plucker_hidden_channels,
+            plucker_identity_init=model_spec.encoder_model.plucker_identity_init,
         )
         if obs_layout.use_multicam_fusion:
             if model_spec.view_fusion_model is None:
@@ -262,6 +350,7 @@ def _build_model(
     encoder_jit: bool,
 ) -> tuple[_BuiltFlowMatchingModel, int]:
     obs_layout = bc_observation_layout(observation_space)
+    backbone_type = canonical_backbone_type(model_spec.backbone.type)
     encoder_model, view_fusion_model, rgb_latent_size = _build_encoder_and_fusion(
         model_spec=model_spec,
         observation_space=observation_space,
@@ -270,6 +359,12 @@ def _build_model(
     feature_dim = int(obs_layout.low_dim_size + rgb_latent_size)
     if model_spec.use_lang_cond:
         feature_dim += int(model_spec.lang_feature_dim)
+    if backbone_type == "transformer" and not obs_layout.use_pixels:
+        low_dim_state_spec = observation_space.spaces.get("low_dim_state")
+        if low_dim_state_spec is not None:
+            feature_dim = int(low_dim_state_spec.shape[-1])
+            if model_spec.use_lang_cond:
+                feature_dim += int(model_spec.lang_feature_dim)
     return _BuiltFlowMatchingModel(
         backbone_model=build_diffusion_backbone(
             model_spec.backbone,
@@ -312,6 +407,10 @@ class FlowMatching(JaxMethodBase):
         objective_type: str = "rectified_flow",
         sampler: str = "euler",
         sample_schedule: str = "uniform",
+        train_time_schedule: str = "uniform",
+        horizon_dropout_lengths: tuple[int, ...] | None = None,
+        horizon_dropout_probs: tuple[float, ...] | None = None,
+        horizon_loss_weights: tuple[float, ...] | None = None,
         update_block_every_steps: int = 1,
     ):
         if not frame_stack_on_channel:
@@ -328,6 +427,8 @@ class FlowMatching(JaxMethodBase):
             )
         sample_schedule = str(sample_schedule).lower()
         sample_schedule_jump_point = _sample_schedule_jump_point(sample_schedule)
+        train_time_schedule = str(train_time_schedule).lower()
+        train_time_beta_params = _train_time_beta_params(train_time_schedule)
         if int(num_flow_steps) < 1:
             raise ValueError("num_flow_steps must be >= 1.")
 
@@ -356,6 +457,46 @@ class FlowMatching(JaxMethodBase):
         self.sampler = str(sampler).lower()
         self.sample_schedule = sample_schedule
         self._sample_schedule_jump_point = sample_schedule_jump_point
+        self.train_time_schedule = train_time_schedule
+        self._train_time_beta_params = train_time_beta_params
+        self._horizon_dropout_lengths = None
+        self._horizon_dropout_probs = None
+        self._horizon_loss_weights = None
+        if horizon_dropout_lengths is not None:
+            lengths = tuple(int(v) for v in horizon_dropout_lengths)
+            if any(v < 1 or v > self.action_sequence for v in lengths):
+                raise ValueError(
+                    "horizon_dropout_lengths must be between 1 and action_sequence."
+                )
+            if horizon_dropout_probs is None:
+                probs = tuple([1.0 / len(lengths)] * len(lengths))
+            else:
+                probs = tuple(float(v) for v in horizon_dropout_probs)
+                if len(probs) != len(lengths):
+                    raise ValueError(
+                        "horizon_dropout_probs must match horizon_dropout_lengths."
+                    )
+                if any(v < 0.0 for v in probs) or sum(probs) <= 0.0:
+                    raise ValueError(
+                        "horizon_dropout_probs must be non-negative and sum > 0."
+                    )
+                prob_sum = sum(probs)
+                probs = tuple(v / prob_sum for v in probs)
+            self._horizon_dropout_lengths = jnp.asarray(lengths, dtype=jnp.int32)
+            self._horizon_dropout_probs = jnp.asarray(probs, dtype=jnp.float32)
+        if horizon_loss_weights is not None:
+            weights = tuple(float(v) for v in horizon_loss_weights)
+            if len(weights) != self.action_sequence:
+                raise ValueError(
+                    "horizon_loss_weights must have length equal to action_sequence."
+                )
+            if any(v < 0.0 for v in weights) or sum(weights) <= 0.0:
+                raise ValueError(
+                    "horizon_loss_weights must be non-negative and sum > 0."
+                )
+            weight_sum = sum(weights)
+            weights = tuple(v / weight_sum for v in weights)
+            self._horizon_loss_weights = jnp.asarray(weights, dtype=jnp.float32)
         self.num_flow_steps = int(num_flow_steps)
         # The diffusion-style SinusoidalPosEmb is tuned for the integer step
         # range (~[0, 1000]); CleanDiffuser feeds the integer diffusion-step
@@ -367,10 +508,9 @@ class FlowMatching(JaxMethodBase):
         self.model_spec = model
         self.use_lang_cond = bool(model.use_lang_cond)
         self.lang_feature_dim = int(model.lang_feature_dim) if self.use_lang_cond else 0
-        self._clip_text_cache = {}
-        self._condition_as_sequence = canonical_backbone_type(
-            self.model_spec.backbone.type
-        ) in {"transformer", "dit"}
+        self._condition_as_sequence = (
+            canonical_backbone_type(self.model_spec.backbone.type) == "transformer"
+        )
         self._init_cached_pixel_feature_key("flow_matching")
 
         built_model, feature_dim = _build_model(
@@ -396,9 +536,16 @@ class FlowMatching(JaxMethodBase):
             (1, self.action_sequence, self.action_dim), dtype=jnp.float32
         )
         dummy_timesteps = jnp.zeros((1,), dtype=jnp.float32)
-        dummy_features = (
-            jnp.zeros((1, feature_dim), dtype=jnp.float32) if feature_dim > 0 else None
-        )
+        if feature_dim > 0 and self._condition_as_sequence and not self.use_pixels:
+            dummy_features = jnp.zeros(
+                (1, self.time_dim, feature_dim), dtype=jnp.float32
+            )
+        else:
+            dummy_features = (
+                jnp.zeros((1, feature_dim), dtype=jnp.float32)
+                if feature_dim > 0
+                else None
+            )
         actor_params = self.actor_model.init(
             init_key, dummy_actions, dummy_timesteps, dummy_features
         )
@@ -444,13 +591,16 @@ class FlowMatching(JaxMethodBase):
         self.opt_state = self.optimizer.init(self.params)
 
         update_fn = self._build_update_fn()
+        update_many_fn = self._build_update_many_fn(update_fn)
         sample_fn = self._build_sample_fn()
         sample_from_noise_fn = self._build_sample_from_noise_fn()
         if self._jit_enabled:
             update_fn = jax.jit(update_fn)
+            update_many_fn = jax.jit(update_many_fn)
             sample_fn = jax.jit(sample_fn)
             sample_from_noise_fn = jax.jit(sample_from_noise_fn)
         self._update_impl = update_fn
+        self._update_many_impl = update_many_fn
         self._sample_impl = sample_fn
         self._sample_from_noise_impl = sample_from_noise_fn
 
@@ -479,68 +629,39 @@ class FlowMatching(JaxMethodBase):
     # Language Conditioning
     # ------------------------------------------------------------------
 
-    def _lang_token_rows(self, batch_or_obs: dict) -> np.ndarray:
-        if "lang_tokens" not in batch_or_obs:
-            raise ValueError(
-                "Language-conditioned flow matching requires 'lang_tokens' observations."
-            )
-        tokens = np.asarray(batch_or_obs["lang_tokens"], dtype=np.int32)
-        if tokens.ndim == 1:
-            tokens = tokens[None, :]
-        elif tokens.ndim >= 3:
-            tokens = tokens.reshape(tokens.shape[0], -1, tokens.shape[-1])[:, -1, :]
-        return tokens
+    def _lang_token_rows(self, batch_or_obs: dict):
+        return lang_token_rows(
+            batch_or_obs,
+            context="Language-conditioned flow matching",
+        )
 
-    def _encode_clip_text(self, tokens: np.ndarray) -> np.ndarray:
-        token_rows = np.asarray(tokens, dtype=np.int32)
-        features = []
-        missing = []
-        missing_keys = []
-        for row in token_rows:
-            key = tuple(int(v) for v in row.tolist())
-            cached = self._clip_text_cache.get(key)
-            if cached is None:
-                missing.append(row)
-                missing_keys.append(key)
-            features.append((key, cached))
-
-        if missing:
-            import torch
-            import clip
-
-            if not hasattr(self, "clip_model"):
-                clip_model, _ = clip.load("ViT-B/32", device="cpu")
-                clip_model.eval()
-                for param in clip_model.parameters():
-                    param.requires_grad_(False)
-                self.__dict__["clip_model"] = clip_model
-
-            with torch.no_grad():
-                token_tensor = torch.as_tensor(
-                    np.stack(missing),
-                    dtype=torch.long,
-                    device="cpu",
-                )
-                encoded = self.clip_model.encode_text(token_tensor).float().cpu().numpy()
-            if encoded.shape[-1] != self.lang_feature_dim:
-                raise ValueError(
-                    "CLIP text feature dimension does not match "
-                    f"method.lang_feature_dim: {encoded.shape[-1]} != "
-                    f"{self.lang_feature_dim}."
-                )
-            for key, value in zip(missing_keys, encoded):
-                self._clip_text_cache[key] = value.astype(np.float32, copy=False)
-
-        return np.stack(
-            [self._clip_text_cache[key] for key, _ in features],
-            axis=0,
-        ).astype(np.float32, copy=False)
+    def _encode_lang_tokens(self, tokens):
+        return tokens_to_feature_jax(tokens, feature_dim=self.lang_feature_dim)
 
     def _extract_lang_features(self, batch_or_obs: dict):
         if not self.use_lang_cond:
             return None
+        if "lang_features" in batch_or_obs:
+            features = self._as_jax_array(
+                lang_feature_rows(
+                    batch_or_obs,
+                    context="Language-conditioned flow matching",
+                ),
+                self.jnp.float32,
+            )
+            if features.shape[-1] != self.lang_feature_dim:
+                raise ValueError(
+                    "Language-conditioned flow matching expected lang_features "
+                    f"with final dimension {self.lang_feature_dim}, got "
+                    f"{features.shape[-1]}."
+                )
+            return features
+        tokens = self._as_jax_array(
+            self._lang_token_rows(batch_or_obs),
+            self.jnp.float32,
+        )
         return self._as_jax_array(
-            self._encode_clip_text(self._lang_token_rows(batch_or_obs)),
+            self._encode_lang_tokens(tokens),
             self.jnp.float32,
         )
 
@@ -596,6 +717,15 @@ class FlowMatching(JaxMethodBase):
                 )
             rgb_obs, _ = self._extract_rgb_obs(batch_or_obs)
             inputs["rgb"] = rgb_obs
+            raymap_obs = self._extract_raymap_obs(batch_or_obs)
+            if raymap_obs is not None:
+                inputs["raymap"] = raymap_obs
+            camera_intrinsic_obs, camera_c2w_obs = self._extract_camera_param_obs(
+                batch_or_obs
+            )
+            if camera_intrinsic_obs is not None:
+                inputs["camera_intrinsic"] = camera_intrinsic_obs
+                inputs["camera_c2w"] = camera_c2w_obs
         if self.use_lang_cond:
             inputs["lang"] = self._extract_lang_features(batch_or_obs)
         return inputs
@@ -608,7 +738,11 @@ class FlowMatching(JaxMethodBase):
             features.append(obs_inputs["low_dim"])
         if "rgb" in obs_inputs:
             rgb_feats = self.encoder.apply_trainable(
-                params["encoder"], obs_inputs["rgb"],
+                params["encoder"],
+                obs_inputs["rgb"],
+                raymap_obs=obs_inputs.get("raymap", None),
+                camera_intrinsic_obs=obs_inputs.get("camera_intrinsic", None),
+                camera_c2w_obs=obs_inputs.get("camera_c2w", None),
             )
             features.append(self._fuse_multi_view(rgb_feats))
         if "lang" in obs_inputs:
@@ -627,25 +761,57 @@ class FlowMatching(JaxMethodBase):
         use_ema = self.use_ema
         actor_model = self.actor_model
         time_scale = self._time_scale
+        train_time_beta_params = self._train_time_beta_params
+        horizon_dropout_lengths = self._horizon_dropout_lengths
+        horizon_dropout_probs = self._horizon_dropout_probs
+        horizon_loss_weights = self._horizon_loss_weights
 
         def update_fn(
             params, opt_state, rng_key, obs_inputs, actions,
             loss_coeff, action_pad_mask, ema_params, ema_optimization_step,
         ):
-            source_key, time_key, next_key = jax.random.split(rng_key, 3)
+            source_key, time_key, dropout_key, next_key = jax.random.split(rng_key, 4)
             x1 = jax.random.normal(source_key, shape=actions.shape)
-            t = jax.random.uniform(
-                time_key,
-                shape=(actions.shape[0],),
-                minval=0.0,
-                maxval=1.0,
-            )
+            if train_time_beta_params is None:
+                t = jax.random.uniform(
+                    time_key,
+                    shape=(actions.shape[0],),
+                    minval=0.0,
+                    maxval=1.0,
+                )
+            else:
+                alpha, beta = train_time_beta_params
+                t = jax.random.beta(
+                    time_key,
+                    alpha,
+                    beta,
+                    shape=(actions.shape[0],),
+                )
+                t = jnp.clip(t, 1e-5, 1.0 - 1e-5)
             t_broadcast = t[:, None, None]
             xt = t_broadcast * x1 + (1.0 - t_broadcast) * actions
             target_velocity = actions - x1
 
-            if action_pad_mask is not None:
-                valid_mask = jnp.logical_not(action_pad_mask)
+            effective_action_pad_mask = action_pad_mask
+            if horizon_dropout_lengths is not None:
+                length_indices = jax.random.choice(
+                    dropout_key,
+                    horizon_dropout_lengths.shape[0],
+                    shape=(actions.shape[0],),
+                    p=horizon_dropout_probs,
+                )
+                sampled_lengths = horizon_dropout_lengths[length_indices]
+                token_positions = jnp.arange(actions.shape[1], dtype=jnp.int32)
+                dropout_mask = token_positions[None, :] >= sampled_lengths[:, None]
+                if effective_action_pad_mask is None:
+                    effective_action_pad_mask = dropout_mask
+                else:
+                    effective_action_pad_mask = jnp.logical_or(
+                        effective_action_pad_mask, dropout_mask
+                    )
+
+            if effective_action_pad_mask is not None:
+                valid_mask = jnp.logical_not(effective_action_pad_mask)
                 xt = jnp.where(valid_mask[..., None], xt, actions)
                 target_velocity = jnp.where(
                     valid_mask[..., None],
@@ -665,14 +831,28 @@ class FlowMatching(JaxMethodBase):
                 )
                 per_token_mse = jnp.square(velocity_pred - target_velocity)
                 reduce_dims = tuple(range(1, per_token_mse.ndim))
-                if action_pad_mask is None:
+                if horizon_loss_weights is not None:
+                    action_reduce_dims = tuple(range(2, per_token_mse.ndim))
+                    per_step_mse = per_token_mse.mean(axis=action_reduce_dims)
+                    weights = horizon_loss_weights
+                    if effective_action_pad_mask is None:
+                        mse_loss = (per_step_mse * weights[None, :]).sum(axis=1)
+                    else:
+                        valid_mask = jnp.logical_not(effective_action_pad_mask).astype(
+                            per_step_mse.dtype
+                        )
+                        weighted_mask = valid_mask * weights[None, :]
+                        denom = jnp.clip(weighted_mask.sum(axis=1), min=1e-8)
+                        mse_loss = (per_step_mse * weighted_mask).sum(axis=1) / denom
+                elif effective_action_pad_mask is None:
                     mse_loss = per_token_mse.mean(axis=reduce_dims)
                 else:
-                    valid_mask = jnp.logical_not(action_pad_mask).astype(
+                    valid_mask = jnp.logical_not(effective_action_pad_mask).astype(
                         per_token_mse.dtype
                     )
                     while valid_mask.ndim < per_token_mse.ndim:
                         valid_mask = valid_mask[..., None]
+                    valid_mask = jnp.broadcast_to(valid_mask, per_token_mse.shape)
                     masked_loss = per_token_mse * valid_mask
                     denom = jnp.clip(valid_mask.sum(axis=reduce_dims), min=1.0)
                     mse_loss = masked_loss.sum(axis=reduce_dims) / denom
@@ -705,6 +885,72 @@ class FlowMatching(JaxMethodBase):
             )
 
         return update_fn
+
+    def _build_update_many_fn(self, update_fn):
+        def update_many_fn(
+            params, opt_state, rng_key, obs_inputs, actions,
+            loss_coeff, action_pad_mask, ema_params, ema_optimization_step,
+        ):
+            def body_fn(carry, xs):
+                current_params, current_opt_state, current_key, current_ema, current_ema_step = carry
+                if action_pad_mask is None:
+                    step_obs_inputs, step_actions, step_loss_coeff = xs
+                    step_action_pad_mask = None
+                else:
+                    step_obs_inputs, step_actions, step_loss_coeff, step_action_pad_mask = xs
+                (
+                    next_params,
+                    next_opt_state,
+                    next_key,
+                    loss,
+                    priority,
+                    next_ema,
+                    next_ema_step,
+                ) = update_fn(
+                    current_params,
+                    current_opt_state,
+                    current_key,
+                    step_obs_inputs,
+                    step_actions,
+                    step_loss_coeff,
+                    step_action_pad_mask,
+                    current_ema,
+                    current_ema_step,
+                )
+                next_carry = (
+                    next_params,
+                    next_opt_state,
+                    next_key,
+                    next_ema,
+                    next_ema_step,
+                )
+                return next_carry, (loss, priority)
+
+            xs = (obs_inputs, actions, loss_coeff)
+            if action_pad_mask is not None:
+                xs = (*xs, action_pad_mask)
+            (
+                new_params,
+                new_opt_state,
+                new_key,
+                new_ema,
+                new_ema_step,
+            ), (losses, priorities) = jax.lax.scan(
+                body_fn,
+                (params, opt_state, rng_key, ema_params, ema_optimization_step),
+                xs,
+            )
+            return (
+                new_params,
+                new_opt_state,
+                new_key,
+                losses[-1],
+                priorities[-1],
+                new_ema,
+                new_ema_step,
+            )
+
+        return update_many_fn
 
     def _build_sample_fn(self):
         actor_model = self.actor_model
@@ -843,6 +1089,11 @@ class FlowMatching(JaxMethodBase):
             )
         return jnp.stack(rows, axis=0)
 
+    def _last_obs_inputs(self, obs_inputs):
+        if isinstance(obs_inputs, dict):
+            return self.jax.tree_util.tree_map(lambda value: value[-1], obs_inputs)
+        return obs_inputs[-1]
+
     def update(
         self,
         replay_iter: Iterator[dict],
@@ -877,7 +1128,7 @@ class FlowMatching(JaxMethodBase):
             actions,
             loss_coeff,
             action_pad_mask,
-            self.params if self.ema_params is None else self.ema_params,
+            self.ema_params,
             self._ema_optimization_step,
         )
         uses_priorities = self._uses_replay_priorities(replay_buffer)
@@ -899,8 +1150,105 @@ class FlowMatching(JaxMethodBase):
         self._first_update_completed = True
         return metrics
 
+    def update_many(
+        self,
+        replay_iter: Iterator[dict],
+        num_updates: int,
+        replay_buffer: ReplayBuffer = None,
+    ) -> dict[str, np.ndarray]:
+        num_updates = int(num_updates)
+        if num_updates <= 1 or self._uses_replay_priorities(replay_buffer):
+            metrics = {}
+            for _ in range(max(num_updates, 1)):
+                metrics.update(self.update(replay_iter, 0, replay_buffer))
+            return metrics
+
+        obs_inputs_list = []
+        actions = []
+        loss_coeffs = []
+        action_pad_masks = []
+        has_action_pad_mask = None
+        for _ in range(num_updates):
+            batch = next(replay_iter)
+            actions.append(self._as_jax_array(batch["action"], self.jnp.float32))
+            loss_coeffs.append(self._loss_weights(batch))
+            if self._trainable_encoder:
+                obs = self._prepare_trainable_obs_inputs(batch)
+            else:
+                obs, _ = self._prepare_obs_features(batch)
+            obs_inputs_list.append(obs)
+            action_pad_mask = self._extract_action_pad_mask(batch)
+            current_has_mask = action_pad_mask is not None
+            if has_action_pad_mask is None:
+                has_action_pad_mask = current_has_mask
+            elif has_action_pad_mask != current_has_mask:
+                raise ValueError(
+                    "Cannot fuse updates with mixed action_pad_mask presence."
+                )
+            if current_has_mask:
+                action_pad_masks.append(action_pad_mask)
+
+        obs_inputs = self.jax.tree_util.tree_map(
+            lambda *values: self.jnp.stack(values, axis=0),
+            *obs_inputs_list,
+        )
+        actions = self.jnp.stack(actions, axis=0)
+        loss_coeffs = self.jnp.stack(loss_coeffs, axis=0)
+        action_pad_mask = (
+            self.jnp.stack(action_pad_masks, axis=0)
+            if has_action_pad_mask
+            else None
+        )
+
+        start_time = time.perf_counter()
+        (
+            self.params,
+            self.opt_state,
+            self.rng_key,
+            actor_loss,
+            _new_priority,
+            self.ema_params,
+            self._ema_optimization_step,
+        ) = self._update_many_impl(
+            self.params,
+            self.opt_state,
+            self.rng_key,
+            obs_inputs,
+            actions,
+            loss_coeffs,
+            action_pad_mask,
+            self.ema_params,
+            self._ema_optimization_step,
+        )
+        if (
+            self.logging
+            or (self._update_step_count + num_updates) % self._update_block_every_steps
+            == 0
+        ):
+            self._block(actor_loss)
+        elapsed = time.perf_counter() - start_time
+        self._update_step_count += num_updates
+        self._first_update_completed = True
+
+        if not self.logging:
+            return {}
+        metrics = {}
+        self._maybe_log_update_metrics(
+            metrics,
+            actor_loss,
+            self._last_obs_inputs(obs_inputs),
+            elapsed / max(num_updates, 1),
+        )
+        return metrics
+
     def state_dict(self) -> dict:
         state = {"params": self._tree_to_numpy(self.params)}
+        if self.encoder is not None:
+            encoder_frozen_state = self.encoder.frozen_state_dict()
+            if encoder_frozen_state:
+                state["_encoder_frozen_state"] = self._tree_to_numpy(
+                    encoder_frozen_state
+                )
         if self.use_ema and self.ema_params is not None:
             state["_ema_params"] = self._tree_to_numpy(self.ema_params)
             state["_ema_state"] = {
@@ -916,6 +1264,11 @@ class FlowMatching(JaxMethodBase):
 
     def load_state_dict(self, state_dict: dict):
         self.params = self._tree_from_numpy(state_dict["params"])
+        encoder_frozen_state = state_dict.get("_encoder_frozen_state")
+        if self.encoder is not None and encoder_frozen_state is not None:
+            self.encoder.load_frozen_state_dict(
+                self._tree_from_numpy(encoder_frozen_state)
+            )
         if not self.use_ema:
             return
         ema_params = state_dict.get("_ema_params")

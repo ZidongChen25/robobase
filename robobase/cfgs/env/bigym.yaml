@@ -9,6 +9,7 @@ env:
   dataset_root: ""
   demo_down_sample_rate: 20
   render_mode: rgb_array
+  camera_conditioning: none
   enable_all_floating_dof: false
   filter_successful_demos: true
   expected_successful_demos: null

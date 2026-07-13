@@ -28,6 +28,10 @@ min_max_margin: 0.2
 
 update_every_steps: 1
 
+method:
+  actor_model:
+    gripper_dims: 1
+
 replay:
   nstep: 1
 

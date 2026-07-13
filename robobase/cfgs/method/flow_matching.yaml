@@ -14,11 +14,15 @@ method:
   weight_decay: 1.0e-6
   noise_mask_steps: 0
   repeat_action: false
+  horizon_dropout_lengths: null
+  horizon_dropout_probs: null
+  horizon_loss_weights: null
 
   objective:
     type: rectified_flow
     num_flow_steps: ${method.num_flow_steps}
     sampler: euler
+    train_time_schedule: uniform
 
   backbone:
     type: fully_connected
@@ -38,6 +42,10 @@ method:
   encoder_model:
     type: resnet
     model: resnet18
+    pretrained: true
+    use_plucker: false
+    plucker_hidden_channels: 64
+    plucker_identity_init: false
 
   view_fusion_model:
     type: multicam_feature

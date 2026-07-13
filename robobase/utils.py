@@ -33,6 +33,10 @@ from robobase.envs.env import Demo, DemoEnv
 from robobase.replay_buffer.replay_buffer import ReplayBuffer
 
 
+def _is_torch_tensor(value):
+    return _TORCH_AVAILABLE and torch.is_tensor(value)
+
+
 class eval_mode:
     def __init__(self, *models):
         self.models = models
@@ -579,12 +583,12 @@ class DemoMergedIterator:
         ), f"Keys in demo batch are different: {batch.keys()}, {demo_batch.keys()}"
 
     def _ones_like(self, value):
-        if torch.is_tensor(value):
+        if _is_torch_tensor(value):
             return torch.ones_like(value)
         return np.ones_like(value)
 
     def _cat(self, lhs, rhs):
-        if torch.is_tensor(lhs):
+        if _is_torch_tensor(lhs):
             return torch.cat([lhs, rhs], 0)
         return np.concatenate([lhs, rhs], axis=0)
 

@@ -1,6 +1,4 @@
-import shutil
 import signal
-import sys
 import time
 import random
 import gc
@@ -9,10 +7,9 @@ from functools import partial
 import logging
 
 from gymnasium import spaces
-from hydra.core.hydra_config import HydraConfig
 from omegaconf import DictConfig
 
-from robobase.factory import create_agent, method_name_from_cfg
+from robobase.factory import create_agent
 from robobase.envs.env import EnvFactory
 from robobase.logger import Logger
 from robobase.replay_buffer.iterator import (
@@ -121,6 +118,29 @@ def _normalize_demos_count(value):
             return np.inf
         return float(normalized)
     return value
+
+
+def _executed_action_steps(info: dict[str, Any]) -> int:
+    mask = info.get("action_sequence_mask") if isinstance(info, dict) else None
+    if mask is None:
+        return 1
+    return max(1, int(np.asarray(mask, dtype=np.int32).sum()))
+
+
+def _validate_eval_env_counts(cfg: DictConfig) -> None:
+    num_eval_envs = int(cfg.num_eval_envs)
+    num_eval_episodes = int(cfg.num_eval_episodes)
+    if num_eval_episodes < 0:
+        raise ValueError(
+            f"num_eval_episodes must be >= 0, got {num_eval_episodes}."
+        )
+    if num_eval_envs < 0:
+        raise ValueError(f"num_eval_envs must be >= 0, got {num_eval_envs}.")
+    if num_eval_episodes > 0 and num_eval_envs < 1:
+        raise ValueError(
+            "num_eval_envs must be >= 1 when num_eval_episodes > 0, got "
+            f"num_eval_envs={num_eval_envs} and num_eval_episodes={num_eval_episodes}."
+        )
 
 
 def _create_default_replay_buffer(
@@ -260,8 +280,7 @@ class Workspace:
         print(f"workspace: {self.work_dir}")
 
         # Sanity checks
-        if cfg.num_eval_envs < 1:
-            raise ValueError(f"num_eval_envs must be >= 1, got {cfg.num_eval_envs}.")
+        _validate_eval_env_counts(cfg)
         if cfg.execution_length > cfg.action_sequence:
             raise ValueError(
                 "execution_length must be <= action_sequence, got "
@@ -736,21 +755,87 @@ class Workspace:
             extracted[key] = value[env_idx]
         return extracted
 
+    def _executed_vector_action_steps(self, infos: dict[str, Any]) -> np.ndarray:
+        return np.asarray(
+            [
+                _executed_action_steps(
+                    self._extract_vector_env_info(
+                        infos,
+                        env_idx,
+                        prefer_final=True,
+                    )
+                )
+                for env_idx in range(self.eval_envs.num_envs)
+            ],
+            dtype=np.int32,
+        )
+
+    def _eval_seed_for_episode(self, episode: int) -> int | None:
+        env_cfg = self.cfg.get("env", {})
+        eval_seeds = env_cfg.get("eval_seeds", None)
+        if eval_seeds is not None:
+            if len(eval_seeds) == 0:
+                raise ValueError("env.eval_seeds must contain at least one seed.")
+            return int(eval_seeds[int(episode) % len(eval_seeds)])
+        eval_seed_start = env_cfg.get("eval_seed_start", None)
+        if eval_seed_start is None:
+            return None
+        return int(eval_seed_start) + int(episode)
+
+    def _set_agent_active_eval_seeds(self, seeds: list[int] | None) -> None:
+        setter = getattr(self.agent, "set_active_eval_seeds", None)
+        if callable(setter):
+            setter(seeds)
+
+    def _reset_vector_env_slots(
+        self,
+        observation,
+        reset_requests: list[tuple[int, int]],
+    ):
+        envs = getattr(self.eval_envs, "envs", None)
+        if envs is None:
+            raise NotImplementedError(
+                "Per-episode vector evaluation seeds require a vector environment "
+                "that exposes its individual envs."
+            )
+
+        observations = list(
+            gym.vector.utils.iterate(
+                self.eval_envs.single_observation_space,
+                observation,
+            )
+        )
+        # Gymnasium 0.29 autoresets done slots without a seed inside step().
+        # Reset those slots again and replace the observation before the next act().
+        for env_idx, seed in reset_requests:
+            observations[env_idx], _ = envs[env_idx].reset(seed=int(seed))
+
+        out = getattr(self.eval_envs, "observations", None)
+        if out is None:
+            out = gym.vector.utils.create_empty_array(
+                self.eval_envs.single_observation_space,
+                n=self.eval_envs.num_envs,
+            )
+        observation = gym.vector.utils.concatenate(
+            self.eval_envs.single_observation_space,
+            observations,
+            out,
+        )
+        if hasattr(self.eval_envs, "observations"):
+            self.eval_envs.observations = observation
+        return observation
+
     def _run_single_env_eval(self, eval_record_all_episode: bool = False) -> dict[str, Any]:
         step, episode, total_reward, successes = 0, 0, 0, 0
         eval_until_episode = _Until(self.cfg.num_eval_episodes)
         first_rollout = []
         metrics = {}
         while eval_until_episode(episode):
-            reset_seed = None
-            env_cfg = self.cfg.get("env", {})
-            eval_seeds = env_cfg.get("eval_seeds", None)
-            eval_seed_start = env_cfg.get("eval_seed_start", None)
-            if eval_seeds is not None:
-                reset_seed = int(eval_seeds[episode % len(eval_seeds)])
-            elif eval_seed_start is not None:
-                reset_seed = int(eval_seed_start) + episode
+            reset_seed = self._eval_seed_for_episode(episode)
             observation, info = self.eval_env.reset(seed=reset_seed)
+            self._set_agent_active_eval_seeds(
+                None if reset_seed is None else [reset_seed]
+            )
             # eval agent always has last id (ids start from 0)
             self.agent.reset(self.main_loop_iterations, [self._eval_agent_indices[-1]])
             enabled = eval_record_all_episode or episode == 0
@@ -772,8 +857,8 @@ class Workspace:
                     if hasattr(self.eval_env, "give_agent_info"):
                         self.eval_env.give_agent_info(env_metrics["agent_act_info"])
                 self.eval_video_recorder.record(self.eval_env)
-                total_reward += reward
-                step += 1
+                total_reward += float(np.asarray(reward).item())
+                step += _executed_action_steps(next_info)
             if episode == 0:
                 first_rollout = np.array(self.eval_video_recorder.frames)
             self.eval_video_recorder.save(f"{self.global_env_steps}.mp4")
@@ -785,8 +870,8 @@ class Workspace:
             episode += 1
         metrics.update(
             {
-                "episode_reward": total_reward / episode,
-                "episode_length": step * self.cfg.action_repeat / episode,
+                "episode_reward": float(total_reward / episode),
+                "episode_length": float(step * self.cfg.action_repeat / episode),
             }
         )
         if successes is not None:
@@ -797,7 +882,29 @@ class Workspace:
 
     def _run_vector_env_eval(self, eval_record_all_episode: bool = False) -> dict[str, Any]:
         del eval_record_all_episode
-        observation, _ = self.eval_envs.reset()
+        active_eval_seeds = [
+            self._eval_seed_for_episode(episode)
+            for episode in range(self.eval_envs.num_envs)
+        ]
+        use_fixed_eval_seeds = active_eval_seeds[0] is not None
+        if use_fixed_eval_seeds:
+            assert all(seed is not None for seed in active_eval_seeds)
+            observation, _ = self.eval_envs.reset(seed=active_eval_seeds)
+            self._set_agent_active_eval_seeds(active_eval_seeds)
+        else:
+            observation, _ = self.eval_envs.reset()
+            self._set_agent_active_eval_seeds(None)
+        active_episode_is_target = np.arange(self.eval_envs.num_envs) < int(
+            self.cfg.num_eval_episodes
+        )
+        next_target_episode = min(
+            self.eval_envs.num_envs,
+            int(self.cfg.num_eval_episodes),
+        )
+        next_filler_episode = max(
+            self.eval_envs.num_envs,
+            int(self.cfg.num_eval_episodes),
+        )
         self.agent.reset(self.main_loop_iterations, self._eval_agent_indices)
 
         completed_rewards = []
@@ -816,10 +923,9 @@ class Workspace:
                 (next_observation, reward, termination, truncation, next_info),
                 env_metrics,
             ) = self._perform_env_steps(observation, self.eval_envs, True)
-            observation = next_observation
             metrics.update(env_metrics)
             episode_rewards += reward
-            episode_lengths += 1
+            episode_lengths += self._executed_vector_action_steps(next_info)
 
             if not video_complete:
                 self.eval_video_recorder.record(self.eval_envs)
@@ -829,6 +935,7 @@ class Workspace:
                 video_complete = True
 
             if not np.any(done_mask):
+                observation = next_observation
                 continue
 
             done_env_indices = np.flatnonzero(done_mask)
@@ -837,7 +944,7 @@ class Workspace:
                 [self._eval_agent_indices[idx] for idx in done_env_indices],
             )
             for env_idx in done_env_indices:
-                if len(completed_rewards) < self.cfg.num_eval_episodes:
+                if active_episode_is_target[env_idx]:
                     completed_rewards.append(float(episode_rewards[env_idx]))
                     completed_lengths.append(int(episode_lengths[env_idx]))
                     info = self._extract_vector_env_info(
@@ -850,8 +957,36 @@ class Workspace:
                             completed_successes = []
                         else:
                             completed_successes.append(int(np.asarray(success).astype(int).item()))
+                active_episode_is_target[env_idx] = False
                 episode_rewards[env_idx] = 0.0
                 episode_lengths[env_idx] = 0
+
+            needs_another_step = (
+                len(completed_rewards) < self.cfg.num_eval_episodes
+                or not video_complete
+            )
+            if needs_another_step:
+                reset_requests = []
+                for env_idx in done_env_indices:
+                    if next_target_episode < self.cfg.num_eval_episodes:
+                        next_episode = next_target_episode
+                        next_target_episode += 1
+                        active_episode_is_target[env_idx] = True
+                    else:
+                        next_episode = next_filler_episode
+                        next_filler_episode += 1
+                    if use_fixed_eval_seeds:
+                        next_seed = self._eval_seed_for_episode(next_episode)
+                        assert next_seed is not None
+                        active_eval_seeds[env_idx] = next_seed
+                        reset_requests.append((int(env_idx), next_seed))
+                if use_fixed_eval_seeds:
+                    next_observation = self._reset_vector_env_slots(
+                        next_observation,
+                        reset_requests,
+                    )
+                    self._set_agent_active_eval_seeds(active_eval_seeds)
+            observation = next_observation
 
         if self.cfg.log_eval_video and len(self.eval_video_recorder.frames) > 0:
             self.eval_video_recorder.save(f"{self.global_env_steps}.mp4")
@@ -872,8 +1007,15 @@ class Workspace:
     def _eval(self, eval_record_all_episode: bool = False) -> dict[str, Any]:
         # TODO: In future, this func could do with a further refactor
         self._ensure_eval_envs_created()
-        if self.eval_env is None:
+        if self.eval_env is None and self.eval_envs is None:
             raise ValueError("Evaluation requested but no evaluation environment is configured.")
+        reset_aligned_eval_noise = getattr(
+            self.agent,
+            "reset_aligned_eval_noise",
+            None,
+        )
+        if callable(reset_aligned_eval_noise):
+            reset_aligned_eval_noise()
         self.agent.set_eval_env_running(True)
         try:
             if self.eval_envs is not None:
@@ -884,6 +1026,7 @@ class Workspace:
                 eval_record_all_episode=eval_record_all_episode
             )
         finally:
+            self._set_agent_active_eval_seeds(None)
             self.agent.set_eval_env_running(False)
             if self._defer_live_eval_env_creation:
                 self._close_eval_envs()
@@ -1354,10 +1497,18 @@ class Workspace:
     def _ensure_eval_envs_created(self):
         if self.cfg.num_eval_episodes <= 0:
             return
-        if self.eval_env is None:
-            self.eval_env = self.env_factory.make_eval_env(self.cfg)
-        if self.cfg.num_eval_envs > 1 and self.eval_envs is None:
-            self.eval_envs = self.env_factory.make_eval_envs(self.cfg)
+        if self.cfg.num_eval_envs > 1:
+            if self.eval_env is not None:
+                self.eval_env.close()
+                self.eval_env = None
+            if self.eval_envs is None:
+                self.eval_envs = self.env_factory.make_eval_envs(self.cfg)
+        else:
+            if self.eval_envs is not None:
+                self.eval_envs.close()
+                self.eval_envs = None
+            if self.eval_env is None:
+                self.eval_env = self.env_factory.make_eval_env(self.cfg)
 
     def _close_eval_envs(self):
         if self.eval_envs is not None:

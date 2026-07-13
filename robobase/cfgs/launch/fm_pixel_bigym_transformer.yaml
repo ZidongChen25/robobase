@@ -46,6 +46,7 @@ log_eval_video: false
 
 env:
   cameras: ["head", "left_wrist", "right_wrist"]
+  camera_conditioning: ${method.encoder_model.use_plucker}
   demo_alignment: reference_post_action
   eval_seed_start: 0
   episode_length_is_env_steps: true
@@ -64,7 +65,6 @@ replay:
   cache_frozen_image_features: false
 
 lazy_replay:
-  use: true
   # Cached BiGym pixel demos used here are reset-aligned: obs[i] is the
   # observation before action[i]. Keep replay on the same s_t -> a_t pairing
   # used at live evaluation reset/step time.
