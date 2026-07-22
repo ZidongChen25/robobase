@@ -1,0 +1,60 @@
+# @package _global_
+
+# Reproduces the state-based Cartpole Swingup Sparse experiment from Figure 9
+# of "Continuous Control with Coarse-to-fine Reinforcement Learning".
+defaults:
+  - ../env: dmc/cartpole_swingup_sparse
+  - ../method: cqn
+
+pixels: false
+frame_stack: 1
+action_repeat: 1
+action_sequence: 1
+execution_length: 1
+
+# Figure 9 reports 500k environment steps and averages four runs.  This launch
+# is one paper seed; repeat with seed=2,3,4 for the full aggregate.
+seed: 1
+num_train_frames: 500000
+num_explore_steps: 2000
+replay_size_before_train: 4000
+batch_size: 256
+update_every_steps: 1
+
+num_eval_episodes: 10
+eval_every_steps: 10000
+env:
+  eval_seed_start: 10000
+
+replay:
+  nstep: 3
+  size: 1000000
+  num_workers: 4
+
+method:
+  levels: 3
+  bins: 5
+  atoms: 51
+  v_min: 0.0
+  v_max: 200.0
+  use_dueling: false
+  stddev_schedule: "0.1"
+  critic_lr: 1e-4
+  critic_target_tau: 0.02
+  weight_decay: 0.0
+
+save_snapshot: true
+snapshot_every_n: 10000
+snapshot_save_start_step: 10000
+save_csv: true
+log_every: 1000
+log_train_video: false
+log_eval_video: false
+wandb:
+  use: false
+tb:
+  use: false
+
+hydra:
+  run:
+    dir: ./exp_local/cqn_paper_cartpole_swingup_sparse_seed${seed}_${now:%Y%m%d%H%M%S}

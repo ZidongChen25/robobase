@@ -14,7 +14,7 @@ from omegaconf import DictConfig
 
 from robobase.method.bc_runtime import bc_actor_input_shapes, bc_observation_layout
 from robobase.method.jax_base import JaxMethodBase
-from robobase.models.encoder import JaxResNetEncoder
+from robobase.models.encoder import JaxCQNEncoder, JaxResNetEncoder
 from robobase.models.fully_connected import JaxMLPWithSequenceOutput
 from robobase.models.fusion import JaxFusionMultiCamFeature
 from robobase.replay_buffer.replay_buffer import ReplayBuffer
@@ -203,7 +203,7 @@ def bc_spec_from_cfg(cfg: DictConfig) -> BCSpec:
 @dataclass(frozen=True)
 class _BuiltBCModel:
     actor_model: JaxMLPWithSequenceOutput
-    encoder_model: JaxResNetEncoder | None
+    encoder_model: JaxCQNEncoder | JaxResNetEncoder | None
     view_fusion_model: JaxFusionMultiCamFeature | None
 
 
@@ -213,6 +213,7 @@ def _build_model(
     observation_space: spaces.Dict,
     action_space: spaces.Box,
     encoder_jit: bool,
+    encoder_seed: int = 0,
 ) -> tuple[_BuiltBCModel, int]:
     obs_layout = bc_observation_layout(observation_space)
     actor_spec = model_spec.actor_model
@@ -236,7 +237,7 @@ def _build_model(
     if obs_layout.use_pixels:
         if model_spec.encoder_model is None:
             raise ValueError("Pixel BC requires encoder_model in the model spec.")
-        if model_spec.encoder_model.type != "resnet":
+        if model_spec.encoder_model.type not in {"resnet", "cqn"}:
             raise NotImplementedError(
                 f"Unsupported BC encoder model type '{model_spec.encoder_model.type}'."
             )
@@ -253,15 +254,26 @@ def _build_model(
                     "BC encoder_model.use_plucker=true requires raymap or camera "
                     "parameter observations paired with every RGB observation."
                 )
-        encoder_model = JaxResNetEncoder(
-            input_shape=obs_layout.rgb_input_shape,
-            model=model_spec.encoder_model.model,
-            jit=encoder_jit,
-            pretrained=model_spec.encoder_model.pretrained,
-            use_plucker=model_spec.encoder_model.use_plucker,
-            plucker_hidden_channels=model_spec.encoder_model.plucker_hidden_channels,
-            plucker_identity_init=model_spec.encoder_model.plucker_identity_init,
-        )
+        if model_spec.encoder_model.type == "cqn":
+            if model_spec.encoder_model.pretrained:
+                raise ValueError("encoder type 'cqn' requires pretrained=false.")
+            if model_spec.encoder_model.use_plucker:
+                raise ValueError("encoder type 'cqn' does not support Plucker inputs.")
+            encoder_model = JaxCQNEncoder(
+                input_shape=obs_layout.rgb_input_shape,
+                jit=encoder_jit,
+                seed=encoder_seed,
+            )
+        else:
+            encoder_model = JaxResNetEncoder(
+                input_shape=obs_layout.rgb_input_shape,
+                model=model_spec.encoder_model.model,
+                jit=encoder_jit,
+                pretrained=model_spec.encoder_model.pretrained,
+                use_plucker=model_spec.encoder_model.use_plucker,
+                plucker_hidden_channels=model_spec.encoder_model.plucker_hidden_channels,
+                plucker_identity_init=model_spec.encoder_model.plucker_identity_init,
+            )
         if obs_layout.use_multicam_fusion:
             if model_spec.view_fusion_model is None:
                 raise ValueError(
@@ -276,7 +288,7 @@ def _build_model(
                 input_shape=encoder_model.output_shape,
                 mode=model_spec.view_fusion_model.mode,
             )
-    elif model_spec.encoder_model is not None and model_spec.encoder_model.type != "resnet":
+    elif model_spec.encoder_model is not None and model_spec.encoder_model.type not in {"resnet", "cqn"}:
         raise NotImplementedError(
             f"Unsupported BC encoder model type '{model_spec.encoder_model.type}'."
         )
@@ -368,6 +380,7 @@ class BC(JaxMethodBase):
             observation_space=observation_space,
             action_space=action_space,
             encoder_jit=jit,
+            encoder_seed=seed,
         )
         self.actor_model = built_model.actor_model
         self.encoder = built_model.encoder_model

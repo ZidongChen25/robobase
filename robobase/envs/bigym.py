@@ -308,27 +308,22 @@ class BiGymEnvFactory(EnvFactory):
             env = FrameStack(env, cfg.frame_stack)
         env = TimeLimit(env, episode_limit_steps)
 
+
         if not demo_env:
-            if not train:
-                if int(cfg.execution_length) == int(cfg.action_sequence):
-                    env = ActionSequence(
-                        env,
-                        cfg.action_sequence,
-                    )
-                else:
-                    env = RecedingHorizonControl(
-                        env,
-                        cfg.action_sequence,
-                        episode_limit_steps,
-                        cfg.execution_length,
-                        temporal_ensemble=cfg.temporal_ensemble,
-                        gain=cfg.temporal_ensemble_gain,
-                        execution_start=cfg.get("action_execution_start", 0),
-                    )
-            else:
+            if int(cfg.execution_length) == int(cfg.action_sequence):
                 env = ActionSequence(
                     env,
                     cfg.action_sequence,
+                )
+            else:
+                env = RecedingHorizonControl(
+                    env,
+                    cfg.action_sequence,
+                    episode_limit_steps,
+                    cfg.execution_length,
+                    temporal_ensemble=cfg.temporal_ensemble,
+                    gain=cfg.temporal_ensemble_gain,
+                    execution_start=cfg.get("action_execution_start", 0),
                 )
 
         env = AppendDemoInfo(env)

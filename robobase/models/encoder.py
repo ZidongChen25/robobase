@@ -24,6 +24,109 @@ _DEFAULT_RESNET18_JAX_NPZ = (
 )
 
 
+class _CQNMultiViewCNN(nn.Module):
+    """Paper CQN-AS encoder: one independent 4-layer CNN per camera."""
+
+    num_views: int
+
+    @nn.compact
+    def __call__(self, rgb_obs: jax.Array) -> jax.Array:
+        x = rgb_obs.astype(jnp.float32) / 255.0 - 0.5
+        outputs = []
+        conv_init = nn.initializers.orthogonal(np.sqrt(2.0))
+        for view in range(self.num_views):
+            y = jnp.transpose(x[:, view], (0, 2, 3, 1))
+            for layer, channels in enumerate((32, 64, 128, 256)):
+                y = nn.Conv(
+                    channels,
+                    kernel_size=(4, 4),
+                    strides=(2, 2),
+                    padding=((1, 1), (1, 1)),
+                    kernel_init=conv_init,
+                    bias_init=nn.initializers.zeros_init(),
+                    name=f"view_{view}_conv_{layer}",
+                )(y)
+                # This is ImgChLayerNorm from the reference implementation:
+                # normalize channels independently at every spatial location.
+                y = nn.LayerNorm(name=f"view_{view}_norm_{layer}")(y)
+                y = nn.silu(y)
+            outputs.append(y.reshape((y.shape[0], -1)))
+        return jnp.stack(outputs, axis=1)
+
+
+class JaxCQNEncoder:
+    """Trainable adapter for the exact vision backbone used by CQN-AS."""
+
+    def __init__(
+        self,
+        input_shape: tuple[int, int, int, int],
+        *,
+        jit: bool = True,
+        seed: int = 0,
+        **unused,
+    ):
+        del unused
+        if len(input_shape) != 4:
+            raise ValueError(f"CQN RGB input must be [views, channels, H, W], got {input_shape}.")
+        self._input_shape = tuple(int(value) for value in input_shape)
+        self._model = _CQNMultiViewCNN(num_views=self._input_shape[0])
+        dummy = jnp.zeros((1, *self._input_shape), dtype=jnp.float32)
+        self._variables = self._model.init(jax.random.PRNGKey(int(seed)), dummy)
+        output = self._model.apply(self._variables, dummy)
+        self._output_shape = tuple(int(value) for value in output.shape[1:])
+        self._jit = bool(jit)
+        self._encode = jax.jit(self._encode_impl) if self._jit else self._encode_impl
+
+    @property
+    def output_shape(self) -> tuple[int, int]:
+        return self._output_shape
+
+    @property
+    def trainable_params(self):
+        return self._variables["params"]
+
+    @property
+    def batch_stats(self):
+        return None
+
+    def frozen_state_dict(self) -> dict:
+        return {}
+
+    def load_frozen_state_dict(self, state_dict) -> None:
+        del state_dict
+
+    def _encode_impl(self, rgb_obs, *, params=None, stop_gradient=True):
+        variables = self._variables if params is None else {"params": params}
+        features = self._model.apply(variables, rgb_obs)
+        return jax.lax.stop_gradient(features) if stop_gradient else features
+
+    def encode(
+        self,
+        rgb_obs,
+        raymap_obs=None,
+        camera_intrinsic_obs=None,
+        camera_c2w_obs=None,
+    ):
+        del raymap_obs, camera_intrinsic_obs, camera_c2w_obs
+        return self._encode(jnp.asarray(rgb_obs, dtype=jnp.float32))
+
+    def apply_trainable(
+        self,
+        params,
+        rgb_obs,
+        raymap_obs=None,
+        camera_intrinsic_obs=None,
+        camera_c2w_obs=None,
+        task_emb=None,
+    ):
+        del raymap_obs, camera_intrinsic_obs, camera_c2w_obs, task_emb
+        return self._encode_impl(
+            jnp.asarray(rgb_obs, dtype=jnp.float32),
+            params=params,
+            stop_gradient=False,
+        )
+
+
 def _pretrained_resnet_candidates(model_name: str) -> list[Path]:
     env_name = f"ROBOBASE_{model_name.upper()}_JAX_NPZ"
     candidates = []

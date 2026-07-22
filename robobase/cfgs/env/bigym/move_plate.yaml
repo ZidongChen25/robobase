@@ -7,7 +7,10 @@ defaults:
 env:
   task_name: move_plate
   stddev_schedule: linear(1.0,0.1,500000)
-  episode_length: 4000
+  episode_length: 3000
   demo_down_sample_rate: 10
   enable_all_floating_dof: false
   expected_successful_demos: 51
+  # Paper setup retains all 60 trajectories in replay and only the 51
+  # successful trajectories in the protected demonstration replay.
+  filter_successful_demos: false

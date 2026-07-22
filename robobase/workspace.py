@@ -9,7 +9,7 @@ import logging
 from gymnasium import spaces
 from omegaconf import DictConfig
 
-from robobase.factory import create_agent
+from robobase.factory import create_agent, method_name_from_cfg
 from robobase.envs.env import EnvFactory
 from robobase.logger import Logger
 from robobase.replay_buffer.iterator import (
@@ -259,6 +259,19 @@ def _create_default_envs(cfg: DictConfig) -> EnvFactory:
     return factory
 
 
+def _validate_rl_action_sequence(cfg: DictConfig) -> None:
+    """Allow action chunks only for RL methods that implement them."""
+
+    if (
+        cfg.method.is_rl
+        and cfg.action_sequence != 1
+        and method_name_from_cfg(cfg) != "cqn_as"
+    ):
+        raise ValueError(
+            "Action sequence > 1 is only supported for the CQN-AS RL method"
+        )
+
+
 class Workspace:
     def __init__(
         self,
@@ -325,8 +338,7 @@ class Workspace:
                 f"must be >= episode_length ({cfg.env.episode_length})."
             )
 
-        if cfg.method.is_rl and cfg.action_sequence != 1:
-            raise ValueError("Action sequence > 1 is not supported for RL methods")
+        _validate_rl_action_sequence(cfg)
         if cfg.method.is_rl and cfg.execution_length != 1:
             raise ValueError("execution_length > 1 is not supported for RL methods")
         if not cfg.method.is_rl and cfg.replay.nstep != 1:
@@ -496,7 +508,7 @@ class Workspace:
             main_loop_iterations
             * self.cfg.action_repeat
             * self.train_envs.num_envs
-            * self.cfg.action_sequence
+            * self.cfg.execution_length
             + pretrain_steps
         )
 
