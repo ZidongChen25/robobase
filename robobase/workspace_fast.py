@@ -8,8 +8,12 @@ relative to :class:`robobase.workspace.Workspace` (untouched):
 
 A'. **Device-side demo merge** -- both batches are ``device_put`` and
     concatenated on the accelerator instead of the host.  Bit-identical
-    values (concatenation is exact, same layout), removes the largest
-    GIL-serialized memcopy from the main thread.
+    values (concatenation is exact, same layout), removes a ~130MB/update
+    GIL-serialized host memcopy from the prefetch thread.  Injected via
+    the ``_make_merged_replay_iter`` hook so it lands inside the prefetch
+    wrapper (the original property-override injection was dead code under
+    ``backend.replay_prefetch_size > 0``; cqn-flow.md 48.1).  Rollback:
+    ``ROBOBASE_HOST_MERGE=1``.
 
 B.  **Async dispatch** -- ``backend.update_block_every_steps`` defaults
     to 10 (numerically identical with uniform replay; metric fetches
@@ -18,9 +22,11 @@ B.  **Async dispatch** -- ``backend.update_block_every_steps`` defaults
 C.  **No wandb, no eval videos** -- both forced off.
 """
 
+import os
+
 from omegaconf import open_dict
 
-from robobase.workspace import Workspace, _DemoMergedIterator
+from robobase.workspace import Workspace
 
 
 class _DeviceMergedIterator:
@@ -75,13 +81,13 @@ class WorkspaceFast(Workspace):
                 cfg.backend.update_block_every_steps = 10
         super().__init__(cfg)
 
-    @property
-    def replay_iter(self):
-        if self._replay_iter is None:
-            base_iterator = Workspace.replay_iter.fget(self)
-            if isinstance(base_iterator, _DemoMergedIterator):
-                self._replay_iter = _DeviceMergedIterator(
-                    base_iterator.replay_iter,
-                    base_iterator.demo_replay_iter,
-                )
-        return self._replay_iter
+    def _make_merged_replay_iter(self, replay_iter, demo_replay_iter):
+        # Hook runs before the prefetch wrapper is added, so the device-side
+        # concat executes inside the prefetch thread. The old implementation
+        # overrode the replay_iter property and isinstance-checked the
+        # parent's return value, which is the PrefetchReplayBatchIterator
+        # whenever backend.replay_prefetch_size > 0 — the device merge was
+        # dead code under the default jax backend (cqn-flow.md 48.1).
+        if os.environ.get("ROBOBASE_HOST_MERGE", "") == "1":
+            return super()._make_merged_replay_iter(replay_iter, demo_replay_iter)
+        return _DeviceMergedIterator(replay_iter, demo_replay_iter)

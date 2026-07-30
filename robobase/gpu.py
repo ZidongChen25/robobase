@@ -18,6 +18,15 @@ def _visible_gpu_ids() -> list[int]:
 
 
 def apply_requested_gpu(cfg: DictConfig):
+    # Opt-in bound on the XLA preallocation pool (default is 75% of the
+    # card). E.g. xla_mem_fraction=0.45 lets two runs share one GPU with a
+    # hard slice each, so neither can OOM the other mid-run. setdefault:
+    # an externally exported XLA_PYTHON_CLIENT_MEM_FRACTION still wins.
+    mem_fraction = cfg.get("xla_mem_fraction", None)
+    if mem_fraction is not None:
+        os.environ.setdefault(
+            "XLA_PYTHON_CLIENT_MEM_FRACTION", str(float(mem_fraction))
+        )
     requested_gpu = cfg.get("gpu_id", None)
     selected_gpu = None
     if requested_gpu is not None:

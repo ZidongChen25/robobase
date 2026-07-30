@@ -276,6 +276,47 @@ def project_categorical(
     return projected.reshape((batch, levels, action_dim, atoms))
 
 
+def unseen_return_floor_loss(
+    all_logits: jax.Array,
+    discrete_action: jax.Array,
+    support: jax.Array,
+    floor_value: float,
+) -> tuple[jax.Array, jax.Array]:
+    """Regress only replay-unseen bins to a valid minimum return.
+
+    ``all_logits`` is ``[B, L, D, bins, atoms]`` and ``discrete_action`` is
+    ``[B, L, D]``.  The replayed bin is explicitly masked out: it is trained
+    only by the Bellman/return objective.  This is the squared conservative-Q
+    regularizer used by Q-Transformer, adapted to CQN's C51 expected values;
+    it is not an action likelihood, classification, or margin loss.
+    """
+
+    all_probabilities = jax.nn.softmax(all_logits, axis=-1)
+    all_q = jnp.sum(all_probabilities * support, axis=-1)
+    chosen_mask = jax.nn.one_hot(
+        discrete_action,
+        all_logits.shape[-2],
+        dtype=all_q.dtype,
+    )
+    unseen_mask = 1.0 - chosen_mask
+    reduce_axes = tuple(range(1, unseen_mask.ndim))
+    unseen_count = jnp.maximum(
+        jnp.sum(unseen_mask, axis=reduce_axes),
+        1.0,
+    )
+    per_sample_loss = (
+        jnp.sum(
+            jnp.square(all_q - float(floor_value)) * unseen_mask,
+            axis=reduce_axes,
+        )
+        / unseen_count
+    )
+    per_sample_unseen_q = (
+        jnp.sum(all_q * unseen_mask, axis=reduce_axes) / unseen_count
+    )
+    return per_sample_loss, per_sample_unseen_q
+
+
 class CQN(JaxRLMethodBase, OffPolicyMethod):
     """RoboBase coarse-to-fine distributional Q-learning for Box actions."""
 
@@ -516,6 +557,13 @@ class CQN(JaxRLMethodBase, OffPolicyMethod):
         optimizer = self.optimizer
         tau = self.critic_target_tau
         use_canonical_mc = bool(getattr(self, "_canonical_mc_anchor", False))
+        return_floor_weight = float(
+            getattr(self, "unseen_return_floor_weight", 0.0)
+        )
+        use_return_floor = return_floor_weight > 0.0
+        return_floor_value = float(
+            getattr(self, "unseen_return_floor_value", 0.0)
+        )
         use_bc_schedule = (
             getattr(self, "bc_lambda_schedule", None) is not None
         )
@@ -594,6 +642,42 @@ class CQN(JaxRLMethodBase, OffPolicyMethod):
                 critic_loss = self.critic_lambda * jnp.mean(
                     per_sample * loss_weights
                 )
+
+                return_floor_loss = jnp.asarray(0.0, dtype=jnp.float32)
+                unseen_q_mean = jnp.asarray(0.0, dtype=jnp.float32)
+                chosen_q_mean = jnp.asarray(0.0, dtype=jnp.float32)
+                if use_return_floor:
+                    flat_actions = actions.reshape((actions.shape[0], -1))
+                    discrete_action = encode_action(
+                        flat_actions,
+                        self.action_low,
+                        self.action_high,
+                        self.levels,
+                        self.bins,
+                    )
+                    # CQN-AS can train only the actually executed k=0 token.
+                    discrete_action = discrete_action[
+                        :, :, : all_logits.shape[2]
+                    ]
+                    floor_per_sample, unseen_q_per_sample = (
+                        unseen_return_floor_loss(
+                            all_logits,
+                            discrete_action,
+                            self.support,
+                            return_floor_value,
+                        )
+                    )
+                    return_floor_loss = return_floor_weight * jnp.mean(
+                        floor_per_sample * loss_weights
+                    )
+                    critic_loss = critic_loss + return_floor_loss
+                    unseen_q_mean = jnp.mean(unseen_q_per_sample)
+                    chosen_q_mean = jnp.mean(
+                        jnp.sum(
+                            chosen_probabilities * self.support,
+                            axis=-1,
+                        )
+                    )
 
                 if self.bc_lambda > 0.0 or use_bc_schedule:
                     demo_count = jnp.maximum(jnp.sum(demos), 1.0)
@@ -752,6 +836,9 @@ class CQN(JaxRLMethodBase, OffPolicyMethod):
                     per_sample,
                     entropy,
                     target_entropy,
+                    return_floor_loss,
+                    unseen_q_mean,
+                    chosen_q_mean,
                     mc_return_loss,
                     mc_return_mae,
                     coarse_flow_loss,
@@ -772,6 +859,9 @@ class CQN(JaxRLMethodBase, OffPolicyMethod):
                 per_sample,
                 entropy,
                 projected_entropy,
+                return_floor_loss,
+                unseen_q_mean,
+                chosen_q_mean,
                 mc_return_loss,
                 mc_return_mae,
                 coarse_flow_loss,
@@ -787,6 +877,13 @@ class CQN(JaxRLMethodBase, OffPolicyMethod):
             if use_canonical_mc:
                 metrics["mc_return_loss"] = mc_return_loss
                 metrics["mc_return_mae"] = mc_return_mae
+            if use_return_floor:
+                metrics["unseen_return_floor_loss"] = return_floor_loss
+                metrics["unseen_q_mean"] = unseen_q_mean
+                metrics["chosen_q_mean"] = chosen_q_mean
+                metrics["chosen_unseen_q_gap"] = (
+                    chosen_q_mean - unseen_q_mean
+                )
             if use_coarse_flow:
                 metrics["coarse_flow_loss"] = coarse_flow_loss
             return (

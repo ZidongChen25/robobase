@@ -13,6 +13,7 @@ from omegaconf import OmegaConf
 
 from robobase.envs.wrappers import RecedingHorizonControl
 from robobase.factory import create_agent
+from robobase.method.cqn import unseen_return_floor_loss
 from robobase.method.cqn_as import C2FSequenceDistributionalCritic
 from robobase.models.encoder import JaxCQNEncoder
 from robobase.replay_buffer.vision_feature_cache import JAX_CQN_AS_FEATURE_KEY
@@ -1343,6 +1344,167 @@ def test_cqn_as_canonical_without_mc_keeps_legacy_metrics():
     agent.logging = True
     metrics = agent.update(iter([_batch()]), step=1)
     assert "mc_return_loss" not in metrics
+
+
+def _strict_demo_rl_cfg(*overrides):
+    return _compose_cqn_as(
+        "num_pretrain_steps=0",
+        "is_imitation_learning=false",
+        "use_self_imitation=false",
+        "method.strict_demo_rl_only=true",
+        "method.bc_lambda=0",
+        "method.bc_lambda_schedule=null",
+        "method.bc_margin=0",
+        "method.demo_fosd=false",
+        "method.separate_bc_policy=false",
+        "method.unseen_return_floor_weight=1.0",
+        "method.unseen_return_floor_value=0.0",
+        *overrides,
+    )
+
+
+def test_unseen_return_floor_has_no_gradient_on_replayed_bin():
+    support = jnp.asarray([-1.0, 0.0, 1.0], dtype=jnp.float32)
+    logits = jnp.asarray(
+        [[[[[0.0, 0.0, 4.0], [0.0, 0.0, 3.0], [3.0, 0.0, 0.0]]]]],
+        dtype=jnp.float32,
+    )
+    replayed_bin = jnp.asarray([[[0]]], dtype=jnp.int32)
+
+    def objective(value):
+        per_sample, _ = unseen_return_floor_loss(
+            value,
+            replayed_bin,
+            support,
+            0.0,
+        )
+        return per_sample.mean()
+
+    grads = jax.grad(objective)(logits)
+    np.testing.assert_array_equal(np.asarray(grads[0, 0, 0, 0]), 0.0)
+    assert np.linalg.norm(np.asarray(grads[0, 0, 0, 1:])) > 0.0
+
+
+def test_unseen_return_floor_cannot_clone_actions_without_return_signal():
+    support = jnp.asarray([-1.0, 0.0, 1.0], dtype=jnp.float32)
+    logits = jnp.zeros((1, 1, 1, 5, 3), dtype=jnp.float32)
+
+    losses = []
+    gradients = []
+    for replayed_bin in range(5):
+        bins = jnp.asarray([[[replayed_bin]]], dtype=jnp.int32)
+
+        def objective(value):
+            per_sample, _ = unseen_return_floor_loss(
+                value,
+                bins,
+                support,
+                0.0,
+            )
+            return per_sample.mean()
+
+        losses.append(float(objective(logits)))
+        gradients.append(np.asarray(jax.grad(objective)(logits)))
+
+    np.testing.assert_array_equal(losses, np.zeros(5))
+    np.testing.assert_array_equal(gradients, np.zeros_like(gradients))
+
+
+def test_cqn_as_strict_demo_rl_ignores_demo_identity_and_has_no_policy():
+    observation_space, action_space = _spaces()
+    cfg = _strict_demo_rl_cfg("method.weight_decay=0.0")
+    demo_agent = create_agent(
+        cfg,
+        observation_space=observation_space,
+        action_space=action_space,
+    )
+    online_agent = create_agent(
+        cfg,
+        observation_space=observation_space,
+        action_space=action_space,
+    )
+    assert "policy" not in demo_agent.params
+    assert "flow_policy" not in demo_agent.params
+
+    demo_batch = _batch()
+    online_batch = {
+        key: np.array(value, copy=True) for key, value in demo_batch.items()
+    }
+    online_batch["demo"][:] = 0
+    demo_agent.logging = True
+    online_agent.logging = True
+    demo_metrics = demo_agent.update(iter([demo_batch]), step=1)
+    online_metrics = online_agent.update(iter([online_batch]), step=1)
+
+    demo_leaves, demo_tree = jax.tree.flatten(demo_agent.params)
+    online_leaves, online_tree = jax.tree.flatten(online_agent.params)
+    assert demo_tree == online_tree
+    for demo_value, online_value in zip(
+        demo_leaves,
+        online_leaves,
+        strict=True,
+    ):
+        np.testing.assert_array_equal(demo_value, online_value)
+    assert demo_metrics["unseen_return_floor_loss"] >= 0.0
+    demo_metrics.pop("backend/update_time_sec")
+    online_metrics.pop("backend/update_time_sec")
+    assert demo_metrics == pytest.approx(online_metrics)
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        "method.bc_lambda=1.0",
+        "method.bc_margin=0.1",
+        "method.demo_fosd=true",
+        "method.separate_bc_policy=true",
+        "method.flow_policy=true",
+        "num_pretrain_steps=1",
+        "use_self_imitation=true",
+    ],
+)
+def test_cqn_as_strict_demo_rl_rejects_imitation_paths(override):
+    with pytest.raises(ValueError, match="strict_demo_rl_only"):
+        create_agent(
+            _strict_demo_rl_cfg(override),
+            observation_space=_spaces()[0],
+            action_space=_spaces()[1],
+        )
+
+
+def test_cqn_as_no_bc_stage1_launches_are_strict_and_matched():
+    configs = []
+    for launch in (
+        "cqn_as_pixel_bigym_nobc_td_gate",
+        "cqn_as_pixel_bigym_nobc_floor_gate",
+    ):
+        GlobalHydra.instance().clear()
+        with initialize_config_dir(config_dir=CONFIG_DIR, version_base=None):
+            configs.append(
+                compose(
+                    config_name="robobase_config",
+                    overrides=[
+                        f"launch={launch}",
+                        "env=bigym/move_plate",
+                    ],
+                )
+            )
+
+    control, treatment = configs
+    assert control.method.strict_demo_rl_only
+    assert treatment.method.strict_demo_rl_only
+    assert control.num_pretrain_steps == treatment.num_pretrain_steps == 0
+    assert not control.use_self_imitation
+    assert not treatment.use_self_imitation
+    assert control.method.critic_lambda == treatment.method.critic_lambda == 1.0
+    assert control.method.bc_lambda == treatment.method.bc_lambda == 0.0
+    assert control.method.bc_margin == treatment.method.bc_margin == 0.0
+    assert not control.method.demo_fosd
+    assert not treatment.method.demo_fosd
+    assert control.method.unseen_return_floor_weight == 0.0
+    assert treatment.method.unseen_return_floor_weight == 1.0
+    assert control.num_eval_episodes == treatment.num_eval_episodes == 0
+    assert control.snapshot_every_n == treatment.snapshot_every_n == 2500
 
 
 def test_cqn_as_stage147_gate_composes_clean_plus_anchor():

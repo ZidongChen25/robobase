@@ -69,6 +69,15 @@ method:
   # Canonical CQN-AS uses both FOSD and expected-Q large-margin imitation.
   # Disable only for a margin-matched comparison against scalar flow critics.
   demo_fosd: true
+  # Audit guard for demo-driven RL experiments with no imitation path. When
+  # true, config composition rejects BC/FOSD/margin, policy/flow heads,
+  # pretraining, self-imitation, and behavior-policy TD targets.
+  strict_demo_rl_only: false
+  # Q-Transformer-style conservative RL term. The replayed action bin is
+  # excluded and remains Bellman/return-only; every other bin is regressed to
+  # the task's valid minimum return. Zero weight preserves canonical CQN-AS.
+  unseen_return_floor_weight: 0.0
+  unseen_return_floor_value: 0.0
   # Diagnostic mode: train a categorical BC policy head and a TD-only critic.
   # The legacy CQN-AS path remains the default for checkpoint compatibility.
   separate_bc_policy: false

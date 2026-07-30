@@ -1,0 +1,44 @@
+# @package _global_
+
+# Stage 1 control for cqn-no-bc.md. This is the clean first-success MovePlate
+# gate with the RL loss restored to unit scale and every imitation path guarded
+# off. Evaluation is external so two matched runs can safely share one GPU.
+defaults:
+  - cqn_as_pixel_bigym_value_fidelity_repro_gate
+  - _self_
+
+num_pretrain_steps: 0
+use_self_imitation: false
+eval_every_steps: 1000000
+num_eval_episodes: 0
+num_eval_envs: 0
+snapshot_every_n: 2500
+save_snapshot: true
+save_csv: true
+
+method:
+  strict_demo_rl_only: true
+  critic_lambda: 1.0
+  bc_lambda: 0.0
+  bc_lambda_schedule: null
+  bc_margin: 0.0
+  demo_fosd: false
+  separate_bc_policy: false
+  bc_policy_stop_gradient: false
+  distinct_policy_encoder: false
+  td_target_action_source: critic
+  td_target_policy_value_beta: null
+  mc_return_weight: 0.0
+  policy_value_beta: null
+  cv_rct_weight: null
+  awr_beta: null
+  flow_policy: false
+  coarse_flow: false
+  coarse_flow_pure: false
+  coarse_flow_selfdistill_weight: null
+  unseen_return_floor_weight: 0.0
+  unseen_return_floor_value: 0.0
+
+hydra:
+  run:
+    dir: ./exp_local/cqn_no_bc/stage1_td_${now:%Y%m%d%H%M%S}

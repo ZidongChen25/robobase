@@ -52,24 +52,35 @@ caused a GPU crash + EGL exhaustion incident on 7/28).
 
 ## 2. In flight right now
 
-- **Crown arm** (`stage164`, GPU0/2, seeds 1,2): combined × QC
-  (explore [0.016,0.032,0.064] persist=2 + decay + nstep=8 + replan-8).
-  Criteria: ≥80 → additivity, new flagship; ≈75 → shared credit-assignment
-  bottleneck. Probe adjudicates whether QC's n-step erodes counterfactual
-  knowledge (0.644 vs 0.467 tension). Auto-chains probe + 200-ep.
+- Nothing training. **Crown VERDICT (7/30 ~21:40, §49): destructive
+  interference** — sealed 200-ep@101k 56.5/50.0 (mean 53.3, −11 vs
+  official, −22 vs combined); probe seed1 0.628 / seed2 0.500 (chance).
+  QC's n-step amplifies the off-policy contamination of forced-exploration
+  segments that 1-step TD absorbed. **Flagship stays combined (75.0)**.
 - Paused by user: 158b (combined seeds 3,4), 163 (combined × replan-8
   without nstep; latest snapshot kept), offqc8/offmask seed-2 replications.
+- Infra §48-48.3 landed and **GPU-accepted (§50): 2.36x steady-state**
+  (4.55→10.73 steps/s, ABBA on GPU5; equivalence within timing-noise
+  envelope, computation bit-equal by unit tests). Full-scale ~2.6-2.7x
+  expected → 101k run ≈ 2.7h. Real VRAM: train 13.1G peak / eval 1.6G;
+  two-runs-per-card recipe (`xla_mem_fraction=0.45`, staggered starts)
+  in AGENTS.md.
 
 ## 3. Next steps (ranked)
 
-1. Read crown results (tonight) → decide flagship.
-2. **Second BiGym task** — the publication-critical external-validity gap;
+1. **Second BiGym task** — the publication-critical external-validity gap;
    everything so far is MovePlate/51 demos. Prefer one long-horizon
    (saucepan_to_hob) + one mid-difficulty task; official vs combined
-   (vs crown) × 2 seeds, new async protocol.
+   × 2 seeds, new async protocol (crown eliminated by §49).
 3. Seed-2/3 for single-seed cells (official+QC, official+mask, U/H/E/N).
 4. Optional probes for CCFF line; sibling-vs-sibling-only probe metric
    (computable from stored records, makes anti-imitation claim airtight).
+
+Public fork state (7/30): `origin/jaxflat` (ZidongChen25/robobase) was
+history-rewritten to `08e64a3 + [clean CQN/CQN-AS port] + [replay
+vectorization]` (local branch `jaxflat-public`). All research-era files
+(flow-matching prototype, analyze_* scripts, planning/eval notes) removed
+from the branch and its history; research lives only on `private` + local.
 
 ## 4. Code map (what was added on this branch)
 
@@ -78,8 +89,14 @@ caused a GPU crash + EGL exhaustion incident on 7/28).
   flow EMA; `cqn.py`: canonical CFM loss, `bc_lambda_schedule` threading.
 - Env: `AppendKeysToLowDim` wrapper (floating base → tail of low_dim_state),
   `env.append_floating_base_to_low_dim`.
-- Infra: `train_fast.py`+`robobase/workspace_fast.py` (device-side demo
-  merge — profile-driven, ~5-8%; equivalence within run-to-run variance),
+- Infra: `train_fast.py`+`robobase/workspace_fast.py` (B+C: video-off +
+  update blocking, ~5-8%; the §41 "device-side merge" was DEAD CODE under
+  prefetch — fixed 7/30 via `_make_merged_replay_iter` hook, §48.1,
+  rollback `ROBOBASE_HOST_MERGE=1`), vectorized replay batch assembly
+  (§48: slice-copy sampling, bit-equal tested, 2.19x CPU; kill-switch
+  `ROBOBASE_SCALAR_SAMPLE=1`; episode-cache caps now null/24G). Combined
+  expectation ~2.5x wall-clock, pending GPU acceptance:
+  `scripts/bench_vecsample_equiv.sh` (ABBA, steady-state, GPU5),
   `scripts/async_eval_watcher.py` (separate-GPU 50-ep eval, deletes
   non-milestone snapshots), `scripts/eval_cqn_as_snapshot_sweep.py`
   (one-process multi-snapshot eval, `--num-eval-envs`, `--replan-interval`),

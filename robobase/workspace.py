@@ -682,6 +682,15 @@ class Workspace:
         """Total number of environment steps taken."""
         return self._calculate_global_env_steps()
 
+    def _make_merged_replay_iter(self, replay_iter, demo_replay_iter):
+        """Build the online+demo merged iterator.
+
+        Overridable hook: subclasses swap the merge implementation (e.g.
+        device-side concat) and it lands *inside* any prefetch wrapper the
+        property adds afterwards.
+        """
+        return _merge_replay_demo_iter(replay_iter, demo_replay_iter)
+
     @property
     def replay_iter(self):
         if self._replay_iter is None:
@@ -714,7 +723,9 @@ class Workspace:
                     self.demo_replay_buffer,
                     num_workers=self.demo_replay_num_workers,
                 )
-                _replay_iter = _merge_replay_demo_iter(_replay_iter, _demo_replay_iter)
+                _replay_iter = self._make_merged_replay_iter(
+                    _replay_iter, _demo_replay_iter
+                )
             prefetch_size = int(
                 self.cfg.get("backend", {}).get("replay_prefetch_size", 0)
                 if self.cfg.get("backend", None)

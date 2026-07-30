@@ -341,6 +341,11 @@ def create_agent(
             ),
             mc_return_value_only=spec.mc_return_value_only,
             policy_value_beta=spec.policy_value_beta,
+            strict_demo_rl_only=spec.strict_demo_rl_only,
+            unseen_return_floor_weight=(
+                spec.unseen_return_floor_weight
+            ),
+            unseen_return_floor_value=spec.unseen_return_floor_value,
             cv_rct_weight=spec.cv_rct_weight,
             cv_rct_level=spec.cv_rct_level,
             cv_rct_baseline=spec.cv_rct_baseline,

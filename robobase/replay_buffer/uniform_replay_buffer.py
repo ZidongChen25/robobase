@@ -1368,6 +1368,161 @@ class UniformReplayBuffer(ReplayBuffer):
         else:
             return self._sample_non_sequential(global_index)
 
+    def _sample_batch_scalar(
+        self, batch_size: int, indices: list[int] | None
+    ) -> dict:
+        if indices is None:
+            indices = [None] * batch_size
+
+        samples = [self.sample_single(indices[i]) for i in range(batch_size)]
+        batch = {}
+        for k in samples[0].keys():
+            batch[k] = np.stack([sample[k] for sample in samples])
+        return batch
+
+    def _vectorized_sample_supported(self) -> bool:
+        """Whether the whole-batch assembly path reproduces sample_single.
+
+        Falls back to the per-sample reference path for any feature it does
+        not mirror bit-exactly, and for subclasses that override the
+        per-sample hooks (e.g. prioritized replay).
+        """
+        if os.environ.get("ROBOBASE_SCALAR_SAMPLE", "") == "1":
+            return False
+        if type(self).sample_single is not UniformReplayBuffer.sample_single:
+            return False
+        if (
+            type(self)._sample_non_sequential
+            is not UniformReplayBuffer._sample_non_sequential
+        ):
+            return False
+        return (
+            not self._sequential
+            and self._action_sequence_start_offset == 0
+            and self._action_padding in {"edge", "repeat"}
+            and self._action_history_len == 0
+            and not (
+                self._preprocessing_fn is not None
+                and self._preprocess_every_sample
+            )
+        )
+
+    def _assemble_batch_vectorized(self, picks: list[tuple]) -> dict:
+        """Assemble a batch with one fancy-index gather per (episode, field).
+
+        ``picks`` holds (episode, transition_idx, global_index) triples in
+        batch order, produced with the exact same RNG/fetch sequence as
+        repeated ``sample_single`` calls; this method only replaces the
+        per-sample slicing + np.stack assembly, so batches are bit-identical
+        to the scalar path.
+        """
+        batch_size = len(picks)
+        nstep = self._nstep
+        frame_stacks = self._frame_stacks
+        seq_len = self._action_seq_len
+
+        obs_names = list(self._obs_signature.keys())
+        handled = {REWARD, ACTION, TERMINAL, TRUNCATED}
+        handled.update(obs_names)
+        extra_names = [
+            name for name in self._storage_signature.keys() if name not in handled
+        ]
+
+        obs_offsets = np.arange(1 - frame_stacks, 1, dtype=np.int64)
+        rew_offsets = np.arange(nstep, dtype=np.int64)
+        discount_vec = self._cumulative_discount_vector[:nstep]
+
+        template = picks[0][0]
+        batch = {}
+        for name in obs_names:
+            source = template[name]
+            batch[name] = np.empty(
+                (batch_size, frame_stacks) + source.shape[1:], dtype=source.dtype
+            )
+            if self._include_tp1:
+                batch[name + "_tp1"] = np.empty_like(batch[name])
+        action_source = template[ACTION]
+        batch[ACTION] = np.empty(
+            (batch_size, seq_len) + action_source.shape[1:],
+            dtype=action_source.dtype,
+        )
+
+        # Stacked frames and action sequences are consecutive rows of the
+        # episode arrays, so away from episode edges each is one contiguous
+        # slice copied straight into its batch row (single memcpy, no
+        # fancy-index temporary). Edge rows fall back to the clipped gather
+        # the scalar path uses, byte-identical either way.
+        for row, (episode, idx, _) in enumerate(picks):
+            ep_len = episode_len(episode)
+            for name in obs_names:
+                source = episode[name]
+                out = batch[name]
+                if idx >= frame_stacks - 1:
+                    out[row] = source[idx - frame_stacks + 1 : idx + 1]
+                else:
+                    out[row] = source[np.clip(idx + obs_offsets, 0, ep_len)]
+                if self._include_tp1:
+                    next_idx = idx + nstep
+                    out_tp1 = batch[name + "_tp1"]
+                    if next_idx >= frame_stacks - 1:
+                        out_tp1[row] = source[
+                            next_idx - frame_stacks + 1 : next_idx + 1
+                        ]
+                    else:
+                        out_tp1[row] = source[
+                            np.clip(next_idx + obs_offsets, 0, ep_len)
+                        ]
+            # Edge/repeat padding with offset 0 is exactly an upper-clipped
+            # gather: rows past the last action repeat action[ep_len - 1].
+            action_out = batch[ACTION]
+            action_end = idx + seq_len
+            if action_end <= ep_len - 1:
+                action_out[row] = episode[ACTION][idx:action_end]
+            else:
+                span = max(ep_len - 1 - idx, 0)
+                action_out[row, :span] = episode[ACTION][idx : idx + span]
+                action_out[row, span:] = episode[ACTION][max(ep_len - 1, 0)]
+
+        groups = {}
+        for row, (episode, idx, _) in enumerate(picks):
+            entry = groups.get(id(episode))
+            if entry is None:
+                groups[id(episode)] = entry = (episode, [], [])
+            entry[1].append(row)
+            entry[2].append(idx)
+
+        def _slot(name: str, group_array: np.ndarray, rows: np.ndarray):
+            out = batch.get(name)
+            if out is None:
+                out = np.empty(
+                    (batch_size,) + group_array.shape[1:], dtype=group_array.dtype
+                )
+                batch[name] = out
+            out[rows] = group_array
+
+        for episode, row_list, idx_list in groups.values():
+            rows = np.asarray(row_list, dtype=np.int64)
+            idxs = np.asarray(idx_list, dtype=np.int64)
+
+            # Sampling guarantees idx <= ep_len - nstep for ep_len >= nstep,
+            # so the reward window and next_idx - 1 stay in range (episodes
+            # shorter than nstep fail in the scalar path as well).
+            reward_idxs = idxs[:, None] + rew_offsets[None, :]
+            discounted = episode[REWARD][reward_idxs] * discount_vec[None, :]
+            _slot(REWARD, discounted.sum(axis=1), rows)
+
+            last_idxs = idxs + nstep - 1
+            _slot(TERMINAL, episode[TERMINAL][last_idxs], rows)
+            _slot(TRUNCATED, episode[TRUNCATED][last_idxs], rows)
+
+            for name in extra_names:
+                _slot(name, episode[name][idxs], rows)
+
+        batch[ACTION_PAD_MASK] = np.zeros((batch_size, seq_len), dtype=np.bool_)
+        batch[INDICES] = np.stack([pick[2] for pick in picks])
+        batch[DISCOUNT] = np.stack([self._gamma**nstep] * batch_size)
+        return batch
+
     @override
     def sample(
         self, batch_size: int | None = None, indices: list[int] = None
@@ -1377,14 +1532,40 @@ class UniformReplayBuffer(ReplayBuffer):
             raise ValueError(
                 f"indices was of size {len(indices)}, but batch size was {batch_size}"
             )
-        if indices is None:
-            indices = [None] * batch_size
+        if batch_size == 0 or not self._vectorized_sample_supported():
+            return self._sample_batch_scalar(batch_size, indices)
 
-        samples = [self.sample_single(indices[i]) for i in range(batch_size)]
-        batch = {}
-        for k in samples[0].keys():
-            batch[k] = np.stack([sample[k] for sample in samples])
-        return batch
+        # Index selection mirrors sample_single/_sample_non_sequential draw
+        # for draw (same np.random calls, same _try_fetch cadence) so RNG
+        # state and sampled transitions match the scalar path exactly; only
+        # the per-transition assembly below is batched.
+        picks = []
+        for i in range(batch_size):
+            global_index = None if indices is None else indices[i]
+            if global_index is None:
+                self._try_fetch()
+            self._samples_since_last_fetch += 1
+            if global_index is None:
+                if self._transition_uniform_sampling:
+                    episode, global_index = (
+                        self._sample_episode_transition_uniform()
+                    )
+                else:
+                    episode, global_index = self._sample_episode()
+                min_idx, max_idx = 0, np.maximum(
+                    episode_len(episode) - self._nstep + 1, 1
+                )
+                idx = np.random.randint(min_idx, max_idx)
+                global_index += idx
+            else:
+                episode_fn, transition_idx = self._locate_global_index(
+                    global_index
+                )
+                episode = self._get_episode_for_sampling(episode_fn)
+                idx = transition_idx
+            picks.append((episode, int(idx), global_index))
+
+        return self._assemble_batch_vectorized(picks)
 
     def __iter__(self):
         while True:

@@ -1,0 +1,14 @@
+# @package _global_
+
+# Stage 1 treatment for cqn-no-bc.md. The sole difference from the normalized
+# TD control is the Q-Transformer-style unseen-action return-floor coefficient.
+defaults:
+  - cqn_as_pixel_bigym_nobc_td_gate
+  - _self_
+
+method:
+  unseen_return_floor_weight: 1.0
+
+hydra:
+  run:
+    dir: ./exp_local/cqn_no_bc/stage1_floor_${now:%Y%m%d%H%M%S}

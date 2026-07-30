@@ -80,8 +80,12 @@ replay:
   # plus the backend prefetch queue.
   epoch_load_all_episodes: false
   epoch_batch_chunk_size: 0
-  max_cached_episodes: 16
-  max_cached_episode_bytes: 8589934592
+  # Cache caps sized so a full 100k-step online run stays resident (~10G online
+  # + ~6G self-imitation demos at MovePlate scale). A 16-episode count cap made
+  # uniform sampling re-decode a whole ~14MB npz per drawn transition once the
+  # buffer outgrew it (~95% miss at 300+ episodes) — the byte cap is the guard.
+  max_cached_episodes: null
+  max_cached_episode_bytes: 25769803776
   include_tp1: true
   discard_loaded_demos_after_replay: true
   transition_seq_len: 1  # The length of transition sequence returned from sample() call. Only applicable if sequential is True
@@ -120,6 +124,9 @@ experiment_name: exp
 seed: 1
 gpu_id: null
 num_gpus: 1
+# Bound the XLA preallocation pool (fraction of the card; default env is
+# 0.75). Set to ~0.45 to co-locate two training runs on one GPU.
+xla_mem_fraction: null
 log_every: 1000
 log_train_video: false
 log_eval_video: true

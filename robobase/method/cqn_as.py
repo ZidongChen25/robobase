@@ -66,6 +66,9 @@ class CQNASpec(CQNSpec):
     """CQN hyperparameters plus the action-sequence architecture settings."""
 
     demo_fosd: bool
+    strict_demo_rl_only: bool
+    unseen_return_floor_weight: float
+    unseen_return_floor_value: float
     gru_layers: int
     temporal_ensemble: bool
     temporal_ensemble_replan_interval: int
@@ -112,6 +115,58 @@ class CQNASpec(CQNSpec):
 
 def cqn_as_spec_from_cfg(cfg: DictConfig) -> CQNASpec:
     method = cfg.method
+    strict_demo_rl_only = bool(method.get("strict_demo_rl_only", False))
+    if strict_demo_rl_only:
+        violations = []
+        if int(cfg.get("num_pretrain_steps", 0)) != 0:
+            violations.append("num_pretrain_steps must be 0")
+        if bool(cfg.get("is_imitation_learning", False)):
+            violations.append("is_imitation_learning must be false")
+        if bool(cfg.get("use_self_imitation", False)):
+            violations.append("use_self_imitation must be false")
+        forbidden_nonzero = {
+            "bc_lambda": method.get("bc_lambda", 0.0),
+            "bc_margin": method.get("bc_margin", 0.0),
+            "causal_rct_weight": method.get("causal_rct_weight", 0.0),
+        }
+        for name, value in forbidden_nonzero.items():
+            if float(value) != 0.0:
+                violations.append(f"method.{name} must be 0")
+        forbidden_true = (
+            "demo_fosd",
+            "separate_bc_policy",
+            "bc_policy_stop_gradient",
+            "distinct_policy_encoder",
+            "flow_policy",
+            "coarse_flow",
+            "coarse_flow_pure",
+            "freeze_bc_policy",
+            "direct_scalar_q",
+        )
+        for name in forbidden_true:
+            if bool(method.get(name, False)):
+                violations.append(f"method.{name} must be false")
+        forbidden_optional = (
+            "bc_lambda_schedule",
+            "td_target_policy_value_beta",
+            "policy_value_beta",
+            "cv_rct_weight",
+            "awr_beta",
+            "coarse_flow_selfdistill_weight",
+        )
+        for name in forbidden_optional:
+            if method.get(name, None) is not None:
+                violations.append(f"method.{name} must be null")
+        if (
+            str(method.get("td_target_action_source", "critic")).lower()
+            != "critic"
+        ):
+            violations.append("method.td_target_action_source must be critic")
+        if violations:
+            raise ValueError(
+                "strict_demo_rl_only forbids imitation/pretraining paths: "
+                + "; ".join(violations)
+            )
     base = cqn_spec_from_cfg(cfg)
     base_values = {field.name: getattr(base, field.name) for field in fields(CQNSpec)}
     policy_value_beta = method.get("policy_value_beta", None)
@@ -122,6 +177,13 @@ def cqn_as_spec_from_cfg(cfg: DictConfig) -> CQNASpec:
     return CQNASpec(
         **base_values,
         demo_fosd=bool(method.get("demo_fosd", True)),
+        strict_demo_rl_only=strict_demo_rl_only,
+        unseen_return_floor_weight=float(
+            method.get("unseen_return_floor_weight", 0.0)
+        ),
+        unseen_return_floor_value=float(
+            method.get("unseen_return_floor_value", 0.0)
+        ),
         gru_layers=int(method.get("gru_layers", 1)),
         temporal_ensemble=bool(method.get("temporal_ensemble", True)),
         temporal_ensemble_replan_interval=int(
@@ -670,6 +732,9 @@ class CQNAS(CQN):
         mc_return_stop_gradient_encoder: bool,
         mc_return_value_only: bool,
         policy_value_beta: float | None,
+        strict_demo_rl_only: bool,
+        unseen_return_floor_weight: float,
+        unseen_return_floor_value: float,
         model: RLModelSpec,
         observation_space: spaces.Dict,
         action_space: spaces.Box,
@@ -822,6 +887,14 @@ class CQNAS(CQN):
             )
         if mc_return_weight < 0.0:
             raise ValueError("mc_return_weight must be non-negative.")
+        if unseen_return_floor_weight < 0.0:
+            raise ValueError(
+                "unseen_return_floor_weight must be non-negative."
+            )
+        if not v_min <= unseen_return_floor_value <= v_max:
+            raise ValueError(
+                "unseen_return_floor_value must lie on the C51 support."
+            )
         # Canonical (non-decoupled) MC anchor is a deliberate Stage-147 arm:
         # it calibrates the same Q head that drives behavior.  The historical
         # decoupling requirement is therefore relaxed; interpretation caveats
@@ -846,6 +919,13 @@ class CQNAS(CQN):
         self.bc_lambda = float(bc_lambda)
         self.bc_margin = float(bc_margin)
         self.demo_fosd = bool(demo_fosd)
+        self.strict_demo_rl_only = bool(strict_demo_rl_only)
+        self.unseen_return_floor_weight = float(
+            unseen_return_floor_weight
+        )
+        self.unseen_return_floor_value = float(
+            unseen_return_floor_value
+        )
         self.use_target_network_for_rollout = bool(use_target_network_for_rollout)
         self.num_update_steps = int(num_update_steps)
         self.critic_grad_clip = critic_grad_clip
@@ -3062,9 +3142,17 @@ class CQNAS(CQN):
             self._bin_flip_delta_sequence[row] = delta
         return flipped
 
-    def _apply_bin_explore(self, action_chunk: np.ndarray) -> np.ndarray:
+    def _apply_bin_explore(
+        self, action_chunk: np.ndarray, register_mask: np.ndarray | None = None
+    ) -> np.ndarray:
         """Hierarchical epsilon-bin exploration compatible with the
         closed-loop temporal ensemble (cqn-flow.md 35).
+
+        ``register_mask`` marks which batch rows carry a *fresh plan* this
+        step (temporal-ensemble replan mask). Rows outside the mask are
+        left untouched: their chunk is not registered, so shifting it
+        would do nothing, and advancing their persist counter would burn
+        the exploration window on discarded plans (cqn-flow.md 48.2).
 
         Per fresh plan and per level l (checked coarse-to-fine, first
         firing wins), with probability ``bin_explore_probs[l]``: pick one
@@ -3089,6 +3177,8 @@ class CQNAS(CQN):
         high = np.asarray(self._step_action_high, dtype=np.float64)
         scale = float(getattr(self, "_bin_explore_scale", 1.0))
         for row in range(batch):
+            if register_mask is not None and not register_mask[row]:
+                continue
             if self._bin_explore_remaining[row] == 0:
                 for level, prob in enumerate(self.bin_explore_probs):
                     if self._bin_explore_rng.random() >= prob * scale:
@@ -3195,7 +3285,9 @@ class CQNAS(CQN):
                     self._bin_explore_scale = float(
                         utils.schedule(self.bin_explore_schedule, step)
                     )
-                action_chunk = self._apply_bin_explore(action_chunk)
+                action_chunk = self._apply_bin_explore(
+                    action_chunk, register_mask
+                )
         else:
             if self.temporal_ensemble:
                 action_chunk = np.zeros(
@@ -3353,6 +3445,45 @@ class CQNAS(CQN):
                 if stored is not None
                 else jax.tree.map(jnp.array, self.params["flow_policy"])
             )
+
+    def checkpoint_state_dict(self) -> dict:
+        state = super().checkpoint_state_dict()
+        state.update(self._exploration_checkpoint_state())
+        return state
+
+    def load_checkpoint_state_dict(self, state_dict: dict):
+        super().load_checkpoint_state_dict(state_dict)
+        self._load_exploration_checkpoint_state(state_dict)
+
+    def _exploration_checkpoint_state(self) -> dict:
+        """NumPy exploration RNG streams (and nothing else).
+
+        Without these a resume restarts both generators from the seed while
+        the original process had advanced them, so the exploration
+        assignment sequence diverges from an uninterrupted run
+        (cqn-flow.md 48.2). The ``_bin_explore_*`` persist windows are
+        deliberately NOT checkpointed: workspace snapshots carry no env
+        state, so a resume starts fresh episodes without an agent.reset()
+        call, and a restored mid-episode window would leak into them —
+        the exact cross-episode intervention that reset() forbids
+        (cqn-flow.md 48.3).
+        """
+        return {
+            "bin_flip_rng_state": self._bin_flip_rng.bit_generator.state,
+            "bin_explore_rng_state": self._bin_explore_rng.bit_generator.state,
+        }
+
+    def _load_exploration_checkpoint_state(self, state_dict: dict) -> None:
+        # Older snapshots predate these keys; keep their fresh-init behavior.
+        stored = state_dict.get("bin_flip_rng_state")
+        if stored is not None:
+            self._bin_flip_rng.bit_generator.state = stored
+        stored = state_dict.get("bin_explore_rng_state")
+        if stored is not None:
+            self._bin_explore_rng.bit_generator.state = stored
+        # Snapshots from the short-lived 48.2 format may carry
+        # bin_explore_{remaining,dimension,level,sibling}; ignore them so
+        # resumed runs start their fresh episodes windowless.
 
     def rollout_diagnostics(self) -> dict[str, float]:
         eligible = int(
@@ -3521,6 +3652,16 @@ class CQNAS(CQN):
                     self._structured_exploration_remaining[agent_index] = 0
                     self._structured_exploration_dimension[agent_index] = -1
                     self._structured_exploration_direction[agent_index] = 0.0
+                if (
+                    hasattr(self, "_bin_explore_remaining")
+                    and agent_index < self._bin_explore_remaining.shape[0]
+                ):
+                    # A persisted sibling shift is a within-episode
+                    # intervention; never carry it into the next episode.
+                    self._bin_explore_remaining[agent_index] = 0
+                    self._bin_explore_dimension[agent_index] = -1
+                    self._bin_explore_level[agent_index] = -1
+                    self._bin_explore_sibling[agent_index] = -1
                 if self._train_action_history is not None:
                     self._train_action_history[agent_index] = 0
                     self._train_action_history_valid[agent_index] = False

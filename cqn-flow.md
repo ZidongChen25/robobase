@@ -12832,3 +12832,174 @@ GPU5,排队 163 链后。判据:200-ep 终点(replan-8 口径)对 163 与组合
   (组合 0.644 vs QC 0.467 的张力:合体探针落在哪决定"QC 回传是否
   侵蚀反事实知识")。
 - offqc8 seed2(GPU3)、offmask seed2(GPU4):两个 +8~+9 单 seed 臂的复核。
+
+### 48. Infra:replay 采样路径手术(用户指令"做一下",实测驱动)
+
+**实测在跑预算(stage164 crown,nstep=8,251ms/step,最近30行中位)**:
+update 调用 281-335ms(其中 backend/JAX 仅 71-77ms → **等待 210-260ms**),
+env.step 4.5-8.7ms,act 1.5-1.7ms。GPU ~3/4 时间挨饿(util 快照 0-55% 相符)。
+
+**否证一个中间假设**:§41 的"组装向量化 20-30%"线索先被放大成"cache
+miss 解码论"(16 上限 vs 329+169 episodes → 每样本整集解码?)——读码
+否证:fetch 路径 `_cache_episode(enforce_limits=False)` 无上限常驻,在线
+稳态**零 miss 零解码**(/proc io 30s 读增量=0 佐证);16 上限只在"先
+miss 一次→永久 thrash"的政权下咬合(实测灾难参考:cap16 冷缓存
+1.5-1.7 s/batch,232 decode/batch)。cache 上限改为 null/24G(robobase_config)
+纯属保险(resume/重启政权),对新鲜 run 逐位无差。
+
+**真瓶颈 = 逐样本组装的双重拷贝**(cProfile:scalar np.stack 重拷贝 63ms
++ 逐样本 gather 30ms ≈ 93ms/256-batch,调用开销次要,拷贝带宽主导)。
+
+**手术**(`uniform_replay_buffer.py`):`sample()` 改为两阶段——索引选择
+逐样本保持与 `sample_single` **完全相同的 np.random 调用序列与 _try_fetch
+节律**(RNG 逐位一致);装配利用 frame_stack/action_seq 是**连续行**的事实,
+非边界样本 = 单次连续 slice memcpy 直写 batch 行(无 fancy-index 临时件),
+边界样本回退 clip-gather(逐字节同值);reward/terminal/extras 按 episode
+分组向量化。护栏:子类(prioritized)/sequential/zero-pad/action-history/
+逐样本预处理一律回退 scalar 参考路径;kill-switch
+`ROBOBASE_SCALAR_SAMPLE=1`。
+
+**验收(已过)**:pytest 逐位等价 7/7(nstep 1/3/8 × fs 1/2/4 × tp1 ×
+uniform-sampling × 显式 indices,含 RNG 终态逐位相等),
+`tests/unit/replay_buffer/test_vectorized_sample_equivalence.py`;真实
+episode(crown replay 150 集)CPU 基准:**78.5 → 35.8 ms/256-batch
+(2.19×)**。两 buffer 合计 157→72ms/update,**首次低于 backend 75ms**,
+`replay_prefetch_size=4 + device_prefetch` 应可完全遮蔽采样 →
+预计 ~95-105ms/step(**~2.4-2.6×**),待 GPU 验收定夺。
+
+**GPU 验收(待跑,卡满排队)**:`scripts/bench_vecsample_equiv.sh`
+(3000 帧同 seed A/B,crown launch,GPU5 按既定指令;判据 = critic_loss
+轨迹在重跑方差 ~2.6% 内 + 墙钟)。stage164 在跑进程不受影响(代码已
+加载),自下一批 run 生效。若遮蔽不完全,下一杠杆已识别:flat 存储
+镜像(每 key 每 batch 单次 gather,est. ~15ms/buffer)。
+
+### 48.1 [P1] 用户复核发现:device-side merge 在默认 JAX 配置下从未生效
+
+**问题(用户最小复现,已核实)**:`workspace_fast.replay_iter` 覆盖
+property 并对父类返回值做 `isinstance(_, _DemoMergedIterator)`;但父类在
+`backend.replay_prefetch_size=4`(jax.yaml 默认)时已把合并器包进
+`PrefetchReplayBatchIterator` 并赋值 `self._replay_iter`——isinstance 永假,
+设备合并是死代码,~130MB/update 的 host `np.concatenate` 一直在跑。
+**历史修正**:§41.1 的 "5-8%" 全部来自 B+C(关视频+update blocking),
+A'(设备合并)贡献为零(fast2 818s ≈ bc_only 水平,数据早有指纹)。
+
+**修复**:workspace 新增可覆盖 hook `_make_merged_replay_iter`(在 prefetch
+包装**之前**注入),WorkspaceFast 覆盖之返回 `_DeviceMergedIterator`
+(设备合并在 prefetch 线程内执行;`prefetch_batch` 的 device_put 幂等,
+map_fn 保留)。回退开关 `ROBOBASE_HOST_MERGE=1`。回归测试
+`tests/unit/test_workspace_fast_merge.py`(5/5):接线断言
+prefetch→_DeviceMergedIterator、kill-switch、host/device 合并值逐位一致
+(dtype 映射 f64→f32/i64→i32 与 jit 边界原有行为相同)。含 §48 采样手术
+全套 101/101 过。
+
+**基准协议修正(用户指出的顺序偏置)**:`bench_vecsample_equiv.sh` 改为
+**ABBA**(old,new,new,old),稳态口径 = train.csv env_steps 1000→3000 的
+steps/s(排除 JIT 编译与启动),等价判据 = 跨臂 critic_loss 漂移落在
+**组内重跑漂移**(A1-A2/B1-B2,当场测得)之内,不再引用历史 2.6%。
+旧臂 = 两开关全开(SCALAR_SAMPLE+HOST_MERGE)= 原生产路径。GPU5 待空。
+
+### 48.2 用户复审第二轮:bin-explore 状态生命周期三修(#2-#4)
+
+复审判定 #1/#5 已修,#2-#4 稳定复现,均已修复 + 回归测试
+(`tests/unit/test_cqn_as_bin_explore_state.py`,4/4;test_cqn_as 全套 74/74):
+
+- **#2 [P1] episode reset 泄漏探索状态**:`reset()` 清 structured_exploration
+  但不清 `_bin_explore_*`,跨 episode 延续旧 sibling shift。已在 reset 中
+  按 agent_index 清理(带 shape 越界护栏)。**历史影响**:覆盖 ~18% 步数的
+  探索窗以 ~16/90 概率跨越 episode 边界 → 约 1/5 的 episode 开头带上一条
+  episode 的 shift(≤16 步),存在于所有已跑探索臂;量级在剂量不敏感区
+  (§46 U/H),不追溯重跑,自下一批语义变更。
+- **#3 [P1] register_mask 未作用于 bin exploration**:多环境下整 batch 传入,
+  未 replan 的 env 也被抽签/施移/扣 persist。已把 mask 传入
+  `_apply_bin_explore`,mask 外行完全不动。**关键澄清(血量减免)**:
+  num_train_envs=1 时 `needs_inference = any(mask)` 使非 replan 步根本不
+  调用该函数——**至今所有 run(含在跑 crown)的单环境语义一直正确**,
+  预注册的 ×8 换算/16 步窗成立;此 bug 仅在未来多环境采集时才会咬合。
+- **#4 [P2] 断点续训丢 NumPy 探索 RNG**:`checkpoint_state_dict` 仅存
+  JAX RNG。CQNAS 现补存 `_bin_flip_rng`/`_bin_explore_rng` 的
+  bit_generator.state + 四个 persist 数组;load 带 .get 护栏,旧快照
+  (含 stage164 在写的)仍可加载(行为同旧:探索流重开)。测试断言
+  "中断-恢复"与"不中断"的 assignment 序列逐位一致。
+
+### 48.3 用户复审第三轮:48.2 的 checkpoint 修复引入的 P2 边界问题(已修)
+
+**问题(成立)**:48.2 把四个 `_bin_explore_*` persist 数组也写进
+checkpoint 并在 load 时恢复;但 workspace 快照不含环境状态,resume 走
+`train_envs.reset()`(workspace.py `_online_rl` 开头)且不调 `agent.reset()`
+——恢复的 mid-episode 窗口会落在全新 episode 上,与 reset() 的
+"intervention 不跨 episode" 语义自相矛盾(等于把 #2 的泄漏从 episode
+边界搬到了 resume 边界)。
+
+**修复**:checkpoint 只保存/恢复两个 NumPy RNG 流(可复现性目标);
+persist 窗口显式不入 checkpoint,load 对短命 48.2 格式里的窗口键显式
+忽略。语义:resume = 新 episode 从无窗状态开始,RNG 流从快照点继续。
+测试更新(5/5):roundtrip 等价改在"无活跃窗口"快照点断言序列逐位
+一致;新增边界测试断言 mid-window 快照 resume 后窗口清零、RNG 流仍续、
+且 48.2 格式快照的窗口键被忽略。test_cqn_as 全套 + method 目录复跑通过。
+
+### 49. Stage-164 crown 裁决:两条 +10 路径**破坏性干涉**(未达任何预注册分支)
+
+**Sealed 200-ep @101k 终点(seeds 800+,replan-8 同口径,ne=25)**:
+| seed | 任务 | 探针(sign acc) |
+|---|---|---|
+| 1 | 56.5 | 0.628(183 对) |
+| 2 | 50.0 | **0.500 = 纯随机**(130 对) |
+| 均值 | **53.3** | — |
+
+对照:combined 75.0/0.644,official+QC 74.0/0.467,官方 64.6/0.567。
+中途 validation 读数(§今日:90k 63.5 / 95k 55.0,seeds 400)方向一致,
+非终点噪声。
+
+**裁决**:预注册判据(≥80 可加;≈75 共享瓶颈)双双落空——crown 落在
+**官方基线之下 11pp、combined 之下 22pp**。两条独立 +10 路径合体是
+**破坏性干涉**,不是可加,也不是简单瓶颈。探针分裂:seed1 0.628 尚存
+combined 型反事实知识但任务已塌,seed2 0.500 全数侵蚀——§47 预注册的
+张力(QC 回传是否侵蚀反事实知识)得到肯定方向的回答(2 seeds 一致塌
+任务,1/2 塌探针)。
+
+**机制候选(单 seed-pair 谨慎,不下定论)**:nstep-8 段内报酬和把
+ε-bin 强制探索段的(故意劣化的)执行结果以 8 步聚合直灌 TD 目标,
+1-step TD 里由 bootstrap 吸收的离策略污染在 QC 化后被放大;同时 margin
+衰减撤掉了行为锚。官方+QC 无探索故近贪心数据下 n-step 无害(74.0),
+combined 无 n-step 故探索污染被 bootstrap 缓冲(75.0),二者合体互拆。
+
+**旗舰维持 combined(explore×decay,75.0/0.644)**。QC 化(74.0)保留为
+独立任务口径路线。第二任务外部效度实验按 official vs combined 设计,
+crown 出局。快照按协议保 101000 + 里程碑,其余可清。
+
+### 50. Infra GPU 验收(ABBA,GPU5):**通过,稳态 2.36×**
+
+| run | 稳态 steps/s(1000→2000) | 墙钟 |
+|---|---|---|
+| old1 | 4.40 | 12.8 min |
+| new1 | 10.65 | 5.9 min |
+| new2 | 10.80 | 5.7 min |
+| old2 | 4.69 | 12.3 min |
+| **old→new** | **4.55 → 10.73 = 2.36×** | |
+
+new 稳态 ≈93ms/step ≈ backend 上限(预测 95-105ms 命中),预取遮蔽基本
+做满。等价性(诚实记录判据的意外):
+- 组内重跑漂移 median 0.04%/0.08%(max **4.13%**/2.86%);
+- 跨臂漂移 median 1.77%/1.00%(max 1.77%/**2.55%**)。
+
+预注册的"跨臂 median ≤ 组内 median"**字面上未过**——诊断:同速重跑的
+fetch 时序几乎一致 → 批组成几乎相同 → 组内 median 塌缩到 0.0x%,它并
+未涵盖"速度本身改变 fetch 交错 → 批组成合法漂移"这一噪声源;而这正是
+所有 run 固有的不可逐位复现机制(§41.1,历史时序噪声 ~2.6%)。按语义
+正确的尺子:跨臂 max 2.55% < 组内 max 4.13% 且 median 1.0-1.8% < 2.6%
+历史包络;计算本身的逐位等同已由单测钉死(采样 bit-equal 7/7、合并值
+等同 5/5)。**判定:接受**;残余漂移归因于批组成时序,与既有 run-to-run
+非确定性同源。
+
+全尺度换算:100k 老口径 251ms/step → 新 ~93-95ms ≈ **2.6-2.7×**,101k
+训练 7.5h → **~2.7h**(下次全尺度 run 复核)。附:训练真实显存峰值
+13.1G(prealloc=false,含 JIT;§AGENTS.md 已收录),eval 1.6G;
+xla_mem_fraction 开关入 gpu.py。同卡双跑(0.45×2,错峰 120s)实测
+探针在跑,出数后补记。
+
+§50 补记(同卡双跑实测,GPU5,0.45×2 + 错峰 120s):peak 30.2G/32.6G
+(两个 0.45 硬切片各自全额预分配 14.7G + EGL/系统,按设计;余量 2.4G,
+无 OOM);每条稳态 7.09/6.99 steps/s = 单跑的 **0.66×**,合计
+**14.1 steps/s/卡 = 1.31× 吞吐**(且双跑单条仍是旧管线单跑的 1.54×)。
+全尺度换算:101k 单跑 ~2.6h、双跑 ~4.0h/条。第二任务矩阵(8 run):
+双跑 4 卡一波 ~4h < 单跑 4 卡两波 ~5.3h,**采用双跑**。
