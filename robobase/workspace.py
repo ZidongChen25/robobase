@@ -1,26 +1,30 @@
-import shutil
 import signal
-import sys
 import time
 import random
+import gc
 from typing import Callable, Any
 from functools import partial
 import logging
 
 from gymnasium import spaces
-from hydra.core.hydra_config import HydraConfig
 from omegaconf import DictConfig
 
 from robobase.factory import create_agent, method_name_from_cfg
 from robobase.envs.env import EnvFactory
 from robobase.logger import Logger
 from robobase.replay_buffer.iterator import (
+    PrefetchReplayBatchIterator,
+    create_epoch_replay_iterator,
     create_jax_replay_iterator,
     normalize_replay_num_workers,
 )
 from robobase.replay_buffer.prioritized_replay_buffer import PrioritizedReplayBuffer
 from robobase.replay_buffer.replay_buffer import ReplayBuffer
 from robobase.replay_buffer.uniform_replay_buffer import UniformReplayBuffer
+from robobase.replay_buffer.bigym_lazy_replay import (
+    LazyBiGymReplayBuffer,
+    lazy_replay_enabled,
+)
 from robobase.replay_buffer.vision_feature_cache import (
     build_vision_feature_cache_plan,
 )
@@ -116,6 +120,29 @@ def _normalize_demos_count(value):
     return value
 
 
+def _executed_action_steps(info: dict[str, Any]) -> int:
+    mask = info.get("action_sequence_mask") if isinstance(info, dict) else None
+    if mask is None:
+        return 1
+    return max(1, int(np.asarray(mask, dtype=np.int32).sum()))
+
+
+def _validate_eval_env_counts(cfg: DictConfig) -> None:
+    num_eval_envs = int(cfg.num_eval_envs)
+    num_eval_episodes = int(cfg.num_eval_episodes)
+    if num_eval_episodes < 0:
+        raise ValueError(
+            f"num_eval_episodes must be >= 0, got {num_eval_episodes}."
+        )
+    if num_eval_envs < 0:
+        raise ValueError(f"num_eval_envs must be >= 0, got {num_eval_envs}.")
+    if num_eval_episodes > 0 and num_eval_envs < 1:
+        raise ValueError(
+            "num_eval_envs must be >= 1 when num_eval_episodes > 0, got "
+            f"num_eval_envs={num_eval_envs} and num_eval_episodes={num_eval_episodes}."
+        )
+
+
 def _create_default_replay_buffer(
     cfg: DictConfig,
     observation_space: gym.Space,
@@ -126,6 +153,22 @@ def _create_default_replay_buffer(
     save_snapshot: bool = False,
     reuse_saved: bool = False,
 ) -> ReplayBuffer:
+    if lazy_replay_enabled(cfg):
+        if demo_replay:
+            raise NotImplementedError("lazy_replay does not support demo replay.")
+        if cfg.env.env_name != "bigym":
+            raise NotImplementedError("lazy_replay is currently implemented for BiGym.")
+        extra_replay_elements = spaces.Dict({})
+        if cfg.demos != 0:
+            extra_replay_elements["demo"] = spaces.Box(0, 1, shape=(), dtype=np.uint8)
+        return LazyBiGymReplayBuffer(
+            cfg,
+            observation_space,
+            action_space,
+            batch_size=cfg.batch_size,
+            extra_replay_elements=extra_replay_elements,
+        )
+
     multiprocessing_context = "spawn"
     cache_plan = build_vision_feature_cache_plan(
         cfg=cfg,
@@ -171,6 +214,16 @@ def _create_default_replay_buffer(
         preprocessing_fn=None if cache_plan is None else cache_plan.preprocessing_fn,
         num_workers=cfg.replay.num_workers,
         sequential=cfg.replay.sequential,
+        transition_seq_len=cfg.replay.transition_seq_len,
+        action_sequence_start_offset=int(
+            cfg.replay.get("action_sequence_start_offset", 0)
+        ),
+        action_padding=str(cfg.replay.get("action_padding", "zero")),
+        max_cached_episodes=cfg.replay.get("max_cached_episodes", None),
+        max_cached_episode_bytes=cfg.replay.get(
+            "max_cached_episode_bytes", None
+        ),
+        include_tp1=bool(cfg.replay.get("include_tp1", True)),
         multiprocessing_context=multiprocessing_context,
     )
 
@@ -197,9 +250,26 @@ def _create_default_envs(cfg: DictConfig) -> EnvFactory:
         from robobase.envs.robomimic import RobomimicEnvFactory
 
         factory = RobomimicEnvFactory()
+    elif cfg.env.env_name == "pusht":
+        from robobase.envs.pusht import PushTEnvFactory
+
+        factory = PushTEnvFactory()
     else:
         ValueError()
     return factory
+
+
+def _validate_rl_action_sequence(cfg: DictConfig) -> None:
+    """Allow action chunks only for RL methods that implement them."""
+
+    if (
+        cfg.method.is_rl
+        and cfg.action_sequence != 1
+        and method_name_from_cfg(cfg) != "cqn_as"
+    ):
+        raise ValueError(
+            "Action sequence > 1 is only supported for the CQN-AS RL method"
+        )
 
 
 class Workspace:
@@ -223,12 +293,22 @@ class Workspace:
         print(f"workspace: {self.work_dir}")
 
         # Sanity checks
-        if cfg.num_eval_envs < 1:
-            raise ValueError(f"num_eval_envs must be >= 1, got {cfg.num_eval_envs}.")
+        _validate_eval_env_counts(cfg)
         if cfg.execution_length > cfg.action_sequence:
             raise ValueError(
                 "execution_length must be <= action_sequence, got "
                 f"{cfg.execution_length} and {cfg.action_sequence}."
+            )
+        action_execution_start = int(cfg.get("action_execution_start", 0))
+        if action_execution_start < 0:
+            raise ValueError(
+                f"action_execution_start must be >= 0, got {action_execution_start}."
+            )
+        if action_execution_start + cfg.execution_length > cfg.action_sequence:
+            raise ValueError(
+                "action_execution_start + execution_length must be <= "
+                f"action_sequence, got {action_execution_start} + "
+                f"{cfg.execution_length} > {cfg.action_sequence}."
             )
         noise_mask_steps = int(cfg.method.get("noise_mask_steps", 0))
         if noise_mask_steps < 0 or noise_mask_steps >= cfg.action_sequence:
@@ -258,8 +338,7 @@ class Workspace:
                 f"must be >= episode_length ({cfg.env.episode_length})."
             )
 
-        if cfg.method.is_rl and cfg.action_sequence != 1:
-            raise ValueError("Action sequence > 1 is not supported for RL methods")
+        _validate_rl_action_sequence(cfg)
         if cfg.method.is_rl and cfg.execution_length != 1:
             raise ValueError("execution_length > 1 is not supported for RL methods")
         if not cfg.method.is_rl and cfg.replay.nstep != 1:
@@ -277,7 +356,19 @@ class Workspace:
         if (num_demos := cfg.demos) != 0:
             # Collect demos or fetch saved demos before making environments
             # to consider demo-based action space (e.g., standardization)
-            if self._should_collect_demos_from_dataset():
+            if self._should_use_lazy_replay():
+                prepare_lazy_replay = getattr(
+                    self.env_factory,
+                    "prepare_lazy_replay",
+                    None,
+                )
+                if not callable(prepare_lazy_replay):
+                    raise NotImplementedError(
+                        "lazy_replay requires env_factory.prepare_lazy_replay()."
+                    )
+                prepare_lazy_replay(cfg, num_demos)
+                self._skip_demo_loading_from_dataset = True
+            elif self._should_collect_demos_from_dataset():
                 self.env_factory.collect_or_fetch_demos(cfg, num_demos)
             else:
                 self._skip_demo_loading_from_dataset = True
@@ -417,7 +508,7 @@ class Workspace:
             main_loop_iterations
             * self.cfg.action_repeat
             * self.train_envs.num_envs
-            * self.cfg.action_sequence
+            * self.cfg.execution_length
             + pretrain_steps
         )
 
@@ -429,10 +520,32 @@ class Workspace:
     @property
     def replay_iter(self):
         if self._replay_iter is None:
-            _replay_iter = create_jax_replay_iterator(
-                self.replay_buffer,
-                num_workers=self.replay_num_workers,
-            )
+            if self._should_use_epoch_style_replay():
+                if self.use_demo_replay:
+                    raise NotImplementedError(
+                        "Epoch-style replay sampling does not support demo replay."
+                    )
+                if self.prioritized_replay:
+                    raise NotImplementedError(
+                        "Epoch-style replay sampling is not compatible with prioritized replay."
+                    )
+                _replay_iter = create_epoch_replay_iterator(
+                    self.replay_buffer,
+                    execution_length=self.cfg.execution_length,
+                    shuffle=True,
+                    seed=int(self.cfg.seed),
+                    load_all_episodes=bool(
+                        self.cfg.replay.get("epoch_load_all_episodes", False)
+                    ),
+                    batch_chunk_size=self.cfg.replay.get(
+                        "epoch_batch_chunk_size", 0
+                    ),
+                )
+            else:
+                _replay_iter = create_jax_replay_iterator(
+                    self.replay_buffer,
+                    num_workers=self.replay_num_workers,
+                )
             if self.use_demo_replay:
                 _demo_replay_iter = create_jax_replay_iterator(
                     self.demo_replay_buffer,
@@ -441,8 +554,95 @@ class Workspace:
                 _replay_iter = _merge_replay_demo_iter(
                     _replay_iter, _demo_replay_iter
                 )
+            prefetch_size = int(
+                self.cfg.get("backend", {}).get("replay_prefetch_size", 0)
+                if self.cfg.get("backend", None)
+                else 0
+            )
+            prefetch_workers = 1
+            if self._should_use_lazy_replay():
+                lazy_cfg = self.cfg.get("lazy_replay", {})
+                prefetch_workers = max(1, int(lazy_cfg.get("num_workers", 1)))
+                if prefetch_size <= 0:
+                    prefetch_size = (
+                        prefetch_workers
+                        * int(lazy_cfg.get("prefetch_factor", 2))
+                    )
+            if prefetch_size > 0:
+                backend_cfg = self.cfg.get("backend", {})
+                map_fn = None
+                if bool(backend_cfg.get("replay_device_prefetch", False)):
+                    map_fn = getattr(self.agent, "prefetch_batch", None)
+                _replay_iter = PrefetchReplayBatchIterator(
+                    _replay_iter,
+                    queue_size=prefetch_size,
+                    worker_name="jax_replay_prefetch",
+                    map_fn=map_fn,
+                    num_workers=prefetch_workers,
+                )
             self._replay_iter = _replay_iter
         return self._replay_iter
+
+    def _should_use_epoch_style_replay(self) -> bool:
+        return bool(
+            self.cfg.is_imitation_learning
+            and self.cfg.num_train_frames <= 0
+            and self.cfg.replay.get("epoch_style_sampling", False)
+        )
+
+    def _offline_batches_per_epoch(self) -> int:
+        if not self._should_use_epoch_style_replay():
+            raise ValueError(
+                "num_pretrain_epochs/eval_every_epochs require offline imitation "
+                "learning with replay.epoch_style_sampling=true."
+            )
+        epoch_iter = create_epoch_replay_iterator(
+            self.replay_buffer,
+            execution_length=self.cfg.execution_length,
+            shuffle=False,
+            seed=int(self.cfg.seed),
+            load_all_episodes=False,
+            batch_chunk_size=self.cfg.replay.get("epoch_batch_chunk_size", 0),
+        )
+        try:
+            return int(epoch_iter.batches_per_epoch)
+        finally:
+            close = getattr(epoch_iter, "close", None)
+            if callable(close):
+                close()
+
+    def _resolve_pretrain_schedule(self) -> tuple[int, int, int | None]:
+        num_pretrain_steps = int(self.cfg.num_pretrain_steps)
+        eval_every_steps = int(self.cfg.eval_every_steps)
+        num_pretrain_epochs = self.cfg.get("num_pretrain_epochs", None)
+        eval_every_epochs = self.cfg.get("eval_every_epochs", None)
+        snapshot_every_epochs = self.cfg.get("snapshot_every_epochs", None)
+
+        if (
+            num_pretrain_epochs is None
+            and eval_every_epochs is None
+            and snapshot_every_epochs is None
+        ):
+            return num_pretrain_steps, eval_every_steps, None
+
+        batches_per_epoch = self._offline_batches_per_epoch()
+        if num_pretrain_epochs is not None:
+            num_pretrain_steps = int(num_pretrain_epochs) * batches_per_epoch
+        if eval_every_epochs is not None:
+            eval_every_steps = int(eval_every_epochs) * batches_per_epoch
+        snapshot_every_steps = None
+        if snapshot_every_epochs is not None:
+            snapshot_every_steps = int(snapshot_every_epochs) * batches_per_epoch
+
+        logging.info(
+            "Resolved offline pretrain schedule: %d batches/epoch, "
+            "%d pretrain steps, eval every %d steps, snapshot every %s steps.",
+            batches_per_epoch,
+            num_pretrain_steps,
+            eval_every_steps,
+            "disabled" if snapshot_every_steps is None else str(snapshot_every_steps),
+        )
+        return num_pretrain_steps, eval_every_steps, snapshot_every_steps
 
     def _close_replay_iter(self):
         if self._replay_iter is None:
@@ -478,6 +678,8 @@ class Workspace:
         return replay_path.exists() and any(replay_path.glob("*.npz"))
 
     def _should_collect_demos_from_dataset(self) -> bool:
+        if self._should_use_lazy_replay():
+            return False
         if self.use_demo_replay:
             return True
         if not bool(self.cfg.replay.reuse_saved):
@@ -485,6 +687,9 @@ class Workspace:
         if self._requires_demo_stats():
             return True
         return not self._saved_replay_exists(demo_replay=False)
+
+    def _should_use_lazy_replay(self) -> bool:
+        return lazy_replay_enabled(self.cfg)
 
     def _timer_state_dict(self) -> dict[str, float]:
         return {"elapsed_total": self._timer.total_time()}
@@ -562,13 +767,87 @@ class Workspace:
             extracted[key] = value[env_idx]
         return extracted
 
+    def _executed_vector_action_steps(self, infos: dict[str, Any]) -> np.ndarray:
+        return np.asarray(
+            [
+                _executed_action_steps(
+                    self._extract_vector_env_info(
+                        infos,
+                        env_idx,
+                        prefer_final=True,
+                    )
+                )
+                for env_idx in range(self.eval_envs.num_envs)
+            ],
+            dtype=np.int32,
+        )
+
+    def _eval_seed_for_episode(self, episode: int) -> int | None:
+        env_cfg = self.cfg.get("env", {})
+        eval_seeds = env_cfg.get("eval_seeds", None)
+        if eval_seeds is not None:
+            if len(eval_seeds) == 0:
+                raise ValueError("env.eval_seeds must contain at least one seed.")
+            return int(eval_seeds[int(episode) % len(eval_seeds)])
+        eval_seed_start = env_cfg.get("eval_seed_start", None)
+        if eval_seed_start is None:
+            return None
+        return int(eval_seed_start) + int(episode)
+
+    def _set_agent_active_eval_seeds(self, seeds: list[int] | None) -> None:
+        setter = getattr(self.agent, "set_active_eval_seeds", None)
+        if callable(setter):
+            setter(seeds)
+
+    def _reset_vector_env_slots(
+        self,
+        observation,
+        reset_requests: list[tuple[int, int]],
+    ):
+        envs = getattr(self.eval_envs, "envs", None)
+        if envs is None:
+            raise NotImplementedError(
+                "Per-episode vector evaluation seeds require a vector environment "
+                "that exposes its individual envs."
+            )
+
+        observations = list(
+            gym.vector.utils.iterate(
+                self.eval_envs.single_observation_space,
+                observation,
+            )
+        )
+        # Gymnasium 0.29 autoresets done slots without a seed inside step().
+        # Reset those slots again and replace the observation before the next act().
+        for env_idx, seed in reset_requests:
+            observations[env_idx], _ = envs[env_idx].reset(seed=int(seed))
+
+        out = getattr(self.eval_envs, "observations", None)
+        if out is None:
+            out = gym.vector.utils.create_empty_array(
+                self.eval_envs.single_observation_space,
+                n=self.eval_envs.num_envs,
+            )
+        observation = gym.vector.utils.concatenate(
+            self.eval_envs.single_observation_space,
+            observations,
+            out,
+        )
+        if hasattr(self.eval_envs, "observations"):
+            self.eval_envs.observations = observation
+        return observation
+
     def _run_single_env_eval(self, eval_record_all_episode: bool = False) -> dict[str, Any]:
         step, episode, total_reward, successes = 0, 0, 0, 0
         eval_until_episode = _Until(self.cfg.num_eval_episodes)
         first_rollout = []
         metrics = {}
         while eval_until_episode(episode):
-            observation, info = self.eval_env.reset()
+            reset_seed = self._eval_seed_for_episode(episode)
+            observation, info = self.eval_env.reset(seed=reset_seed)
+            self._set_agent_active_eval_seeds(
+                None if reset_seed is None else [reset_seed]
+            )
             # eval agent always has last id (ids start from 0)
             self.agent.reset(self.main_loop_iterations, [self._eval_agent_indices[-1]])
             enabled = eval_record_all_episode or episode == 0
@@ -590,8 +869,8 @@ class Workspace:
                     if hasattr(self.eval_env, "give_agent_info"):
                         self.eval_env.give_agent_info(env_metrics["agent_act_info"])
                 self.eval_video_recorder.record(self.eval_env)
-                total_reward += reward
-                step += 1
+                total_reward += float(np.asarray(reward).item())
+                step += _executed_action_steps(next_info)
             if episode == 0:
                 first_rollout = np.array(self.eval_video_recorder.frames)
             self.eval_video_recorder.save(f"{self.global_env_steps}.mp4")
@@ -603,8 +882,8 @@ class Workspace:
             episode += 1
         metrics.update(
             {
-                "episode_reward": total_reward / episode,
-                "episode_length": step * self.cfg.action_repeat / episode,
+                "episode_reward": float(total_reward / episode),
+                "episode_length": float(step * self.cfg.action_repeat / episode),
             }
         )
         if successes is not None:
@@ -615,7 +894,29 @@ class Workspace:
 
     def _run_vector_env_eval(self, eval_record_all_episode: bool = False) -> dict[str, Any]:
         del eval_record_all_episode
-        observation, _ = self.eval_envs.reset()
+        active_eval_seeds = [
+            self._eval_seed_for_episode(episode)
+            for episode in range(self.eval_envs.num_envs)
+        ]
+        use_fixed_eval_seeds = active_eval_seeds[0] is not None
+        if use_fixed_eval_seeds:
+            assert all(seed is not None for seed in active_eval_seeds)
+            observation, _ = self.eval_envs.reset(seed=active_eval_seeds)
+            self._set_agent_active_eval_seeds(active_eval_seeds)
+        else:
+            observation, _ = self.eval_envs.reset()
+            self._set_agent_active_eval_seeds(None)
+        active_episode_is_target = np.arange(self.eval_envs.num_envs) < int(
+            self.cfg.num_eval_episodes
+        )
+        next_target_episode = min(
+            self.eval_envs.num_envs,
+            int(self.cfg.num_eval_episodes),
+        )
+        next_filler_episode = max(
+            self.eval_envs.num_envs,
+            int(self.cfg.num_eval_episodes),
+        )
         self.agent.reset(self.main_loop_iterations, self._eval_agent_indices)
 
         completed_rewards = []
@@ -634,10 +935,9 @@ class Workspace:
                 (next_observation, reward, termination, truncation, next_info),
                 env_metrics,
             ) = self._perform_env_steps(observation, self.eval_envs, True)
-            observation = next_observation
             metrics.update(env_metrics)
             episode_rewards += reward
-            episode_lengths += 1
+            episode_lengths += self._executed_vector_action_steps(next_info)
 
             if not video_complete:
                 self.eval_video_recorder.record(self.eval_envs)
@@ -647,6 +947,7 @@ class Workspace:
                 video_complete = True
 
             if not np.any(done_mask):
+                observation = next_observation
                 continue
 
             done_env_indices = np.flatnonzero(done_mask)
@@ -655,7 +956,7 @@ class Workspace:
                 [self._eval_agent_indices[idx] for idx in done_env_indices],
             )
             for env_idx in done_env_indices:
-                if len(completed_rewards) < self.cfg.num_eval_episodes:
+                if active_episode_is_target[env_idx]:
                     completed_rewards.append(float(episode_rewards[env_idx]))
                     completed_lengths.append(int(episode_lengths[env_idx]))
                     info = self._extract_vector_env_info(
@@ -668,8 +969,36 @@ class Workspace:
                             completed_successes = []
                         else:
                             completed_successes.append(int(np.asarray(success).astype(int).item()))
+                active_episode_is_target[env_idx] = False
                 episode_rewards[env_idx] = 0.0
                 episode_lengths[env_idx] = 0
+
+            needs_another_step = (
+                len(completed_rewards) < self.cfg.num_eval_episodes
+                or not video_complete
+            )
+            if needs_another_step:
+                reset_requests = []
+                for env_idx in done_env_indices:
+                    if next_target_episode < self.cfg.num_eval_episodes:
+                        next_episode = next_target_episode
+                        next_target_episode += 1
+                        active_episode_is_target[env_idx] = True
+                    else:
+                        next_episode = next_filler_episode
+                        next_filler_episode += 1
+                    if use_fixed_eval_seeds:
+                        next_seed = self._eval_seed_for_episode(next_episode)
+                        assert next_seed is not None
+                        active_eval_seeds[env_idx] = next_seed
+                        reset_requests.append((int(env_idx), next_seed))
+                if use_fixed_eval_seeds:
+                    next_observation = self._reset_vector_env_slots(
+                        next_observation,
+                        reset_requests,
+                    )
+                    self._set_agent_active_eval_seeds(active_eval_seeds)
+            observation = next_observation
 
         if self.cfg.log_eval_video and len(self.eval_video_recorder.frames) > 0:
             self.eval_video_recorder.save(f"{self.global_env_steps}.mp4")
@@ -690,8 +1019,15 @@ class Workspace:
     def _eval(self, eval_record_all_episode: bool = False) -> dict[str, Any]:
         # TODO: In future, this func could do with a further refactor
         self._ensure_eval_envs_created()
-        if self.eval_env is None:
+        if self.eval_env is None and self.eval_envs is None:
             raise ValueError("Evaluation requested but no evaluation environment is configured.")
+        reset_aligned_eval_noise = getattr(
+            self.agent,
+            "reset_aligned_eval_noise",
+            None,
+        )
+        if callable(reset_aligned_eval_noise):
+            reset_aligned_eval_noise()
         self.agent.set_eval_env_running(True)
         try:
             if self.eval_envs is not None:
@@ -702,6 +1038,7 @@ class Workspace:
                 eval_record_all_episode=eval_record_all_episode
             )
         finally:
+            self._set_agent_active_eval_seeds(None)
             self.agent.set_eval_env_running(False)
             if self._defer_live_eval_env_creation:
                 self._close_eval_envs()
@@ -813,6 +1150,9 @@ class Workspace:
     def _load_demos(self):
         if self._snapshot_loaded:
             return
+        if self._should_use_lazy_replay():
+            logging.info("Using lazy replay; skipping DemoEnv replay import.")
+            return
         if self.replay_buffer.reused_existing and not self.use_demo_replay:
             logging.info("Reusing saved replay episodes from disk. Skipping demo import.")
             return
@@ -828,6 +1168,15 @@ class Workspace:
                 self.env_factory.load_demos_into_replay(
                     self.cfg, self.demo_replay_buffer, is_demo_buffer=True
                 )
+            if bool(self.cfg.replay.get("discard_loaded_demos_after_replay", True)):
+                clear_loaded_demos = getattr(
+                    self.env_factory,
+                    "clear_loaded_demos",
+                    None,
+                )
+                if callable(clear_loaded_demos):
+                    clear_loaded_demos()
+                    gc.collect()
 
         if self.cfg.replay_size_before_train > 0:
             num_demos = _normalize_demos_count(num_demos)
@@ -917,13 +1266,22 @@ class Workspace:
         return action, (*env_step_tuple, next_info), metrics
 
     def _pretrain_on_demos(self):
-        if self.cfg.num_pretrain_steps > 0:
-            pre_train_until_step = _Until(self.cfg.num_pretrain_steps)
+        (
+            num_pretrain_steps,
+            eval_every_steps,
+            snapshot_every_steps,
+        ) = self._resolve_pretrain_schedule()
+        if num_pretrain_steps > 0:
+            pre_train_until_step = _Until(num_pretrain_steps)
             should_pretrain_log = _Every(self.cfg.log_pretrain_every)
-            should_pretrain_eval = _Every(self.cfg.eval_every_steps)
-            snapshot_every_n = (
-                self.cfg.snapshot_every_n if self.cfg.save_snapshot else 0
-            )
+            should_pretrain_eval = _Every(eval_every_steps)
+            snapshot_every_n = 0
+            if self.cfg.save_snapshot:
+                snapshot_every_n = (
+                    snapshot_every_steps
+                    if snapshot_every_steps is not None
+                    else self.cfg.snapshot_every_n
+                )
             should_pretrain_save_snapshot = _Every(snapshot_every_n)
             snapshot_save_start_step = int(
                 self.cfg.get("snapshot_save_start_step", 0)
@@ -931,13 +1289,50 @@ class Workspace:
             if len(self.replay_buffer) <= 0:
                 raise ValueError(
                     "there is no sample to pre-train with in the replay buffer "
-                    f"but num_pretrain_steps ({self.cfg.num_pretrain_steps}) is > 0"
+                    f"but num_pretrain_steps ({num_pretrain_steps}) is > 0"
                 )
 
             while pre_train_until_step(self.pretrain_steps):
                 if self._shutting_down:
                     break
                 self.agent.logging = False
+
+                fused_update_steps = int(
+                    self.cfg.get("backend", {}).get("fused_update_steps", 1)
+                    if self.cfg.get("backend", None)
+                    else 1
+                )
+                if (
+                    fused_update_steps > 1
+                    and hasattr(self.agent, "update_many")
+                    and not should_pretrain_log(self.pretrain_steps)
+                ):
+                    boundary_step = int(num_pretrain_steps)
+                    if self.cfg.log_pretrain_every:
+                        next_log_step = (
+                            self.pretrain_steps // self.cfg.log_pretrain_every + 1
+                        ) * self.cfg.log_pretrain_every
+                        boundary_step = min(boundary_step, next_log_step)
+                    if eval_every_steps:
+                        next_eval_step = (
+                            self.pretrain_steps // eval_every_steps + 1
+                        ) * eval_every_steps
+                        boundary_step = min(boundary_step, next_eval_step - 1)
+                    if snapshot_every_n:
+                        next_snapshot_step = (
+                            self.pretrain_steps // snapshot_every_n + 1
+                        ) * snapshot_every_n
+                        boundary_step = min(boundary_step, next_snapshot_step - 1)
+                    block_steps = min(
+                        fused_update_steps,
+                        max(0, boundary_step - self.pretrain_steps),
+                    )
+                    if block_steps > 1:
+                        self.agent.update_many(
+                            self.replay_iter, block_steps, self.replay_buffer
+                        )
+                        self._pretrain_step += block_steps
+                        continue
 
                 if should_pretrain_log(self.pretrain_steps):
                     self.agent.logging = True
@@ -1066,9 +1461,10 @@ class Workspace:
             main_loop_iterations = self.main_loop_iterations
         if pretrain_steps is None:
             pretrain_steps = self.pretrain_steps
+        iteration = pretrain_steps if self.train_envs is None else main_loop_iterations
         metrics = {
             "total_time": total_time,
-            "iteration": main_loop_iterations,
+            "iteration": iteration,
             "env_steps": self._calculate_global_env_steps(
                 main_loop_iterations=main_loop_iterations,
                 pretrain_steps=pretrain_steps,
@@ -1113,10 +1509,18 @@ class Workspace:
     def _ensure_eval_envs_created(self):
         if self.cfg.num_eval_episodes <= 0:
             return
-        if self.eval_env is None:
-            self.eval_env = self.env_factory.make_eval_env(self.cfg)
-        if self.cfg.num_eval_envs > 1 and self.eval_envs is None:
-            self.eval_envs = self.env_factory.make_eval_envs(self.cfg)
+        if self.cfg.num_eval_envs > 1:
+            if self.eval_env is not None:
+                self.eval_env.close()
+                self.eval_env = None
+            if self.eval_envs is None:
+                self.eval_envs = self.env_factory.make_eval_envs(self.cfg)
+        else:
+            if self.eval_envs is not None:
+                self.eval_envs.close()
+                self.eval_envs = None
+            if self.eval_env is None:
+                self.eval_env = self.env_factory.make_eval_env(self.cfg)
 
     def _close_eval_envs(self):
         if self.eval_envs is not None:
@@ -1156,7 +1560,12 @@ class Workspace:
         with snapshot.open("wb") as f:
             pickle.dump(payload, f)
         latest_snapshot = self.work_dir / "snapshots" / "latest_snapshot.pkl"
-        shutil.copy(snapshot, latest_snapshot)
+        # Point `latest` at the just-written snapshot via a relative symlink
+        # instead of a full copy, so we don't duplicate the (large) checkpoint
+        # on disk. Resume reads latest_snapshot.pkl and transparently follows
+        # the link; the numbered `<step>_snapshot.pkl` is kept as-is.
+        latest_snapshot.unlink(missing_ok=True)
+        latest_snapshot.symlink_to(snapshot.name)
 
     def load_snapshot(
         self,

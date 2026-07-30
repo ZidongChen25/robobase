@@ -1,0 +1,13 @@
+# @package _global_
+
+defaults:
+  - d4rl
+  - _self_
+
+env:
+  task_name: relocate
+  dataset_format: minari
+  dataset_id: D4RL/relocate/expert-v2
+  episode_length: 200
+
+# demos: 5000 # Full size = 5000

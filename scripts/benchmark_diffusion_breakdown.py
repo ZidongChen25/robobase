@@ -36,15 +36,6 @@ def _configure_jax_logging():
     logging.getLogger("jax._src.xla_bridge").setLevel(logging.WARNING)
 
 
-def _torch_sync(device):
-    import torch
-
-    if device is None:
-        return
-    if device.type == "cuda":
-        torch.cuda.synchronize(device)
-
-
 def _summarize(values: list[float]) -> dict[str, float]:
     arr = np.asarray(values, dtype=np.float64)
     mean = float(arr.mean())
@@ -111,96 +102,6 @@ def _compose_cfg(
         job_name="benchmark_diffusion_breakdown",
     ):
         return compose(config_name="robobase_config", overrides=overrides)
-
-
-def _benchmark_torch_step(agent, replay_iter, replay_buffer) -> dict[str, float]:
-    from robobase.method.utils import extract_from_batch, loss_weights
-
-    total_start = time.perf_counter()
-
-    replay_start = time.perf_counter()
-    batch = next(replay_iter)
-    replay_next = time.perf_counter() - replay_start
-
-    cached_pixel_features = bool(
-        agent.use_pixels
-        and hasattr(agent, "_has_cached_pixel_features")
-        and agent._has_cached_pixel_features(batch)
-    )
-    transfer_start = time.perf_counter()
-    keys_to_skip = set()
-    if cached_pixel_features:
-        keys_to_skip.update(agent.obs_layout.rgb_keys)
-        keys_to_skip.update(f"{key}_tp1" for key in agent.obs_layout.rgb_keys)
-    batch = {
-        key: value.to(agent.device, non_blocking=True)
-        for key, value in batch.items()
-        if key not in keys_to_skip
-    }
-    _torch_sync(agent.device)
-    device_transfer = time.perf_counter() - transfer_start
-
-    prep_start = time.perf_counter()
-    action = batch["action"]
-    action_pad_mask = extract_from_batch(batch, "action_pad_mask", missing_ok=True)
-    loss_coeff = loss_weights(batch, agent.replay_beta)
-    low_dim_obs = None
-    if agent.low_dim_size > 0:
-        low_dim_obs, _ = agent.extract_low_dim_state(batch)
-    _torch_sync(agent.device)
-    prep_low_dim = time.perf_counter() - prep_start
-
-    vision_time = 0.0
-    fused_view_feats = None
-    if agent.use_pixels:
-        if cached_pixel_features:
-            fused_view_feats = agent._extract_cached_pixel_features(batch)
-        else:
-            vision_start = time.perf_counter()
-            rgb_obs, _, _ = agent.extract_pixels(batch)
-            _, rgb_feats = agent.encode(rgb_obs)
-            _, fused_view_feats = agent.multi_view_fusion(rgb_obs, rgb_feats)
-            if fused_view_feats is not None:
-                fused_view_feats = fused_view_feats.detach()
-            _torch_sync(agent.device)
-            vision_time = time.perf_counter() - vision_start
-
-    core_start = time.perf_counter()
-    agent.update_actor(
-        low_dim_obs,
-        fused_view_feats,
-        action,
-        loss_coeff,
-        action_pad_mask=action_pad_mask,
-        used_cached_pixel_features=cached_pixel_features,
-    )
-    _torch_sync(agent.device)
-    core_update = time.perf_counter() - core_start
-
-    priority_start = time.perf_counter()
-    if replay_buffer.__class__.__name__ == "PrioritizedReplayBuffer":
-        replay_buffer.set_priority(
-            indices=batch["indices"].cpu().detach().numpy(),
-            priorities=agent._new_priority**agent.replay_alpha,
-        )
-    priority_update = time.perf_counter() - priority_start
-
-    total = time.perf_counter() - total_start
-    return {
-        "replay_next_sec": replay_next,
-        "device_transfer_sec": device_transfer,
-        "prep_low_dim_sec": prep_low_dim,
-        "vision_encode_fuse_sec": vision_time,
-        "core_update_sec": core_update,
-        "priority_update_sec": priority_update,
-        "total_sec": total,
-        "segment_sum_sec": replay_next
-        + device_transfer
-        + prep_low_dim
-        + vision_time
-        + core_update
-        + priority_update,
-    }
 
 
 def _benchmark_jax_step(agent, replay_iter, replay_buffer) -> dict[str, float]:
@@ -319,18 +220,11 @@ def _run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
         replay_dir = Path(args.replay_save_dir)
         replay_file_count = len(list(replay_dir.glob("*.npz"))) if replay_dir.exists() else 0
 
-        if args.backend == "torch":
-            step_fn = lambda: _benchmark_torch_step(
-                agent,
-                workspace.replay_iter,
-                workspace.replay_buffer,
-            )
-        else:
-            step_fn = lambda: _benchmark_jax_step(
-                agent,
-                workspace.replay_iter,
-                workspace.replay_buffer,
-            )
+        step_fn = lambda: _benchmark_jax_step(
+            agent,
+            workspace.replay_iter,
+            workspace.replay_buffer,
+        )
 
         for _ in range(args.warmup_iters):
             step_fn()
@@ -363,11 +257,11 @@ def _run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--backend", choices=("torch", "jax"), required=True)
+    parser.add_argument("--backend", choices=("jax",), default="jax")
     parser.add_argument("--modality", choices=("state", "image"), required=True)
     parser.add_argument("--gpu-id", type=int, default=3)
     parser.add_argument("--demos", default=".inf")
-    parser.add_argument("--cache-backends", default="torch,jax")
+    parser.add_argument("--cache-backends", default="jax")
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--replay-num-workers", type=int, default=4)
     parser.add_argument("--warmup-iters", type=int, default=5)

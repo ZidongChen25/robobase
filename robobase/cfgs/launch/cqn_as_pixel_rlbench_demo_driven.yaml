@@ -1,0 +1,51 @@
+# @package _global_
+
+defaults:
+  - ../method: cqn_as
+  - ../env: rlbench/take_lid_off_saucepan
+  - /env/rlbench/episode_length: cqn
+
+pixels: true
+visual_observation_shape: [84, 84]
+frame_stack: 8
+action_repeat: 1
+action_sequence: 4
+execution_length: 1
+temporal_ensemble: false  # CQN-AS performs the official ensemble inside the agent.
+
+env:
+  arm_max_velocity: 2.0
+  arm_max_acceleration: 8.0
+
+demos: 100
+use_min_max_normalization: true
+min_max_margin: 0.2
+batch_size: 256
+demo_batch_size: 256
+num_pretrain_steps: 0
+num_explore_steps: 0
+replay_size_before_train: 500
+use_self_imitation: true
+num_train_frames: 30100
+num_eval_episodes: 50
+eval_every_steps: 2500
+update_every_steps: 1
+
+replay:
+  nstep: 1
+  size: 50000
+  demo_size: 50000
+  num_workers: 4
+  action_padding: edge
+  action_sequence_start_offset: 0
+  include_tp1: true
+
+method:
+  v_min: -2.0
+  v_max: 2.0
+  bc_margin: 0.01
+  use_target_network_for_rollout: true
+
+hydra:
+  run:
+    dir: ./exp_local/pixel_cqn_as/rlbench_${env.task_name}_${now:%Y%m%d%H%M%S}

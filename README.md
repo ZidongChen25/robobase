@@ -62,6 +62,10 @@ export QT_DEBUG_PLUGINS=1
 
 ### BiGym
 
+RoboBase includes a local BiGym checkout at [third_party/bigym](third_party/bigym).
+This machine also has a standalone BiGym project at
+[/home/zc1525/bigym](/home/zc1525/bigym).
+
 ```commandline
 pip install ".[bigym]"
 ```

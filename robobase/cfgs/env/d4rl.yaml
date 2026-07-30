@@ -3,7 +3,7 @@
 env:
   env_name: d4rl
   episode_length: 999
-  random_traj: false  # if true, will choose the top K (K=demos) trajectories
+  random_traj: false  # false selects top-K returns; true samples K trajectories
   stddev_schedule: linear(1.0,0.1,500000)
 
 # demos: .inf # Use all available demos

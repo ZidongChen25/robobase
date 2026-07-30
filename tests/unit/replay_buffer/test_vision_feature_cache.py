@@ -1,12 +1,15 @@
 from pathlib import Path
 
 import numpy as np
+import pytest
 from gymnasium import spaces
 from omegaconf import OmegaConf
 
 from robobase.replay_buffer.uniform_replay_buffer import UniformReplayBuffer
 from robobase.replay_buffer.vision_feature_cache import (
+    JAX_ACT_FEATURE_KEY,
     JAX_DIFFUSION_FEATURE_KEY,
+    VISION_CACHE_FINGERPRINT_KEY,
     build_vision_feature_cache_plan,
 )
 
@@ -24,6 +27,36 @@ def _make_diffusion_cfg(cache_setting="auto"):
                 "encoder_model": {
                     "type": "resnet",
                     "model": "resnet18",
+                    "trainable": False,
+                    "pretrained": True,
+                },
+                "view_fusion_model": {
+                    "type": "multicam_feature",
+                    "mode": "flatten",
+                },
+            },
+            "replay": {
+                "cache_frozen_image_features": cache_setting,
+                "cache_frozen_image_feature_backends": ["jax"],
+            },
+        }
+    )
+
+
+def _make_act_cfg(cache_setting="auto"):
+    return OmegaConf.create(
+        {
+            "action_sequence": 16,
+            "method": {
+                "name": "act",
+                "actor_model": {
+                    "type": "transformer",
+                    "num_queries": 16,
+                },
+                "encoder_model": {
+                    "type": "resnet",
+                    "model": "resnet18",
+                    "trainable": False,
                 },
                 "view_fusion_model": {
                     "type": "multicam_feature",
@@ -67,6 +100,7 @@ def test_build_vision_feature_cache_plan_replaces_raw_rgb_with_cached_features()
     assert "rgb1" not in plan.observation_space.spaces
     assert JAX_DIFFUSION_FEATURE_KEY in plan.observation_space.spaces
     assert plan.observation_space[JAX_DIFFUSION_FEATURE_KEY].shape == (1, 1024)
+    assert VISION_CACHE_FINGERPRINT_KEY in plan.observation_space.spaces
 
 
 def test_feature_preprocessor_rewrites_raw_transition(monkeypatch):
@@ -95,6 +129,121 @@ def test_feature_preprocessor_rewrites_raw_transition(monkeypatch):
     assert "rgb1" not in processed
     assert processed[JAX_DIFFUSION_FEATURE_KEY].shape == (1024,)
     assert np.all(processed[JAX_DIFFUSION_FEATURE_KEY] == 2.0)
+    assert (
+        processed[VISION_CACHE_FINGERPRINT_KEY].tobytes().hex()
+        == plan.fingerprint
+    )
+
+
+def test_feature_preprocessor_forwards_pretrained_to_jax_encoder(monkeypatch):
+    plan = build_vision_feature_cache_plan(
+        cfg=_make_diffusion_cfg(),
+        observation_space=_make_pixel_obs_space(),
+        save_dir=None,
+        reuse_saved=False,
+    )
+    preprocessor = plan.preprocessing_fn[0]
+    captured = {}
+
+    class FakeEncoder:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+        def encode(self, rgb_batch):
+            return np.zeros(
+                (rgb_batch.shape[0], rgb_batch.shape[1], 512),
+                dtype=np.float32,
+            )
+
+    monkeypatch.setattr("robobase.models.encoder.JaxResNetEncoder", FakeEncoder)
+
+    preprocessor._encode_jax(np.zeros((2, 2, 3, 16, 16), dtype=np.uint8))
+
+    assert captured["pretrained"] is True
+
+
+def test_feature_cache_v3_key_rejects_legacy_random_feature_cache(tmp_path: Path):
+    np.savez(
+        tmp_path / "episode_0_2_0.npz",
+        vision_features_jax_diffusion=np.zeros((2, 1024), dtype=np.float32),
+    )
+
+    assert JAX_DIFFUSION_FEATURE_KEY == "vision_features_jax_diffusion_v3"
+    with pytest.raises(ValueError, match="does not contain cached image features"):
+        build_vision_feature_cache_plan(
+            cfg=_make_diffusion_cfg(),
+            observation_space=_make_pixel_obs_space(),
+            save_dir=str(tmp_path),
+            reuse_saved=True,
+        )
+
+
+def test_cache_plan_accepts_matching_saved_fingerprint(tmp_path: Path):
+    initial_plan = build_vision_feature_cache_plan(
+        cfg=_make_diffusion_cfg(),
+        observation_space=_make_pixel_obs_space(),
+        save_dir=None,
+        reuse_saved=False,
+    )
+    encoded_fingerprint = np.frombuffer(
+        bytes.fromhex(initial_plan.fingerprint),
+        dtype=np.uint8,
+    )
+    np.savez(
+        tmp_path / "episode_0_2_0.npz",
+        **{
+            JAX_DIFFUSION_FEATURE_KEY: np.zeros((2, 1024), dtype=np.float32),
+            VISION_CACHE_FINGERPRINT_KEY: np.repeat(
+                encoded_fingerprint[None],
+                2,
+                axis=0,
+            ),
+        },
+    )
+
+    reused_plan = build_vision_feature_cache_plan(
+        cfg=_make_diffusion_cfg(),
+        observation_space=_make_pixel_obs_space(),
+        save_dir=str(tmp_path),
+        reuse_saved=True,
+    )
+
+    assert reused_plan is not None
+    assert reused_plan.fingerprint == initial_plan.fingerprint
+
+
+def test_cache_plan_rejects_fingerprint_from_different_encoder(tmp_path: Path):
+    initial_plan = build_vision_feature_cache_plan(
+        cfg=_make_diffusion_cfg(),
+        observation_space=_make_pixel_obs_space(),
+        save_dir=None,
+        reuse_saved=False,
+    )
+    encoded_fingerprint = np.frombuffer(
+        bytes.fromhex(initial_plan.fingerprint),
+        dtype=np.uint8,
+    )
+    np.savez(
+        tmp_path / "episode_0_2_0.npz",
+        **{
+            JAX_DIFFUSION_FEATURE_KEY: np.zeros((2, 1024), dtype=np.float32),
+            VISION_CACHE_FINGERPRINT_KEY: np.repeat(
+                encoded_fingerprint[None],
+                2,
+                axis=0,
+            ),
+        },
+    )
+    changed_cfg = _make_diffusion_cfg()
+    changed_cfg.method.encoder_model.model = "resnet34"
+
+    with pytest.raises(ValueError, match="fingerprint"):
+        build_vision_feature_cache_plan(
+            cfg=changed_cfg,
+            observation_space=_make_pixel_obs_space(),
+            save_dir=str(tmp_path),
+            reuse_saved=True,
+        )
 
 
 def test_cache_plan_falls_back_when_reusing_raw_saved_replay(tmp_path: Path):

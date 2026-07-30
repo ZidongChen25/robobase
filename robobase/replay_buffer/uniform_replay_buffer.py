@@ -16,7 +16,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Callable, Type
 import math
-from collections import defaultdict
+from collections import OrderedDict, defaultdict
 import logging
 from typing_extensions import override
 
@@ -49,7 +49,7 @@ def episode_len(episode):
 
 def save_episode(episode, fn):
     with io.BytesIO() as bs:
-        np.savez_compressed(bs, **episode)
+        np.savez(bs, **episode)
         bs.seek(0)
         with fn.open("wb") as f:
             f.write(bs.read())
@@ -60,6 +60,11 @@ def load_episode(fn: Path):
         episode = np.load(f)
         episode = {k: episode[k] for k in episode.keys()}
         return episode
+
+
+def _parse_episode_file_metadata(eps_fn: Path) -> tuple[int, int, int]:
+    eps_idx, eps_len, global_idx = [int(x) for x in eps_fn.stem.split("_")[-3:]]
+    return eps_idx, eps_len, global_idx
 
 
 class UniformReplayBuffer(ReplayBuffer):
@@ -132,6 +137,11 @@ class UniformReplayBuffer(ReplayBuffer):
         fetch_every: int = 100,
         sequential: bool = False,
         transition_seq_len: int = 1,
+        action_sequence_start_offset: int = 0,
+        action_padding: str = "zero",
+        max_cached_episodes: int | None = None,
+        max_cached_episode_bytes: int | None = None,
+        include_tp1: bool = True,
         multiprocessing_context: str = "fork",
     ):
         """Initializes OutOfGraphReplayBuffer.
@@ -225,6 +235,28 @@ class UniformReplayBuffer(ReplayBuffer):
         self._frame_stacks = frame_stack
         self._action_seq_len = action_seq_len
         self._transition_seq_len = transition_seq_len
+        self._action_sequence_start_offset = max(0, int(action_sequence_start_offset))
+        self._action_padding = str(action_padding).lower()
+        if self._action_padding not in {"zero", "edge", "repeat"}:
+            raise ValueError(
+                "action_padding must be one of 'zero', 'edge', or 'repeat'."
+            )
+        self._max_cached_episodes = (
+            None if max_cached_episodes is None else int(max_cached_episodes)
+        )
+        self._max_cached_episode_bytes = (
+            None
+            if max_cached_episode_bytes is None
+            else int(max_cached_episode_bytes)
+        )
+        if self._max_cached_episodes is not None and self._max_cached_episodes < 0:
+            raise ValueError("max_cached_episodes must be >= 0 or null.")
+        if (
+            self._max_cached_episode_bytes is not None
+            and self._max_cached_episode_bytes < 0
+        ):
+            raise ValueError("max_cached_episode_bytes must be >= 0 or null.")
+        self._include_tp1 = bool(include_tp1)
         self._replay_capacity = replay_capacity
         self._batch_size = batch_size
         self._nstep = 1 if sequential else nstep
@@ -250,7 +282,12 @@ class UniformReplayBuffer(ReplayBuffer):
 
         # =======
         self._episode_files = []  # list of episode file path
-        self._episodes = {}  # Key: eps_file_path, value: episode
+        self._episodes = OrderedDict()  # Key: eps_file_path, value: episode
+        self._episode_cache_bytes = 0
+        self._episode_metadata_cache_key = None
+        self._episode_metadata_records = []
+        self._episode_metadata_starts = np.asarray([], dtype=np.int64)
+        self._episode_metadata_ends = np.asarray([], dtype=np.int64)
         # Key: global_idx. Global_idx refers to the index in the entire replay buffer.
         # Value: (episode_file_path, transition_idx) where transition_idx
         # refers to the index of transition in the episode
@@ -273,6 +310,11 @@ class UniformReplayBuffer(ReplayBuffer):
             self.__class__.__name__,
         )
         logging.info("\t frame_stack: %d", self._frame_stacks)
+        logging.info(
+            "\t action_sequence_start_offset: %d",
+            self._action_sequence_start_offset,
+        )
+        logging.info("\t action_padding: %s", self._action_padding)
         logging.info("\t replay_capacity: %d", self._replay_capacity)
         logging.info("\t batch_size: %d", self._batch_size)
         logging.info("\t nstep: %d", self._nstep)
@@ -634,7 +676,12 @@ class UniformReplayBuffer(ReplayBuffer):
         self._save_snapshot = bool(state_dict.get("save_snapshot", self._save_snapshot))
 
         self._episode_files = []
-        self._episodes = {}
+        self._episodes = OrderedDict()
+        self._episode_cache_bytes = 0
+        self._episode_metadata_cache_key = None
+        self._episode_metadata_records = []
+        self._episode_metadata_starts = np.asarray([], dtype=np.int64)
+        self._episode_metadata_ends = np.asarray([], dtype=np.int64)
         self._global_idxs_to_episode_and_transition_idx = defaultdict(list)
         self._size = 0
         self._samples_since_last_fetch = self._fetch_every
@@ -647,10 +694,103 @@ class UniformReplayBuffer(ReplayBuffer):
 
     ### Below are the Dataset functions ###
 
+    @staticmethod
+    def _episode_nbytes(episode: dict) -> int:
+        return int(sum(getattr(value, "nbytes", 0) for value in episode.values()))
+
+    def _cache_episode(
+        self,
+        eps_fn: Path,
+        episode: dict,
+        *,
+        enforce_limits: bool,
+    ):
+        if eps_fn in self._episodes:
+            old_episode = self._episodes.pop(eps_fn)
+            self._episode_cache_bytes -= self._episode_nbytes(old_episode)
+        self._episodes[eps_fn] = episode
+        self._episode_cache_bytes += self._episode_nbytes(episode)
+        if enforce_limits:
+            self._enforce_episode_cache_limits()
+
+    def _enforce_episode_cache_limits(self):
+        while self._episodes and (
+            (
+                self._max_cached_episodes is not None
+                and len(self._episodes) > self._max_cached_episodes
+            )
+            or (
+                self._max_cached_episode_bytes is not None
+                and self._episode_cache_bytes > self._max_cached_episode_bytes
+            )
+        ):
+            _, evicted_episode = self._episodes.popitem(last=False)
+            self._episode_cache_bytes -= self._episode_nbytes(evicted_episode)
+
+    def _get_episode_for_sampling(self, eps_fn: Path) -> dict:
+        if eps_fn in self._episodes:
+            episode = self._episodes.pop(eps_fn)
+            self._episodes[eps_fn] = episode
+            return episode
+        episode = load_episode(eps_fn)
+        self._cache_episode(eps_fn, episode, enforce_limits=True)
+        return episode
+
+    def _episode_metadata(self):
+        records = self._unique_episode_file_records()
+        cache_key = tuple(records)
+        if cache_key != self._episode_metadata_cache_key:
+            self._episode_metadata_cache_key = cache_key
+            self._episode_metadata_records = records
+            self._episode_metadata_starts = np.asarray(
+                [global_idx for _, _, global_idx in records],
+                dtype=np.int64,
+            )
+            self._episode_metadata_ends = np.asarray(
+                [global_idx + eps_len for _, eps_len, global_idx in records],
+                dtype=np.int64,
+            )
+        return (
+            self._episode_metadata_records,
+            self._episode_metadata_starts,
+            self._episode_metadata_ends,
+        )
+
+    def _locate_global_index(
+        self,
+        global_index: int,
+        records: list[tuple[Path, int, int]] | None = None,
+        starts: np.ndarray | None = None,
+        ends: np.ndarray | None = None,
+    ) -> tuple[Path, int]:
+        if global_index in self._global_idxs_to_episode_and_transition_idx:
+            episode_fn, transition_idx = (
+                self._global_idxs_to_episode_and_transition_idx[global_index]
+            )
+            return episode_fn, transition_idx
+
+        if records is None or starts is None or ends is None:
+            records, starts, ends = self._episode_metadata()
+        if starts.size == 0:
+            raise ValueError("Cannot sample because no replay episodes are available.")
+
+        record_idx = int(np.searchsorted(starts, global_index, side="right") - 1)
+        if record_idx < 0 or global_index >= int(ends[record_idx]):
+            raise ValueError(f"Global replay index {global_index} is not available.")
+        eps_fn, _, global_start = records[record_idx]
+        return eps_fn, int(global_index - global_start)
+
     def _sample_episode(self):
-        eps_fn = np.random.choice(self._episode_files)
-        _, _, global_index = [int(x) for x in eps_fn.stem.split("_")[1:]]
-        return self._episodes[eps_fn], global_index
+        if self._episode_files:
+            eps_fn = np.random.choice(self._episode_files)
+            _, _, global_index = _parse_episode_file_metadata(eps_fn)
+            return self._get_episode_for_sampling(eps_fn), global_index
+
+        records, _, _ = self._episode_metadata()
+        if not records:
+            raise ValueError("Cannot sample because no replay episodes are available.")
+        eps_fn, _, global_index = records[np.random.randint(0, len(records))]
+        return self._get_episode_for_sampling(eps_fn), global_index
 
     def _load_episode_into_worker(self, eps_fn: Path, global_idx: int):
         # Load episode into memory
@@ -673,7 +813,7 @@ class UniformReplayBuffer(ReplayBuffer):
         self._episode_files.append(eps_fn)
         self._episode_files.sort()  # NOTE: eps_fn starts with created timestamp.
         # so after sort, earliest episode appears first.
-        self._episodes[eps_fn] = episode
+        self._cache_episode(eps_fn, episode, enforce_limits=False)
         global_idxs = np.arange(global_idx, global_idx + eps_len)
         global_idxs_wrapped = (global_idxs % self.replay_capacity).tolist()
         self._global_idxs_to_episode_and_transition_idx.update(
@@ -698,7 +838,7 @@ class UniformReplayBuffer(ReplayBuffer):
         eps_fns = sorted(self._replay_dir.glob("*.npz"), reverse=True)
         fetched_size = 0
         for eps_fn in eps_fns:
-            eps_idx, eps_len, global_idx = [int(x) for x in eps_fn.stem.split("_")[1:]]
+            eps_idx, eps_len, global_idx = _parse_episode_file_metadata(eps_fn)
 
             # Each worker should only contain its relevant indices.
             if self._num_workers > 0 and eps_idx % self._num_workers != worker_id:
@@ -715,6 +855,171 @@ class UniformReplayBuffer(ReplayBuffer):
 
             if not self._load_episode_into_worker(eps_fn, global_idx):
                 break
+
+    def _unique_episode_file_records(self) -> list[tuple[Path, int, int]]:
+        records = []
+        seen_global_starts = set()
+
+        episode_files = list(self._replay_dir.glob("*.npz"))
+        if not episode_files:
+            episode_files = list(self._episode_files)
+
+        for eps_fn in sorted(episode_files):
+            _, eps_len, global_idx = _parse_episode_file_metadata(eps_fn)
+            if global_idx in seen_global_starts:
+                continue
+            seen_global_starts.add(global_idx)
+            records.append((eps_fn, eps_len, global_idx))
+
+        records.sort(key=lambda record: record[2])
+        return records
+
+    @override
+    def load_all_episodes(self):
+        if self.add_count <= 0:
+            return
+
+        original_max_size = self._max_size_per_worker
+        self._max_size_per_worker = max(self._max_size_per_worker, self._replay_capacity)
+        try:
+            for eps_fn, _, global_idx in self._unique_episode_file_records():
+                if eps_fn in self._episodes:
+                    continue
+                if not self._load_episode_into_worker(eps_fn, global_idx):
+                    raise ValueError(f"Failed to load replay episode '{eps_fn}'.")
+        finally:
+            self._max_size_per_worker = max(original_max_size, self._size)
+
+    @override
+    def episode_index_metadata(self) -> list[tuple[int, int]]:
+        return [
+            (global_idx, eps_len)
+            for _, eps_len, global_idx in self._unique_episode_file_records()
+        ]
+
+    def sample_batch_indices(self, indices: np.ndarray | list[int]) -> dict:
+        """Vectorized non-sequential sampling for a batch of global indices.
+
+        Epoch-style imitation learning repeatedly samples known global indices.
+        The generic ``sample`` path builds each item with Python loops and then
+        stacks 256 small dictionaries.  This path groups indices by episode and
+        uses NumPy advanced indexing for the observation and action windows.
+        """
+        if self._sequential:
+            return self.sample(batch_size=len(indices), indices=list(indices))
+
+        indices = np.asarray(indices, dtype=np.int64)
+        batch_size = int(indices.shape[0])
+        if batch_size == 0:
+            raise ValueError("sample_batch_indices requires at least one index.")
+
+        records, starts, ends = self._episode_metadata()
+        by_episode: dict[Path, list[tuple[int, int, int]]] = defaultdict(list)
+        for out_idx, global_index in enumerate(indices.tolist()):
+            episode_fn, transition_idx = self._locate_global_index(
+                global_index,
+                records=records,
+                starts=starts,
+                ends=ends,
+            )
+            by_episode[episode_fn].append((out_idx, transition_idx, global_index))
+
+        first_episode_fn = next(iter(by_episode.keys()))
+        first_episode = self._get_episode_for_sampling(first_episode_fn)
+
+        batch = {}
+        for name in self._obs_signature.keys():
+            obs_shape = first_episode[name].shape[1:]
+            batch[name] = np.empty(
+                (batch_size, self._frame_stacks, *obs_shape),
+                dtype=first_episode[name].dtype,
+            )
+            if self._include_tp1:
+                batch[name + "_tp1"] = np.empty_like(batch[name])
+
+        batch[ACTION] = np.empty(
+            (batch_size, self._action_seq_len, *first_episode[ACTION].shape[1:]),
+            dtype=first_episode[ACTION].dtype,
+        )
+        batch[ACTION_PAD_MASK] = np.zeros(
+            (batch_size, self._action_seq_len), dtype=np.bool_
+        )
+        batch[REWARD] = np.empty((batch_size,), dtype=first_episode[REWARD].dtype)
+        batch[TERMINAL] = np.empty((batch_size,), dtype=first_episode[TERMINAL].dtype)
+        batch[TRUNCATED] = np.empty((batch_size,), dtype=first_episode[TRUNCATED].dtype)
+        batch[INDICES] = indices.copy()
+        batch[DISCOUNT] = np.empty((batch_size,), dtype=np.float64)
+
+        for name in self._storage_signature.keys():
+            if name in batch:
+                continue
+            value_shape = first_episode[name].shape[1:]
+            batch[name] = np.empty(
+                (batch_size, *value_shape), dtype=first_episode[name].dtype
+            )
+
+        obs_offsets = np.arange(-(self._frame_stacks - 1), 1, dtype=np.int64)
+        action_offsets = np.arange(self._action_seq_len, dtype=np.int64)
+
+        for episode_fn, records in by_episode.items():
+            episode = self._get_episode_for_sampling(episode_fn)
+            out_idxs = np.asarray([record[0] for record in records], dtype=np.int64)
+            idxs = np.asarray([record[1] for record in records], dtype=np.int64)
+            ep_len = episode_len(episode)
+
+            next_idxs = idxs + self._nstep
+            obs_idxs = np.clip(idxs[:, None] + obs_offsets[None, :], 0, ep_len)
+            next_obs_idxs = np.clip(
+                next_idxs[:, None] + obs_offsets[None, :], 0, ep_len
+            )
+            for name in self._obs_signature.keys():
+                batch[name][out_idxs] = episode[name][obs_idxs]
+                if self._include_tp1:
+                    batch[name + "_tp1"][out_idxs] = episode[name][next_obs_idxs]
+
+            action_start_idxs = idxs - self._action_sequence_start_offset
+            action_idxs = action_start_idxs[:, None] + action_offsets[None, :]
+            invalid_action_idxs = (action_idxs < 0) | (action_idxs >= ep_len)
+            clipped_action_idxs = np.clip(action_idxs, 0, max(ep_len - 1, 0))
+            actions = episode[ACTION][clipped_action_idxs]
+            if self._action_padding == "zero":
+                actions = actions.copy()
+                actions[invalid_action_idxs] = 0
+                batch[ACTION_PAD_MASK][out_idxs] = invalid_action_idxs
+            batch[ACTION][out_idxs] = actions
+
+            if self._nstep == 1:
+                batch[REWARD][out_idxs] = episode[REWARD][idxs]
+                batch[TERMINAL][out_idxs] = episode[TERMINAL][idxs]
+                batch[TRUNCATED][out_idxs] = episode[TRUNCATED][idxs]
+                batch[DISCOUNT][out_idxs] = self._gamma
+            else:
+                for out_idx, idx, next_idx in zip(out_idxs, idxs, next_idxs):
+                    discount_slice_len = next_idx - idx
+                    batch[REWARD][out_idx] = np.sum(
+                        episode[REWARD][idx:next_idx]
+                        * self._cumulative_discount_vector[:discount_slice_len]
+                    )
+                    batch[TERMINAL][out_idx] = episode[TERMINAL][next_idx - 1]
+                    batch[TRUNCATED][out_idx] = episode[TRUNCATED][next_idx - 1]
+                    batch[DISCOUNT][out_idx] = self._gamma**discount_slice_len
+
+            for name in self._storage_signature.keys():
+                if name in {
+                    ACTION,
+                    ACTION_PAD_MASK,
+                    REWARD,
+                    TERMINAL,
+                    TRUNCATED,
+                    DISCOUNT,
+                    INDICES,
+                    *self._obs_signature.keys(),
+                }:
+                    continue
+                batch[name][out_idxs] = episode[name][idxs]
+
+        self._samples_since_last_fetch += batch_size
+        return batch
 
     def _flatten_episodes(self, episodes: list[dict]):
         for ep in episodes:
@@ -753,14 +1058,8 @@ class UniformReplayBuffer(ReplayBuffer):
             global_index += idx
 
         else:
-            if global_index not in self._global_idxs_to_episode_and_transition_idx:
-                # This worker does not have this sample
-                return None
-            (
-                episode_fn,
-                transition_idx,
-            ) = self._global_idxs_to_episode_and_transition_idx[global_index]
-            episode = self._episodes[episode_fn]
+            episode_fn, transition_idx = self._locate_global_index(global_index)
+            episode = self._get_episode_for_sampling(episode_fn)
             idx = transition_idx
 
         # Construct replay sample from sampled transition index
@@ -807,15 +1106,8 @@ class UniformReplayBuffer(ReplayBuffer):
             global_index += idx
 
         else:
-            if global_index not in self._global_idxs_to_episode_and_transition_idx:
-                # This worker does not have this sample
-                return None
-
-            (
-                episode_fn,
-                transition_idx,
-            ) = self._global_idxs_to_episode_and_transition_idx[global_index]
-            episode = self._episodes[episode_fn]
+            episode_fn, transition_idx = self._locate_global_index(global_index)
+            episode = self._get_episode_for_sampling(episode_fn)
             idx = transition_idx
 
         # Construct replay sample from sampled transition index
@@ -843,28 +1135,50 @@ class UniformReplayBuffer(ReplayBuffer):
         for name in self._obs_signature.keys():
             replay_sample[name] = episode[name][obs_idxs]
             # Retrieve tp1 observations
-            replay_sample[name + "_tp1"] = episode[name][next_obs_idxs]
+            if self._include_tp1:
+                replay_sample[name + "_tp1"] = episode[name][next_obs_idxs]
 
-        # Handle action sequences
-        action_start_idx = idx
-        action_end_idx = min(idx + self._action_seq_len, ep_len)
-        # - action_idxs contains indices of all action, considering action sequences.
-        action_idxs = list(range(action_start_idx, action_end_idx))
+        # Handle action sequences. CleanDiffuser-style diffusion-policy sampling
+        # starts the prediction horizon before the latest observation frame.
+        action_start_idx = idx - self._action_sequence_start_offset
+        action_end_idx = action_start_idx + self._action_seq_len
+        buffer_start_idx = max(action_start_idx, 0)
+        buffer_end_idx = min(action_end_idx, ep_len)
+        action_idxs = list(range(buffer_start_idx, buffer_end_idx))
         action_seq = episode[ACTION][action_idxs]
         action_pad_mask = np.zeros(self._action_seq_len, dtype=np.bool_)
-        # - Pad zeros to the end if action_sequences exceeds eps_len
-        if len(action_seq) < self._action_seq_len:
-            num_action_to_pad = self._action_seq_len - len(action_seq)
-            action_pad_mask[-num_action_to_pad:] = True
-            action_seq = np.concatenate(
-                [
-                    action_seq,
-                    np.zeros(
-                        (num_action_to_pad, *action_seq.shape[1:]),
-                        dtype=action_seq.dtype,
-                    ),
-                ],
-                axis=0,
+        pre_pad = max(0, -action_start_idx)
+        post_pad = max(0, action_end_idx - ep_len)
+        if pre_pad or post_pad:
+            if len(action_seq) == 0:
+                edge_idx = int(np.clip(action_start_idx, 0, max(ep_len - 1, 0)))
+                action_seq = episode[ACTION][[edge_idx]]
+            if self._action_padding in {"edge", "repeat"}:
+                parts = []
+                if pre_pad:
+                    parts.append(np.repeat(action_seq[:1], pre_pad, axis=0))
+                parts.append(action_seq)
+                if post_pad:
+                    parts.append(np.repeat(action_seq[-1:], post_pad, axis=0))
+                action_seq = np.concatenate(parts, axis=0)
+            else:
+                parts = []
+                if pre_pad:
+                    parts.append(
+                        np.zeros((pre_pad, *action_seq.shape[1:]), dtype=action_seq.dtype)
+                    )
+                    action_pad_mask[:pre_pad] = True
+                parts.append(action_seq)
+                if post_pad:
+                    parts.append(
+                        np.zeros((post_pad, *action_seq.shape[1:]), dtype=action_seq.dtype)
+                    )
+                    action_pad_mask[-post_pad:] = True
+                action_seq = np.concatenate(parts, axis=0)
+        if len(action_seq) != self._action_seq_len:
+            raise RuntimeError(
+                "Internal action sequence padding error: "
+                f"{len(action_seq)} != {self._action_seq_len}."
             )
         replay_sample[ACTION] = action_seq
         replay_sample[ACTION_PAD_MASK] = action_pad_mask
@@ -902,7 +1216,8 @@ class UniformReplayBuffer(ReplayBuffer):
             dict: replay sample.
         """
         # index here is the "global" index of a flattened sample
-        self._try_fetch()
+        if global_index is None:
+            self._try_fetch()
 
         self._samples_since_last_fetch += 1
 

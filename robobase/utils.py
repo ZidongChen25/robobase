@@ -33,6 +33,10 @@ from robobase.envs.env import Demo, DemoEnv
 from robobase.replay_buffer.replay_buffer import ReplayBuffer
 
 
+def _is_torch_tensor(value):
+    return _TORCH_AVAILABLE and torch.is_tensor(value)
+
+
 class eval_mode:
     def __init__(self, *models):
         self.models = models
@@ -542,8 +546,12 @@ def add_demo_to_replay_buffer(wrapped_env: DemoEnv, replay_buffer: ReplayBuffer)
     while not (term or trunc):
         next_obs, rew, term, trunc, next_info = wrapped_env.step(fake_action)
         action = next_info.pop("demo_action")
-        assert np.all(action <= 1.0)
-        assert np.all(action >= -1.0)
+        action_space = wrapped_env.action_space
+        if np.all(np.isfinite(action_space.low)) and np.all(
+            np.isfinite(action_space.high)
+        ):
+            assert np.all(action <= action_space.high)
+            assert np.all(action >= action_space.low)
         ep.append([obs, action, rew, term, trunc, info, next_info])
         obs = next_obs
         info = next_info
@@ -575,12 +583,12 @@ class DemoMergedIterator:
         ), f"Keys in demo batch are different: {batch.keys()}, {demo_batch.keys()}"
 
     def _ones_like(self, value):
-        if torch.is_tensor(value):
+        if _is_torch_tensor(value):
             return torch.ones_like(value)
         return np.ones_like(value)
 
     def _cat(self, lhs, rhs):
-        if torch.is_tensor(lhs):
+        if _is_torch_tensor(lhs):
             return torch.cat([lhs, rhs], 0)
         return np.concatenate([lhs, rhs], axis=0)
 

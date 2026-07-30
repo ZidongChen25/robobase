@@ -1,0 +1,8 @@
+[submodule "third_party/bigym"]
+	path = third_party/bigym
+	url = https://github.com/chernyadev/bigym.git
+	branch = master
+[submodule "third_party/mobile-genima-bigym"]
+	path = third_party/mobile-genima-bigym
+	url = https://github.com/ZidongChen25/mobile-genima-bigym.git
+	branch = mobile-genima

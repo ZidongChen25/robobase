@@ -6,7 +6,7 @@ import numpy as np
 
 
 def maybe_numpy(value) -> np.ndarray:
-    """Convert a value to a numpy array, handling torch tensors gracefully."""
+    """Convert array-like values to numpy arrays."""
     if isinstance(value, np.ndarray):
         return value
     if hasattr(value, "detach"):

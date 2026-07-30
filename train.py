@@ -36,10 +36,14 @@ def main(cfg):
 
     workspace = Workspace(cfg)
 
-    snapshot = root_dir / "snapshot.pt"
-    if snapshot.exists():
-        print(f"resuming: {snapshot}")
-        workspace.load_snapshot()
+    latest_snapshot = workspace.work_dir / "snapshots" / "latest_snapshot.pkl"
+    legacy_snapshot = root_dir / "snapshot.pt"
+    if latest_snapshot.exists():
+        print(f"resuming: {latest_snapshot}")
+        workspace.load_snapshot(latest_snapshot)
+    elif legacy_snapshot.exists():
+        print(f"resuming: {legacy_snapshot}")
+        workspace.load_snapshot(legacy_snapshot)
     workspace.train()
 
 

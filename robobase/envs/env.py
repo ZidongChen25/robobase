@@ -60,6 +60,12 @@ class EnvFactory:
         """
         raise NotImplementedError("This env does not support demo loading.")
 
+    def clear_loaded_demos(self):
+        """Release raw demonstration objects after they have been written to replay."""
+        for attr in ("_all_raw_demos", "_raw_demos", "_demos"):
+            if hasattr(self, attr):
+                delattr(self, attr)
+
 
 class DemoEnv(gym.Env):
     def __init__(self, demos: List[Demo], action_space, observation_space):

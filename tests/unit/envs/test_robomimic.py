@@ -7,7 +7,11 @@ from omegaconf import OmegaConf
 
 h5py = pytest.importorskip("h5py")
 
-from robobase.envs.robomimic import RobomimicEnvFactory
+from robobase.envs.robomimic import (
+    RobomimicEnvFactory,
+    _abs_action_to_raw_action,
+    _raw_action_to_abs_action,
+)
 from robobase.envs.wrappers import RecedingHorizonControl
 
 
@@ -111,6 +115,67 @@ def _write_image_dataset(path, image_shape=(84, 84)):
 
         mask_group = dataset_file.create_group("mask")
         mask_group.create_dataset("train", data=np.asarray([b"demo_0"]))
+
+
+def _write_toolhang_abs_dataset(path):
+    with h5py.File(path, "w") as dataset_file:
+        data_group = dataset_file.create_group("data")
+        data_group.attrs["env_args"] = json.dumps(
+            {
+                "env_name": "ToolHang",
+                "env_version": "1.4.1",
+                "type": 1,
+                "env_kwargs": {
+                    "robots": ["Panda"],
+                    "controller_configs": {"type": "OSC_POSE", "control_delta": True},
+                    "reward_shaping": False,
+                },
+            }
+        )
+        episode = data_group.create_group("demo_0")
+        length = 4
+        episode.attrs["num_samples"] = length
+        actions = np.asarray(
+            [
+                [-0.1, 0.0, 1.0, 0.1, 0.2, 0.3, -1.0],
+                [-0.05, 0.01, 1.02, 0.2, 0.1, 0.3, -1.0],
+                [0.0, 0.02, 1.04, 0.3, 0.1, 0.2, 1.0],
+                [0.05, 0.03, 1.06, 0.4, 0.2, 0.1, 1.0],
+            ],
+            dtype=np.float32,
+        )
+        episode.create_dataset("actions", data=actions)
+        rewards = np.zeros(length, dtype=np.float32)
+        rewards[-1] = 1.0
+        episode.create_dataset("rewards", data=rewards)
+        dones = np.zeros(length, dtype=np.uint8)
+        dones[-1] = 1
+        episode.create_dataset("dones", data=dones)
+
+        obs = episode.create_group("obs")
+        next_obs = episode.create_group("next_obs")
+        obs.create_dataset(
+            "object",
+            data=np.arange(length * 44, dtype=np.float32).reshape(length, 44),
+        )
+        obs.create_dataset(
+            "robot0_eef_pos",
+            data=np.arange(length * 3, dtype=np.float32).reshape(length, 3) / 10.0,
+        )
+        obs.create_dataset(
+            "robot0_eef_quat",
+            data=np.tile(np.asarray([1.0, 0.0, 0.0, 0.0], dtype=np.float32), (length, 1)),
+        )
+        obs.create_dataset(
+            "robot0_gripper_qpos",
+            data=np.arange(length * 2, dtype=np.float32).reshape(length, 2) / 10.0,
+        )
+        obs.create_dataset(
+            "robot0_joint_pos",
+            data=np.ones((length, 7), dtype=np.float32),
+        )
+        for key in obs.keys():
+            next_obs.create_dataset(key, data=np.asarray(obs[key]) + 1.0)
 
 
 def _make_cfg(dataset_path):
@@ -372,5 +437,59 @@ def test_postprocess_demos_supports_min_max_norm_and_rhc(tmp_path):
         )
         assert truncated
         assert info["action_sequence_mask"].tolist() == [1, 0, 0, 0]
+    finally:
+        env.close()
+
+
+def test_toolhang_clean_diffuser_lowdim_abs_parity(tmp_path):
+    dataset_path = tmp_path / "toolhang_low_dim_abs.hdf5"
+    _write_toolhang_abs_dataset(dataset_path)
+    cfg = _make_cfg(dataset_path)
+    cfg.env.filter_key = "all"
+    cfg.env.obs_keys = [
+        "object",
+        "robot0_eef_pos",
+        "robot0_eef_quat",
+        "robot0_gripper_qpos",
+    ]
+    cfg.env.abs_action = True
+    cfg.env.episode_length = 700
+    cfg.action_sequence = 3
+    cfg.execution_length = 2
+    cfg.action_execution_start = 1
+    cfg.temporal_ensemble = False
+    cfg.demos = 1
+    cfg.use_min_max_normalization = True
+    cfg.norm_obs = True
+    cfg.obs_norm_type = "min_max"
+
+    factory = RobomimicEnvFactory()
+    factory.collect_or_fetch_demos(cfg, float("inf"))
+    factory.post_collect_or_fetch_demos(cfg)
+
+    raw_action = factory._raw_demos[0][1][-1]["demo_action"]
+    assert raw_action.shape == (10,)
+    raw7 = np.asarray([-0.1, 0.0, 1.0, 0.1, 0.2, 0.3, -1.0], dtype=np.float32)
+    np.testing.assert_allclose(
+        _abs_action_to_raw_action(_raw_action_to_abs_action(raw7)),
+        raw7,
+        atol=1e-6,
+    )
+
+    buffer = _FakeReplayBuffer()
+    factory.load_demos_into_replay(cfg, buffer, is_demo_buffer=True)
+    first_obs, first_action, *_ = buffer.transitions[0]
+    assert first_obs["low_dim_state"].shape == (53,)
+    assert first_action.shape == (10,)
+    assert np.all(first_action <= 1.0)
+    assert np.all(first_action >= -1.0)
+
+    env = factory.make_eval_env(cfg)
+    try:
+        obs, _ = env.reset()
+        assert obs["low_dim_state"].shape == (2, 53)
+        assert env.action_space.shape == (3, 10)
+        assert np.all(obs["low_dim_state"] <= 1.0)
+        assert np.all(obs["low_dim_state"] >= -1.0)
     finally:
         env.close()

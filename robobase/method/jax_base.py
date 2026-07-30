@@ -19,7 +19,7 @@ from robobase.method.bc_runtime import (
     flatten_time_into_channel,
 )
 from robobase.method.core import Method
-from robobase.method.jax_utils import maybe_numpy, stack_tensor_dictionary
+from robobase.method.jax_utils import maybe_numpy
 from robobase.replay_buffer.replay_buffer import ReplayBuffer
 from robobase.replay_buffer.vision_feature_cache import (
     cached_feature_observation_key,
@@ -58,6 +58,7 @@ class JaxMethodBase(Method):
         seed: int = 0,
         is_rl: bool = False,
         use_ema: bool = False,
+        update_block_every_steps: int = 1,
     ):
         if intrinsic_reward_module is not None:
             raise NotImplementedError(
@@ -120,6 +121,7 @@ class JaxMethodBase(Method):
         self._jit_enabled = jit
         self._first_update_completed = False
         self._update_step_count = 0
+        self._update_block_every_steps = max(1, int(update_block_every_steps))
 
         # -- Observation layout --
         self.obs_layout = bc_observation_layout(observation_space)
@@ -128,6 +130,11 @@ class JaxMethodBase(Method):
         self.use_pixels = self.obs_layout.use_pixels
         self.use_multicam_fusion = self.obs_layout.use_multicam_fusion
         self._rgb_batch_keys = tuple(self.obs_layout.rgb_keys)
+        self._raymap_batch_keys = tuple(self.obs_layout.raymap_keys)
+        self._camera_intrinsic_batch_keys = tuple(
+            self.obs_layout.camera_intrinsic_keys
+        )
+        self._camera_c2w_batch_keys = tuple(self.obs_layout.camera_c2w_keys)
         self.action_sequence = int(action_space.shape[0])
         self.action_dim = int(action_space.shape[1])
 
@@ -150,9 +157,7 @@ class JaxMethodBase(Method):
     def _extract_low_dim_batch(self, batch_or_obs: dict):
         if self.low_dim_size == 0 or "low_dim_state" not in batch_or_obs:
             return None
-        low_dim_obs = maybe_numpy(batch_or_obs["low_dim_state"]).astype(
-            np.float32, copy=False
-        )
+        low_dim_obs = self._as_jax_array(batch_or_obs["low_dim_state"], self.jnp.float32)
         low_dim_obs = flatten_time_into_channel(low_dim_obs)
         return low_dim_obs.reshape((low_dim_obs.shape[0], -1))
 
@@ -167,10 +172,60 @@ class JaxMethodBase(Method):
                 for key, value in rgb_obs_dict.items()
             }
         rgb_obs = flatten_time_into_channel(
-            stack_tensor_dictionary(rgb_obs_dict, axis=1),
+            self.jnp.stack(
+                [
+                    self._as_jax_array(value, self.jnp.float32)
+                    for value in rgb_obs_dict.values()
+                ],
+                axis=1,
+            ),
             has_view_axis=True,
-        ).astype(np.float32, copy=False)
+        )
         return rgb_obs, metrics
+
+    def _extract_raymap_obs(self, batch_or_obs: dict):
+        if not self._raymap_batch_keys:
+            return None
+        raymap_obs_dict = {}
+        for key in self._raymap_batch_keys:
+            if key not in batch_or_obs:
+                raise ValueError(f"Missing raymap observation key '{key}'.")
+            raymap_obs_dict[key] = batch_or_obs[key]
+        return flatten_time_into_channel(
+            self.jnp.stack(
+                [
+                    self._as_jax_array(value, self.jnp.float32)
+                    for value in raymap_obs_dict.values()
+                ],
+                axis=1,
+            ),
+            has_view_axis=True,
+        )
+
+    def _extract_camera_param_obs(self, batch_or_obs: dict):
+        if not self._camera_intrinsic_batch_keys:
+            return None, None
+        intrinsic_values = []
+        c2w_values = []
+        for intrinsic_key, c2w_key in zip(
+            self._camera_intrinsic_batch_keys,
+            self._camera_c2w_batch_keys,
+            strict=True,
+        ):
+            if intrinsic_key not in batch_or_obs:
+                raise ValueError(f"Missing camera intrinsic observation key '{intrinsic_key}'.")
+            if c2w_key not in batch_or_obs:
+                raise ValueError(f"Missing camera c2w observation key '{c2w_key}'.")
+            intrinsic_values.append(
+                self._as_jax_array(batch_or_obs[intrinsic_key], self.jnp.float32)
+            )
+            c2w_values.append(
+                self._as_jax_array(batch_or_obs[c2w_key], self.jnp.float32)
+            )
+        return (
+            self.jnp.stack(intrinsic_values, axis=1),
+            self.jnp.stack(c2w_values, axis=1),
+        )
 
     def _has_cached_pixel_features(self, batch_or_obs: dict) -> bool:
         return (
@@ -181,8 +236,8 @@ class JaxMethodBase(Method):
     def _extract_cached_pixel_features(self, batch_or_obs: dict):
         if not self._has_cached_pixel_features(batch_or_obs):
             return None
-        cached = maybe_numpy(batch_or_obs[self._cached_pixel_feature_key]).astype(
-            np.float32, copy=False,
+        cached = self._as_jax_array(
+            batch_or_obs[self._cached_pixel_feature_key], self.jnp.float32
         )
         cached = flatten_time_into_channel(cached)
         return cached.reshape((cached.shape[0], -1))
@@ -190,23 +245,34 @@ class JaxMethodBase(Method):
     def _extract_action_pad_mask(self, batch: dict):
         if "action_pad_mask" not in batch:
             return None
-        return maybe_numpy(batch["action_pad_mask"]).astype(np.bool_, copy=False)
+        return self._as_jax_array(batch["action_pad_mask"], self.jnp.bool_)
 
-    def _loss_weights(self, batch: dict) -> np.ndarray:
+    def _loss_weights(self, batch: dict):
         if "sampling_probabilities" in batch:
-            probs = maybe_numpy(batch["sampling_probabilities"]).astype(
-                np.float32, copy=False,
+            probs = self._as_jax_array(
+                batch["sampling_probabilities"], self.jnp.float32
             )
-            weights = 1.0 / np.sqrt(probs + 1e-10)
-            weights = (weights / np.max(weights)) ** self.replay_beta
-            return weights.astype(np.float32, copy=False)
-        batch_size = maybe_numpy(batch["action"]).shape[0]
-        return np.ones((batch_size,), dtype=np.float32)
+            weights = 1.0 / self.jnp.sqrt(probs + 1e-10)
+            weights = (weights / self.jnp.max(weights)) ** self.replay_beta
+            return weights.astype(self.jnp.float32)
+        batch_size = int(batch["action"].shape[0])
+        return self.jnp.ones((batch_size,), dtype=self.jnp.float32)
 
-    def _encode_pixels(self, rgb_obs):
+    def _encode_pixels(
+        self,
+        rgb_obs,
+        raymap_obs=None,
+        camera_intrinsic_obs=None,
+        camera_c2w_obs=None,
+    ):
         if self.encoder is None:
             return None
-        return self.encoder.encode(rgb_obs)
+        return self.encoder.encode(
+            rgb_obs,
+            raymap_obs=raymap_obs,
+            camera_intrinsic_obs=camera_intrinsic_obs,
+            camera_c2w_obs=camera_c2w_obs,
+        )
 
     def _fuse_multi_view(self, rgb_feats):
         if rgb_feats is None:
@@ -239,8 +305,19 @@ class JaxMethodBase(Method):
         metrics = {}
         if self.use_pixels and fused_view_feats is None:
             rgb_obs, pixel_metrics = self._extract_rgb_obs(batch_or_obs)
+            raymap_obs = self._extract_raymap_obs(batch_or_obs)
+            camera_intrinsic_obs, camera_c2w_obs = self._extract_camera_param_obs(
+                batch_or_obs
+            )
             metrics.update(pixel_metrics)
-            fused_view_feats = self._fuse_multi_view(self._encode_pixels(rgb_obs))
+            fused_view_feats = self._fuse_multi_view(
+                self._encode_pixels(
+                    rgb_obs,
+                    raymap_obs=raymap_obs,
+                    camera_intrinsic_obs=camera_intrinsic_obs,
+                    camera_c2w_obs=camera_c2w_obs,
+                )
+            )
         obs_features = self._combine_features(low_dim_obs, fused_view_feats)
         return obs_features, metrics
 
@@ -251,6 +328,14 @@ class JaxMethodBase(Method):
     def _block(self, *values):
         for value in values:
             self.jax.block_until_ready(value)
+
+    def _as_jax_array(self, value, dtype=None):
+        if hasattr(value, "detach"):
+            value = value.detach().cpu().numpy()
+        return self.jnp.asarray(value, dtype=dtype)
+
+    def prefetch_batch(self, batch: dict):
+        return self.jax.tree_util.tree_map(self.jax.device_put, batch)
 
     def _tree_to_numpy(self, tree):
         return self.jax.tree_util.tree_map(
@@ -274,6 +359,14 @@ class JaxMethodBase(Method):
                 priorities=new_priority_np ** self.replay_alpha,
             )
 
+    def _uses_replay_priorities(self, replay_buffer) -> bool:
+        return replay_buffer is not None and hasattr(replay_buffer, "set_priority")
+
+    def _should_block_update(self, uses_priorities: bool) -> bool:
+        if uses_priorities or self.logging:
+            return True
+        return (self._update_step_count + 1) % self._update_block_every_steps == 0
+
     # ------------------------------------------------------------------
     # Logging metrics (shared)
     # ------------------------------------------------------------------
@@ -282,11 +375,15 @@ class JaxMethodBase(Method):
         self, metrics: dict, actor_loss, obs_features, elapsed: float
     ):
         if self.logging:
+            if isinstance(obs_features, dict):
+                batch_size = self.jax.tree_util.tree_leaves(obs_features)[0].shape[0]
+            else:
+                batch_size = obs_features.shape[0]
             metrics["actor_loss"] = float(
                 np.asarray(self.jax.device_get(actor_loss))
             )
             metrics["backend/update_time_sec"] = elapsed
-            metrics["backend/update_steps_per_second"] = obs_features.shape[0] / max(
+            metrics["backend/update_steps_per_second"] = batch_size / max(
                 elapsed, 1e-12,
             )
             if not self._first_update_completed:

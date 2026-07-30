@@ -229,6 +229,111 @@ Notes:
 - `launch=dp_state_robomimic` keeps the algorithm defaults in one place and decouples the task from the backend implementation.
 - The short local smoke runs used during implementation only verified that both backends can load the real robomimic datasets and complete a couple of offline pretrain updates; they are not the final speed or quality comparison.
 
+# JAX Imitation Backbone Matrix
+
+Use these commands to compare the JAX imitation-learning stack across the shared
+backbone registry on low-dimensional robomimic `Transport`.
+
+Diffusion Policy with FC/UNet/Transformer/DiT:
+
+```bash
+for backbone in fully_connected unet1d transformer dit; do
+  PATH=/home/zc1525/robobase/.venv/bin:$PATH python train.py \
+    launch=dp_state_robomimic \
+    env=robomimic/transport \
+    backend=jax \
+    gpu_id=1 \
+    env.dataset_path=/home/zc1525/robobase/third_party_datasets/robomimic/transport/ph/low_dim_v141.hdf5 \
+    num_pretrain_steps=200000 \
+    num_train_envs=1 \
+    num_eval_envs=10 \
+    num_eval_episodes=50 \
+    batch_size=256 \
+    action_sequence=16 \
+    execution_length=8 \
+    eval_every_steps=25000 \
+    log_pretrain_every=100 \
+    env.use_live_env=true \
+    replay.num_workers=0 \
+    log_eval_video=false \
+    save_snapshot=true \
+    snapshot_every_n=25000 \
+    method.backbone.type=${backbone} \
+    hydra.run.dir=./exp_local/transport_dp_jax_${backbone} \
+    wandb.use=true \
+    wandb.entity=tsztungchen25-imperial-college-london \
+    wandb.project=robobase_jax_imitation_backbone_compare \
+    wandb.name=transport_dp_jax_${backbone}
+done
+```
+
+Flow Matching / Rectified Flow with FC/UNet/Transformer/DiT:
+
+```bash
+for backbone in fully_connected unet1d transformer dit; do
+  PATH=/home/zc1525/robobase/.venv/bin:$PATH python train.py \
+    launch=fm_state_robomimic \
+    env=robomimic/transport \
+    backend=jax \
+    gpu_id=1 \
+    env.dataset_path=/home/zc1525/robobase/third_party_datasets/robomimic/transport/ph/low_dim_v141.hdf5 \
+    num_pretrain_steps=200000 \
+    num_train_envs=1 \
+    num_eval_envs=10 \
+    num_eval_episodes=50 \
+    batch_size=256 \
+    action_sequence=16 \
+    execution_length=8 \
+    eval_every_steps=25000 \
+    log_pretrain_every=100 \
+    env.use_live_env=true \
+    replay.num_workers=0 \
+    log_eval_video=false \
+    save_snapshot=true \
+    snapshot_every_n=25000 \
+    method.backbone.type=${backbone} \
+    hydra.run.dir=./exp_local/transport_fm_jax_${backbone} \
+    wandb.use=true \
+    wandb.entity=tsztungchen25-imperial-college-london \
+    wandb.project=robobase_jax_imitation_backbone_compare \
+    wandb.name=transport_fm_jax_${backbone}
+done
+```
+
+ACT:
+
+```bash
+PATH=/home/zc1525/robobase/.venv/bin:$PATH python train.py \
+  launch=act_state_robomimic \
+  env=robomimic/transport \
+  backend=jax \
+  gpu_id=1 \
+  env.dataset_path=/home/zc1525/robobase/third_party_datasets/robomimic/transport/ph/low_dim_v141.hdf5 \
+  num_pretrain_steps=200000 \
+  num_train_envs=1 \
+  num_eval_envs=10 \
+  num_eval_episodes=50 \
+  batch_size=256 \
+  action_sequence=16 \
+  execution_length=8 \
+  eval_every_steps=25000 \
+  log_pretrain_every=100 \
+  env.use_live_env=true \
+  replay.num_workers=0 \
+  log_eval_video=false \
+  save_snapshot=true \
+  snapshot_every_n=25000 \
+  hydra.run.dir=./exp_local/transport_act_jax \
+  wandb.use=true \
+  wandb.entity=tsztungchen25-imperial-college-london \
+  wandb.project=robobase_jax_imitation_backbone_compare \
+  wandb.name=transport_act_jax
+```
+
+Track the same W&B metrics as the Diffusion backend comparison, plus GPU memory
+from the system metrics panel. Keep `action_sequence=16` for all three method
+families so action-chunk quality and action sampling speed are comparable.
+
 # ToolHang Image Offline JAX Replay Comparison
 
 Use these two commands to compare real image-based offline BC training for robomimic `ToolHang`

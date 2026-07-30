@@ -1,4 +1,6 @@
 import numpy as np
+import gymnasium as gym
+from gymnasium import spaces
 from gymnasium.vector import SyncVectorEnv
 from tests.unit.wrappers.utils import DummyEnv, DummyEEEnv, ACTION_SHAPE
 from robobase.envs.wrappers import (
@@ -9,6 +11,16 @@ from robobase.envs.wrappers import (
 )
 
 NUM_ENVS = 2
+
+
+class TightActionEnv(gym.Env):
+    def __init__(self):
+        self.observation_space = spaces.Box(-1, 1, (1,), dtype=np.float32)
+        self.action_space = spaces.Box(
+            np.array([-0.34], dtype=np.float32),
+            np.array([0.34], dtype=np.float32),
+            dtype=np.float32,
+        )
 
 
 def _assert_rescale_from_tanh_to_2(env):
@@ -79,6 +91,18 @@ def test_rescale_with_minmax_single_env():
     }
     env = RescaleFromTanhWithMinMax(DummyEnv(), action_stats, min_max_margin=0.2)
     _assert_rescale_from_tanh_with_minmax(env)
+
+
+def test_rescale_with_minmax_clips_to_raw_action_space():
+    action_stats = {
+        "min": np.array([-0.34], dtype=np.float32),
+        "max": np.array([0.34000003], dtype=np.float32),
+    }
+    env = RescaleFromTanhWithMinMax(TightActionEnv(), action_stats)
+
+    rescaled_action = env.action(np.ones_like(env.action_space.sample()))
+
+    assert rescaled_action[0] == env.orig_action_space.high[0]
 
 
 def test_rescale_wrapped_vec_env():

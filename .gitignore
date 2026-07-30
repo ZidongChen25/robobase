@@ -1,6 +1,7 @@
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
+*$py.class
 
 # C extensions
 *.so
@@ -19,6 +20,7 @@ var/
 *.egg-info/
 .installed.cfg
 *.egg
+pip-wheel-metadata/
 
 # Installer logs
 pip-log.txt
@@ -34,6 +36,7 @@ pip-delete-this-directory.txt
 exp_local/
 wandb/
 eval_video/
+eval_videos/
 *.csv
 events.out.*
 .DS_Store
@@ -43,4 +46,43 @@ robomimic.md
 .venv/
 .claude/
 .pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
 .vscode/
+
+# Runtime/training artifacts
+.hydra/
+log/
+logs/
+runs/
+evaluation/
+evaluations/
+multirun/
+outputs/
+checkpoint/
+checkpoints/
+*.ckpt
+*.pt
+*.pth
+*.safetensors
+*.pid
+*.log
+*.out
+*.err
+*.bak*
+*.tmp
+*.temp
+*.swp
+latest_*_run
+RoboMimic/logs/
+RoboMimic/runs/
+RoboMimic/smoke/
+
+# Local benchmark/data caches
+.bigym/
+/.cache/
+/huggingface/
+/datasets/
+/data/

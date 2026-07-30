@@ -1,0 +1,118 @@
+# @package _global_
+
+defaults:
+  - ../env: null
+  - ../method: diffusion
+
+seed: 0
+gpu_id: null
+
+demos: !!float .inf
+num_pretrain_steps: 0
+num_pretrain_epochs: 1000
+eval_every_steps: 0
+eval_every_epochs: 100
+snapshot_every_n: 0
+snapshot_every_epochs: 100
+snapshot_save_start_step: 0
+num_train_frames: 0
+num_train_envs: 1
+num_eval_envs: 1
+num_eval_episodes: 50
+batch_size: 128
+save_snapshot: true
+save_csv: true
+replay_size_before_train: 500
+
+pixels: true
+visual_observation_shape: [256, 256]
+frame_stack: 1
+
+is_imitation_learning: true
+
+action_repeat: 1
+action_sequence: 20
+execution_length: 20
+temporal_ensemble: false
+use_standardization: false
+use_min_max_normalization: true
+min_max_margin: 0
+norm_obs: true
+obs_norm_type: standardization
+
+update_every_steps: 1
+log_pretrain_every: 100
+log_eval_video: false
+
+env:
+  cameras: ["head", "left_wrist", "right_wrist"]
+  camera_conditioning: ${method.encoder_model.use_plucker}
+  demo_alignment: reference_post_action
+  eval_seed_start: 0
+  episode_length_is_env_steps: true
+
+replay:
+  nstep: 1
+  num_workers: 0
+  pin_memory: false
+  epoch_style_sampling: true
+  epoch_load_all_episodes: false
+  epoch_batch_chunk_size: 32
+  max_cached_episodes: 16
+  max_cached_episode_bytes: 8589934592
+  discard_loaded_demos_after_replay: true
+  persist: false
+  cache_frozen_image_features: false
+
+lazy_replay:
+  observation_timing: post_action
+  num_workers: 8
+  prefetch_factor: 2
+  persistent_workers: true
+  pin_memory: false
+  max_cached_episodes_per_worker: 2
+  include_tp1: false
+
+backend:
+  replay_prefetch_size: 16
+  replay_device_prefetch: false
+  fused_update_steps: 8
+  update_block_every_steps: 8
+
+method:
+  num_train_steps: 1000000
+  num_diffusion_iters: 50
+  adaptive_lr: true
+  lr_schedule: cosine
+  use_ema: true
+  ema_decay: 0.995
+  ema_decay_schedule: constant
+  weight_decay: 0.01
+  use_lang_cond: true
+  lang_feature_dim: 512
+
+  objective:
+    type: ddpm
+    num_diffusion_iters: ${method.num_diffusion_iters}
+    sampler: ddpm
+
+  backbone:
+    type: transformer
+    sequence_length: ${action_sequence}
+    d_model: 256
+    n_heads: 4
+    num_layers: 8
+    n_cond_layers: 0
+    dropout: 0.3
+
+  encoder_model:
+    trainable: true
+
+wandb:
+  use: false
+  project: dp_bigym
+  name: ${env.task_name}_dp_transformer_ddpm_1000e_b128
+
+hydra:
+  run:
+    dir: ./exp_local/bigym_${env.task_name}_dp_transformer_trainable_lang_ddpm_1000e_b128_${now:%Y%m%d%H%M%S}

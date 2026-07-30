@@ -1,0 +1,51 @@
+# @package _global_
+
+defaults:
+  - ../env: pusht
+  - ../method: diffusion
+
+demos: .inf
+num_pretrain_steps: 200000
+num_train_frames: 0
+num_train_envs: 1
+eval_every_steps: 25000
+num_eval_episodes: 50
+num_eval_envs: 10
+batch_size: 64
+save_snapshot: true
+snapshot_every_n: ${eval_every_steps}
+snapshot_save_start_step: 50000
+is_imitation_learning: true
+
+pixels: true
+visual_observation_shape: [96, 96]
+frame_stack: 2
+action_sequence: 16
+execution_length: 8
+temporal_ensemble: false
+use_min_max_normalization: true
+min_max_margin: 0
+norm_obs: true
+
+update_every_steps: 1
+log_eval_video: false
+save_csv: true
+
+replay:
+  nstep: 1
+  num_workers: 0
+  pin_memory: false
+
+method:
+  noise_mask_steps: 0
+  repeat_action: false
+  num_diffusion_iters: 100
+
+wandb:
+  use: false
+  project: dp_pusht
+  name: pusht_dp_pixel
+
+hydra:
+  run:
+    dir: ./exp_local/pusht_dp_pixel_${now:%Y%m%d%H%M%S}

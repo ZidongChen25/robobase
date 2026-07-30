@@ -30,6 +30,11 @@ norm_obs: true
 
 update_every_steps: 1
 
+method:
+  use_lang_cond: true
+  actor_model:
+    gripper_dims: 2
+
 replay:
   nstep: 1
 

@@ -23,6 +23,11 @@ method:
   encoder_model:
     type: resnet
     model: resnet18
+    pretrained: true
+    trainable: false
+    use_plucker: false
+    plucker_hidden_channels: 64
+    plucker_identity_init: false
 
   view_fusion_model:
     type: multicam_feature
