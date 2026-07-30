@@ -74,8 +74,11 @@ replay:
   # plus the backend prefetch queue.
   epoch_load_all_episodes: false
   epoch_batch_chunk_size: 0
-  max_cached_episodes: 16
-  max_cached_episode_bytes: 8589934592
+  # Keep the whole buffer resident once loaded: a small episode-count cap
+  # makes uniform sampling re-decode whole episode files per drawn
+  # transition once the buffer outgrows it; the byte cap is the guard.
+  max_cached_episodes: null
+  max_cached_episode_bytes: 25769803776
   include_tp1: true
   discard_loaded_demos_after_replay: true
   transition_seq_len: 1  # The length of transition sequence returned from sample() call. Only applicable if sequential is True
