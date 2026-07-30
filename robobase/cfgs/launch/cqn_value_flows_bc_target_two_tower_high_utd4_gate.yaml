@@ -1,0 +1,47 @@
+# @package _global_
+
+# CQN-AS-conditioned Value Flows control.  It preserves the current matched
+# two-tower/high-UTD data path, but replaces scalar expected-FLOQ with a
+# Gaussian return-sample flow trained by DCFM + BCFM.  The fixed independent
+# BC policy supplies the Bellman next action, so this estimates Z^pi_BC rather
+# than allowing the critic to choose and reinforce its own bootstrap action.
+defaults:
+  - cqn_flow_floq_compute8_two_tower_high_utd4_gate
+  - _self_
+
+method:
+  value_mode: return_sample
+  atom_ce_lambda: 0.0
+  demo_fosd: false
+  bcfm_lambda: 1.0
+  dcfm_lambda: 1.0
+  confidence_weight_temp: null
+  pcbf_loss_coeff: 0.0
+  pcbf_lambda: 0.0
+  num_flow_steps: 10
+  num_flow_samples: 4
+  num_target_flow_samples: 4
+  num_action_flow_samples: 4
+  flow_source_type: gaussian
+  flow_source_std: 1.0
+  antithetic_flow_sources: true
+  fixed_action_flow_sources: true
+  action_flow_quantile_grid: false
+  flow_iqn_quantile_coupling: false
+  return_sample_aggregation: mean
+  flow_q_action_readout: false
+  flow_distill_lambda: 0.0
+  flow_distill_action_readout: false
+  endpoint_q_lambda: 0.0
+  source_consistency_lambda: 0.0
+  scalar_value_embedding: raw
+  time_embedding_type: raw
+  time_scale: 1.0
+  clip_flow_trajectory: true
+  td_target_action_source: bc_policy
+  td_target_policy_value_beta: null
+  policy_value_beta: null
+
+hydra:
+  run:
+    dir: ./exp_local/cqn_flow_high_utd/bigym_${env.task_name}_value_flows_bc_target_two_tower_utd4_${now:%Y%m%d%H%M%S}

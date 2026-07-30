@@ -1,0 +1,19 @@
+# @package _global_
+
+# Mechanism arm for non-stationary TD targets. Relative to the matched
+# replay-next expected-FLOQ run, only Bellman next-action selection changes:
+# the online integrated flow critic proposes bins while beta=1 BC log support
+# regularizes them. Rollout remains exact independent BC, so replay collection,
+# exploration, UTD, source distribution, and all losses stay matched.
+defaults:
+  - cqn_flow_floq_distill_two_tower_high_utd4_gate
+  - _self_
+
+method:
+  td_target_action_source: policy_value
+  td_target_policy_value_beta: 1.0
+  policy_value_beta: null
+
+hydra:
+  run:
+    dir: ./exp_local/cqn_flow_high_utd/bigym_${env.task_name}_floq_td_policy_value_two_tower_utd4_${now:%Y%m%d%H%M%S}

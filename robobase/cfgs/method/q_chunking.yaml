@@ -1,0 +1,44 @@
+# @package _global_
+
+action_sequence: 5
+execution_length: 1
+temporal_ensemble: false
+
+replay:
+  nstep: ${action_sequence}
+  include_tp1: true
+  action_sequence_start_offset: 0
+  action_padding: zero
+
+method:
+  name: q_chunking
+  _target_: robobase.method.q_chunking.QChunking
+  is_rl: true
+  num_train_steps: ${num_train_frames}
+  num_explore_steps: ${num_explore_steps}
+
+  # Official ACFQL Best-of-N defaults.
+  actor_lr: 3e-4
+  critic_lr: 3e-4
+  critic_target_tau: 0.005
+  flow_steps: 10
+  actor_num_samples: 32
+  q_aggregate: mean
+  actor_grad_clip: null
+  critic_grad_clip: null
+  weight_decay: 0.0
+
+  model:
+    hidden_dims: [512, 512, 512, 512]
+    activation: gelu
+
+  encoder_model:
+    type: resnet
+    model: resnet18
+    trainable: true
+    pretrained: false
+    use_plucker: false
+
+  view_fusion_model:
+    type: multicam_feature
+    mode: flatten

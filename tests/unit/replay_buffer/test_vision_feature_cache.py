@@ -8,8 +8,10 @@ from omegaconf import OmegaConf
 from robobase.replay_buffer.uniform_replay_buffer import UniformReplayBuffer
 from robobase.replay_buffer.vision_feature_cache import (
     JAX_ACT_FEATURE_KEY,
+    JAX_CQN_AS_FEATURE_KEY,
     JAX_DIFFUSION_FEATURE_KEY,
     JAX_FLOW_MATCHING_FEATURE_KEY,
+    JAX_Q_CHUNKING_FEATURE_KEY,
     VISION_CACHE_FINGERPRINT_KEY,
     build_vision_feature_cache_plan,
 )
@@ -44,10 +46,11 @@ def _make_diffusion_cfg(cache_setting="auto"):
     )
 
 
-def _make_flow_matching_cfg(cache_setting="auto"):
+def _make_flow_matching_cfg(cache_setting="auto", *, seed=0):
     return OmegaConf.create(
         {
             "action_sequence": 16,
+            "seed": seed,
             "method": {
                 "name": "flow_matching",
                 "backbone": {
@@ -58,6 +61,7 @@ def _make_flow_matching_cfg(cache_setting="auto"):
                     "type": "resnet",
                     "model": "resnet18",
                     "trainable": False,
+                    "pretrained": False,
                 },
                 "view_fusion_model": {
                     "type": "multicam_feature",
@@ -100,6 +104,45 @@ def _make_act_cfg(cache_setting="auto"):
     )
 
 
+def _make_cqn_as_cfg(cache_setting="auto"):
+    return OmegaConf.create(
+        {
+            "action_sequence": 4,
+            "seed": 0,
+            "method": {
+                "name": "cqn_as",
+                "encoder_model": {
+                    "type": "resnet",
+                    "model": "resnet18",
+                    "trainable": False,
+                    "pretrained": False,
+                },
+                "view_fusion_model": {
+                    "type": "multicam_feature",
+                    "mode": "flatten",
+                },
+            },
+            "replay": {
+                "cache_frozen_image_features": cache_setting,
+                "cache_frozen_image_feature_backends": ["jax"],
+            },
+        }
+    )
+
+
+def _make_cqn_flow_cfg(cache_setting="auto"):
+    cfg = _make_cqn_as_cfg(cache_setting)
+    cfg.method.name = "cqn_flow"
+    return cfg
+
+
+def _make_q_chunking_cfg(cache_setting="auto"):
+    cfg = _make_cqn_as_cfg(cache_setting)
+    cfg.action_sequence = 5
+    cfg.method.name = "q_chunking"
+    return cfg
+
+
 def _make_pixel_obs_space():
     return spaces.Dict(
         {
@@ -132,7 +175,7 @@ def test_build_vision_feature_cache_plan_replaces_raw_rgb_with_cached_features()
     assert VISION_CACHE_FINGERPRINT_KEY in plan.observation_space.spaces
 
 
-def test_cache_plan_supports_flow_matching_and_act_feature_keys():
+def test_cache_plan_supports_flow_matching_act_and_rl_value_feature_keys():
     flow_plan = build_vision_feature_cache_plan(
         cfg=_make_flow_matching_cfg(),
         observation_space=_make_pixel_obs_space(),
@@ -145,11 +188,39 @@ def test_cache_plan_supports_flow_matching_and_act_feature_keys():
         save_dir=None,
         reuse_saved=False,
     )
+    cqn_as_plan = build_vision_feature_cache_plan(
+        cfg=_make_cqn_as_cfg(),
+        observation_space=_make_pixel_obs_space(),
+        save_dir=None,
+        reuse_saved=False,
+    )
+    cqn_flow_plan = build_vision_feature_cache_plan(
+        cfg=_make_cqn_flow_cfg(),
+        observation_space=_make_pixel_obs_space(),
+        save_dir=None,
+        reuse_saved=False,
+    )
+    q_chunking_plan = build_vision_feature_cache_plan(
+        cfg=_make_q_chunking_cfg(),
+        observation_space=_make_pixel_obs_space(),
+        save_dir=None,
+        reuse_saved=False,
+    )
 
     assert JAX_FLOW_MATCHING_FEATURE_KEY in flow_plan.observation_space.spaces
     assert flow_plan.observation_space[JAX_FLOW_MATCHING_FEATURE_KEY].shape == (1, 1024)
     assert JAX_ACT_FEATURE_KEY in act_plan.observation_space.spaces
     assert act_plan.observation_space[JAX_ACT_FEATURE_KEY].shape == (1, 1024)
+    assert JAX_CQN_AS_FEATURE_KEY in cqn_as_plan.observation_space.spaces
+    assert cqn_as_plan.observation_space[JAX_CQN_AS_FEATURE_KEY].shape == (1, 1024)
+    assert JAX_CQN_AS_FEATURE_KEY in cqn_flow_plan.observation_space.spaces
+    assert cqn_flow_plan.observation_space[JAX_CQN_AS_FEATURE_KEY].shape == (1, 1024)
+    assert cqn_flow_plan.fingerprint == cqn_as_plan.fingerprint
+    assert JAX_Q_CHUNKING_FEATURE_KEY in q_chunking_plan.observation_space.spaces
+    assert q_chunking_plan.observation_space[JAX_Q_CHUNKING_FEATURE_KEY].shape == (
+        1,
+        1024,
+    )
 
 
 def test_feature_preprocessor_rewrites_raw_transition(monkeypatch):
@@ -209,6 +280,41 @@ def test_feature_preprocessor_forwards_pretrained_to_jax_encoder(monkeypatch):
     preprocessor._encode_jax(np.zeros((2, 2, 3, 16, 16), dtype=np.uint8))
 
     assert captured["pretrained"] is True
+    assert captured["seed"] == 0
+
+
+def test_random_encoder_seed_is_forwarded_and_changes_cache_fingerprint(monkeypatch):
+    first = build_vision_feature_cache_plan(
+        cfg=_make_flow_matching_cfg(seed=0),
+        observation_space=_make_pixel_obs_space(),
+        save_dir=None,
+        reuse_saved=False,
+    )
+    second = build_vision_feature_cache_plan(
+        cfg=_make_flow_matching_cfg(seed=7),
+        observation_space=_make_pixel_obs_space(),
+        save_dir=None,
+        reuse_saved=False,
+    )
+    captured = {}
+
+    class FakeEncoder:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+        def encode(self, rgb_batch):
+            return np.zeros(
+                (rgb_batch.shape[0], rgb_batch.shape[1], 512),
+                dtype=np.float32,
+            )
+
+    monkeypatch.setattr("robobase.models.encoder.JaxResNetEncoder", FakeEncoder)
+    second.preprocessing_fn[0]._encode_jax(
+        np.zeros((1, 2, 3, 16, 16), dtype=np.uint8)
+    )
+
+    assert first.fingerprint != second.fingerprint
+    assert captured["seed"] == 7
 
 
 def test_feature_cache_v3_key_rejects_legacy_random_feature_cache(tmp_path: Path):

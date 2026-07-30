@@ -1,0 +1,10 @@
+# @package method.encoder_model
+# Official CamPose ACT late-fusion Plucker encoder preset.
+type: resnet
+model: resnet18
+pretrained: true
+trainable: true
+use_plucker: true
+plucker_fusion_mode: act_late
+plucker_hidden_channels: 64
+plucker_identity_init: false

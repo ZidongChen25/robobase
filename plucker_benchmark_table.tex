@@ -1,0 +1,46 @@
+% Best-checkpoint success-rate benchmark for Plucker comparison.
+% Local evidence:
+% - flip cup Diff. Policy plain: corrected eval of exp_local/bigym_flip_cup_dp_transformer_trainable_lang_ddpm_1000e_b128_gpu2_20260527_164504/snapshots/137000_snapshot.pkl is 34%.
+%   The raw in-training pretrain_eval.csv for the same checkpoint reports 54%, so the table uses the corrected-eval number.
+% - flip cup Diff. Policy +Plucker old: corrected eval of exp_local/bigym_flip_cup_dp_transformer_trainable_lang_ddpm_plucker_identityinit_pretrained_1000e_b128_gpu3_fused1_20260627_125014/snapshots/13700_snapshot.pkl is 16%.
+% - flip cup Diff. Policy +Plucker fixed: corrected eval of exp_local/bigym_flip_cup_dp_clean_plucker_pluckerfix_1000e_b96_fused1_gpu3_20260629_232755/snapshots/18200_snapshot.pkl is 20%.
+% - No completed matching +Plucker eval was found locally for move plate or flip cutlery.
+
+\begin{table}[t]
+\centering
+\small
+\setlength{\tabcolsep}{4pt}
+\definecolor{lightpurple}{RGB}{246,239,245}
+
+\begin{tabularx}{\textwidth}{%
+>{\raggedright\arraybackslash}X|
+>{\centering\arraybackslash}X
+>{\centering\arraybackslash}X|
+>{\centering\arraybackslash}X
+>{\centering\arraybackslash}X|
+>{\centering\arraybackslash}X
+>{\centering\arraybackslash}X
+>{\centering\arraybackslash}X
+>{\centering\arraybackslash}X
+}
+\toprule
+\textbf{Task}
+& \multicolumn{2}{c|}{\textsc{Loco-Genima}}
+& \multicolumn{2}{c|}{\textsc{ACT}}
+& \multicolumn{4}{c}{\textsc{Diff.\ Policy}} \\
+\cmidrule(lr){2-3}\cmidrule(lr){4-5}\cmidrule(lr){6-9}
+& Plain & +Plucker & Plain & +Plucker & Plain & +Plucker old & +Plucker fixed & $\Delta$ \\
+\midrule
+move plate   & 90\% & -- & 76\% & -- & 20\% & --  & --  & -- \\
+\rowcolor{lightpurple}
+flip cup     & 62\% & -- & 46\% & -- & 34\% & 16\% & 20\%$^\dagger$ & -14\% \\
+flip cutlery & 74\% & -- & 40\% & -- & 24\% & --  & --  & -- \\
+\midrule
+\rowcolor{lightpurple}
+\textbf{average} & 75.3\% & -- & 54.0\% & -- & 26.0\% & 16.0\%$^\ddagger$ & 20.0\%$^\ddagger$ & -- \\
+\bottomrule
+\end{tabularx}
+
+\caption{Best-checkpoint success rates for plain and Plucker-conditioned variants. Missing entries indicate that no completed matching Plucker run was found locally. $^\dagger$Fixed Plucker was run with batch size 96 and fused update 1 to fit memory. $^\ddagger$Average over available Plucker entries only.}
+\label{tab:plucker_ablation}
+\end{table}

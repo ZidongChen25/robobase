@@ -1,0 +1,22 @@
+# @package _global_
+
+# Stage-142: anchor-matched flow value benchmark.  Identical platform to the
+# Stage-141 control arm (independent BC policy, replay-next TD, MC-return
+# anchor 0.1, coherent level-0 H=4 p=0.060 interventions); the only change is
+# the value parameterization: scalar expected-Q flow endpoints instead of the
+# categorical C51 head.  Comparison targets are the Stage-141 cv_rct_weight=0
+# checkpoints on executed-action calibration, CRPS, and the same-state
+# branch gate.
+defaults:
+  - cqn_flow_floq_coherent_value_gate
+  - _self_
+
+save_csv: true
+
+method:
+  structured_exploration_prob: 0.060
+  structured_exploration_level: 0
+
+hydra:
+  run:
+    dir: ./exp_local/cqn_stage142_anchor_matched/bigym_${env.task_name}_floq_mc_${now:%Y%m%d%H%M%S}

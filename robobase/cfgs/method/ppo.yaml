@@ -1,0 +1,35 @@
+# @package _global_
+
+method:
+  name: ppo
+  _target_: robobase.method.ppo.PPO
+  is_rl: true
+  num_train_steps: ${num_train_frames}
+  lr: 3e-4
+  rollout_steps: 2048
+  batch_size: 64
+  num_epochs: 10
+  gamma: ${replay.gamma}
+  gae_lambda: 0.95
+  clip_range: 0.2
+  clip_range_vf: null
+  normalize_advantage: true
+  entropy_coef: 0.0
+  value_coef: 0.5
+  max_grad_norm: 0.5
+  target_kl: null
+
+  model:
+    hidden_dims: [64, 64]
+    activation: tanh
+
+  encoder_model:
+    type: resnet
+    model: resnet18
+    trainable: true
+    pretrained: false
+    use_plucker: false
+
+  view_fusion_model:
+    type: multicam_feature
+    mode: flatten

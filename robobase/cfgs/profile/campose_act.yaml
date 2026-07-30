@@ -1,0 +1,60 @@
+# @package _global_
+# CamPose ACT architecture and camera-conditioning profile.
+pixels: true
+visual_observation_shape: [256, 256]
+frame_stack: 1
+action_sequence: 30
+batch_size: 70
+use_standardization: true
+use_min_max_normalization: false
+norm_obs: true
+obs_norm_type: standardization
+
+env:
+  camera_conditioning: plucker
+  cameras: [head, left_wrist]
+
+method:
+  lr: 2e-5
+  lr_backbone: 2e-5
+  adaptive_lr: false
+  weight_decay: 1e-4
+  proprio_dropout_stage: raw
+  proprio_dropout_prob: 1.0
+  proprio_dropout_keys: [proprioception, proprioception_grippers]
+  actor_model:
+    type: transformer
+    hidden_dim: 512
+    enc_layers: 4
+    dec_layers: 7
+    dim_feedforward: 2048
+    dropout: 0.1
+    nheads: 8
+    num_queries: ${action_sequence}
+    pre_norm: true
+    latent_dim: 32
+    kl_weight: 1.0
+    gripper_loss_weight: 0.0
+    data_augmentation: true
+    image_augmentation_type: campose_crop
+    image_position_embedding_type: campose_learned
+    image_position_max_tokens: 128
+    use_camera_extrinsics: true
+    num_camera_extrinsics: 2
+    proprio_dropout_prob: 0.0
+    proprio_projection_type: campose_single
+    style_cls_type: zero
+    decoder_output_layer: first
+  encoder_model:
+    type: resnet
+    model: resnet18
+    trainable: true
+    pretrained: true
+    use_plucker: true
+    plucker_fusion_mode: act_late
+    plucker_hidden_channels: 64
+    plucker_identity_init: false
+
+replay:
+  nstep: 1
+  action_padding: raw_zero

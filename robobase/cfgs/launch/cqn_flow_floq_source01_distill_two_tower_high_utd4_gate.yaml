@@ -1,0 +1,17 @@
+# @package _global_
+
+# Single-variable expected-FLOQ fidelity arm.  The Stage-24/62 configs left
+# source bounds null, which derives [-0.2, 0.2] from v_min/v_max=[-2, 2].
+# MovePlate has terminal-return support [0, 1], so FLOQ's noise_coverage=0.1
+# heuristic instead gives the explicit source interval [0, 0.1].
+defaults:
+  - cqn_flow_floq_distill_two_tower_high_utd4_gate
+  - _self_
+
+method:
+  flow_source_min: 0.0
+  flow_source_max: 0.1
+
+hydra:
+  run:
+    dir: ./exp_local/cqn_flow_high_utd/bigym_${env.task_name}_floq_source01_distill_two_tower_utd4_${now:%Y%m%d%H%M%S}

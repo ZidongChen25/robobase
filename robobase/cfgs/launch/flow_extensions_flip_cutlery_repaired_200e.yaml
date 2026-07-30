@@ -1,0 +1,61 @@
+# @package _global_
+# Shared checkpoint-matched protocol for the repaired FlipCutlery FM baseline.
+
+defaults:
+  - flow_extensions_bigym
+  - override /env: bigym/flip_cutlery
+  - _self_
+
+num_pretrain_epochs: 200
+eval_every_epochs: 100
+num_eval_episodes: 50
+snapshot_every_n: 0
+snapshot_every_epochs: 20
+snapshot_save_start_step: 0
+save_snapshot: true
+
+action_sequence: 20
+execution_length: 20
+action_execution_start: 0
+
+env:
+  dataset_root: ${oc.env:HOME}/.bigym
+  pixel_dataset_root: ${oc.env:HOME}/.bigym_reset_aligned
+  state_dataset_root: ${oc.env:HOME}/.bigym
+
+replay:
+  action_padding: zero
+
+backend:
+  # Match the original FM checkpoints' numerical update path.
+  fused_update_steps: 1
+  update_block_every_steps: 8
+
+method:
+  # Match the optimizer horizon encoded by the existing 1000-epoch FM run.
+  num_train_steps: 1000000
+  num_flow_steps: 10
+  adaptive_lr: true
+  use_ema: true
+  ema_decay: 0.995
+  ema_decay_schedule: diffusers
+  weight_decay: 0.01
+  lang_feature_source: precomputed
+  lang_description: reach the target
+  lang_feature_path: >-
+    exp_local/flip_cutlery_fm_baseline_repro_h20_e20_epoch100_200_20260719/legacy_language/reach_the_target_openai_clip_vit_b32.npy
+  encoder_model:
+    # The repaired FM baseline was initialized from timm/resnet18.a1_in1k.
+    pretrained_weights_path: >-
+      ${oc.env:HOME}/.cache/robobase_jaxflat/resnet18_a1_in1k_jax_resnet.npz
+  backbone:
+    # The historical FM training call left Transformer dropout disabled even
+    # though its saved config said 0.3. Use the effective baseline value.
+    dropout: 0.0
+
+wandb:
+  name: ${env.task_name}_${method.policy_label}_h20_k${execution_length}_s10_200e_seed${seed}_repaired
+
+hydra:
+  run:
+    dir: ./exp_local/bigym_${env.task_name}_${method.policy_label}_h20_k${execution_length}_s10_200e_seed${seed}_repaired_${now:%Y%m%d%H%M%S}

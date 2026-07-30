@@ -1,0 +1,20 @@
+# @package _global_
+
+# Stage-163: Q-chunking-style receding horizon during TRAINING -- keep the
+# temporal ensemble machinery but replan every 8 steps, so each executed
+# segment comes from (at most 2) coherent plans instead of a 16-plan
+# average. Exploration dose rescaled to keep per-env-step activation and
+# window length matched to the combined recipe (draws now happen once per
+# 8 steps: probs x8, persist 2 plans = 16 steps).
+defaults:
+  - cqn_as_pixel_bigym_stage162_uniform
+  - _self_
+
+method:
+  bin_explore_probs: [0.016, 0.032, 0.064]
+  bin_explore_persist_plans: 2
+  temporal_ensemble_replan_interval: 8
+
+hydra:
+  run:
+    dir: ./exp_local/cqn_stage163_replan8/bigym_${env.task_name}_replan8_${now:%Y%m%d%H%M%S}

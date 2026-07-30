@@ -6,7 +6,6 @@ logic that was previously duplicated across JaxBC and JaxDiffusion.
 
 from __future__ import annotations
 
-import time
 import warnings
 from abc import abstractmethod
 from typing import Iterator, Optional
@@ -66,7 +65,8 @@ class JaxMethodBase(Method):
             )
         if len(action_space.shape) != 2:
             raise ValueError(
-                "JAX methods expect action_space.shape == (sequence_length, action_dim)."
+                "JAX methods expect action_space.shape == "
+                "(sequence_length, action_dim)."
             )
 
         # -- JAX imports (lazy so the module can be imported without JAX) --
@@ -78,14 +78,14 @@ class JaxMethodBase(Method):
             requested_platform = str(platform)
             jax.config.update("jax_platform_name", requested_platform)
             try:
-                # Force backend creation early so we can gracefully fallback in CPU-only envs.
+                # Force backend creation so unavailable accelerators fail here.
                 _ = jax.devices()
-            except RuntimeError as exc:
+            except RuntimeError:
                 if requested_platform.lower() in {"cuda", "gpu"}:
                     jax.config.update("jax_platform_name", "cpu")
                     warnings.warn(
-                        "Requested JAX platform '%s' is unavailable; falling back to 'cpu'."
-                        % requested_platform,
+                        "Requested JAX platform '%s' is unavailable; "
+                        "falling back to 'cpu'." % requested_platform,
                         RuntimeWarning,
                         stacklevel=2,
                     )
@@ -131,12 +131,17 @@ class JaxMethodBase(Method):
         self.use_multicam_fusion = self.obs_layout.use_multicam_fusion
         self._rgb_batch_keys = tuple(self.obs_layout.rgb_keys)
         self._raymap_batch_keys = tuple(self.obs_layout.raymap_keys)
-        self._camera_intrinsic_batch_keys = tuple(
-            self.obs_layout.camera_intrinsic_keys
-        )
+        self._camera_intrinsic_batch_keys = tuple(self.obs_layout.camera_intrinsic_keys)
         self._camera_c2w_batch_keys = tuple(self.obs_layout.camera_c2w_keys)
         self.action_sequence = int(action_space.shape[0])
         self.action_dim = int(action_space.shape[1])
+        action_low = np.asarray(action_space.low, dtype=np.float32)
+        action_high = np.asarray(action_space.high, dtype=np.float32)
+        self._sample_clip_bounds = (
+            (jnp.asarray(action_low), jnp.asarray(action_high))
+            if np.all(np.isfinite(action_low)) and np.all(np.isfinite(action_high))
+            else None
+        )
 
         # -- RNG --
         self.rng_key = jax.random.PRNGKey(int(seed))
@@ -157,7 +162,9 @@ class JaxMethodBase(Method):
     def _extract_low_dim_batch(self, batch_or_obs: dict):
         if self.low_dim_size == 0 or "low_dim_state" not in batch_or_obs:
             return None
-        low_dim_obs = self._as_jax_array(batch_or_obs["low_dim_state"], self.jnp.float32)
+        low_dim_obs = self._as_jax_array(
+            batch_or_obs["low_dim_state"], self.jnp.float32
+        )
         low_dim_obs = flatten_time_into_channel(low_dim_obs)
         return low_dim_obs.reshape((low_dim_obs.shape[0], -1))
 
@@ -168,8 +175,7 @@ class JaxMethodBase(Method):
         metrics = {}
         if self.logging:
             metrics = {
-                key: maybe_numpy(value)[0, -1]
-                for key, value in rgb_obs_dict.items()
+                key: maybe_numpy(value)[0, -1] for key, value in rgb_obs_dict.items()
             }
         rgb_obs = flatten_time_into_channel(
             self.jnp.stack(
@@ -213,7 +219,9 @@ class JaxMethodBase(Method):
             strict=True,
         ):
             if intrinsic_key not in batch_or_obs:
-                raise ValueError(f"Missing camera intrinsic observation key '{intrinsic_key}'.")
+                raise ValueError(
+                    f"Missing camera intrinsic observation key '{intrinsic_key}'."
+                )
             if c2w_key not in batch_or_obs:
                 raise ValueError(f"Missing camera c2w observation key '{c2w_key}'.")
             intrinsic_values.append(
@@ -356,7 +364,7 @@ class JaxMethodBase(Method):
         if replay_buffer is not None and hasattr(replay_buffer, "set_priority"):
             replay_buffer.set_priority(
                 indices=maybe_numpy(batch["indices"]),
-                priorities=new_priority_np ** self.replay_alpha,
+                priorities=new_priority_np**self.replay_alpha,
             )
 
     def _uses_replay_priorities(self, replay_buffer) -> bool:
@@ -375,16 +383,21 @@ class JaxMethodBase(Method):
         self, metrics: dict, actor_loss, obs_features, elapsed: float
     ):
         if self.logging:
-            if isinstance(obs_features, dict):
-                batch_size = self.jax.tree_util.tree_leaves(obs_features)[0].shape[0]
-            else:
-                batch_size = obs_features.shape[0]
-            metrics["actor_loss"] = float(
-                np.asarray(self.jax.device_get(actor_loss))
-            )
+            leaves = [
+                leaf
+                for leaf in self.jax.tree_util.tree_leaves(obs_features)
+                if leaf is not None and hasattr(leaf, "shape") and leaf.ndim > 0
+            ]
+            if not leaves:
+                raise ValueError(
+                    "Observation features contain no batched array leaves."
+                )
+            batch_size = leaves[0].shape[0]
+            metrics["actor_loss"] = float(np.asarray(self.jax.device_get(actor_loss)))
             metrics["backend/update_time_sec"] = elapsed
             metrics["backend/update_steps_per_second"] = batch_size / max(
-                elapsed, 1e-12,
+                elapsed,
+                1e-12,
             )
             if not self._first_update_completed:
                 metrics["backend/first_update_time_sec"] = elapsed
@@ -409,7 +422,30 @@ class JaxMethodBase(Method):
 
     def load_checkpoint_state_dict(self, state_dict: dict[str, dict]):
         if "opt_state" in state_dict:
-            self.opt_state = self._tree_from_numpy(state_dict["opt_state"])
+            candidate_opt_state = self._tree_from_numpy(state_dict["opt_state"])
+            candidate_structure = self.jax.tree_util.tree_structure(candidate_opt_state)
+            current_structure = self.jax.tree_util.tree_structure(self.opt_state)
+            candidate_shapes = tuple(
+                np.shape(value)
+                for value in self.jax.tree_util.tree_leaves(candidate_opt_state)
+            )
+            current_shapes = tuple(
+                np.shape(value)
+                for value in self.jax.tree_util.tree_leaves(self.opt_state)
+            )
+            if (
+                candidate_structure == current_structure
+                and candidate_shapes == current_shapes
+            ):
+                self.opt_state = candidate_opt_state
+            else:
+                warnings.warn(
+                    "Checkpoint optimizer state is incompatible with the current "
+                    "parameter/optimizer tree; keeping a freshly initialized "
+                    "optimizer state.",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
         if "rng_key" in state_dict:
             self.rng_key = self.jnp.asarray(state_dict["rng_key"])
         self._update_step_count = int(state_dict.get("update_step_count", 0))

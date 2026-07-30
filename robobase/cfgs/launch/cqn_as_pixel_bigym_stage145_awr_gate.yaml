@@ -1,0 +1,23 @@
+# @package _global_
+
+# Stage-145 / Route-(c): support-only improvement gate (cqn-flow.md 26.2).
+# Decoupled pi-BC + MC-anchored critic platform WITHOUT structured
+# exploration (behavior quality is the endpoint here, not causal
+# identification), plus IQL-style expectile V and advantage-weighted BC over
+# demo and online transitions.  Task target: clean CQN-AS three-seed
+# validation-best mean 72.00% (cqn-flow.md 21.104).
+defaults:
+  - cqn_as_pixel_bigym_decoupled_value_gate
+  - _self_
+
+save_csv: true
+
+method:
+  mc_return_weight: 0.1
+  awr_beta: 0.5
+  awr_weight_max: 10.0
+  awr_expectile_tau: 0.7
+
+hydra:
+  run:
+    dir: ./exp_local/cqn_stage145_awr/bigym_${env.task_name}_awr_${now:%Y%m%d%H%M%S}

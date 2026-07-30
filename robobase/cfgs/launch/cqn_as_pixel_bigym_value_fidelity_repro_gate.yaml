@@ -1,0 +1,15 @@
+# @package _global_
+
+# Reproduce the clean first-success CQN-AS seed-1 gate while materializing the
+# exact 7.5k evaluation checkpoint. The historical run saved every 1k steps,
+# so its reported 92% @ 7.5k policy has no corresponding snapshot on disk.
+defaults:
+  - cqn_as_pixel_bigym_value_fidelity_gate
+  - _self_
+
+snapshot_every_n: 500
+save_csv: true
+
+hydra:
+  run:
+    dir: ./exp_local/cqn_value_fidelity_stage22/bigym_${env.task_name}_clean_cqn_as_repro_${now:%Y%m%d%H%M%S}

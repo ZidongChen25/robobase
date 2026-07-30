@@ -1,4 +1,5 @@
 import numpy as np
+import pytest
 from gymnasium import spaces
 
 from robobase.envs.env import DemoEnv
@@ -304,7 +305,109 @@ def test_action_sequence_start_offset_uses_edge_padding():
 
     np.testing.assert_array_equal(start_sample["action"][0, :, 0], [0, 0, 1, 2])
     np.testing.assert_array_equal(end_sample["action"][0, :, 0], [2, 3, 3, 3])
-    np.testing.assert_array_equal(vector_sample["action"][:, :, 0], [[0, 0, 1, 2], [2, 3, 3, 3]])
+    np.testing.assert_array_equal(
+        vector_sample["action"][:, :, 0], [[0, 0, 1, 2], [2, 3, 3, 3]]
+    )
     assert not start_sample["action_pad_mask"].any()
     assert not end_sample["action_pad_mask"].any()
     assert not vector_sample["action_pad_mask"].any()
+
+
+@pytest.mark.parametrize(
+    "padding,expected_start",
+    [("edge", [5, 5, 5]), ("zero", [0, 0, 0])],
+)
+def test_uniform_replay_emits_strict_a2a_history_windows(padding, expected_start):
+    observation_space = spaces.Dict(
+        {
+            "low_dim_state": spaces.Box(
+                low=-np.inf,
+                high=np.inf,
+                shape=(1, 1),
+                dtype=np.float32,
+            )
+        }
+    )
+    replay_buffer = UniformReplayBuffer(
+        batch_size=2,
+        replay_capacity=16,
+        action_shape=(3, 1),
+        action_dtype=np.float32,
+        nstep=1,
+        reward_shape=(),
+        reward_dtype=np.float32,
+        observation_elements=observation_space,
+        extra_replay_elements=spaces.Dict({}),
+        num_workers=0,
+        action_history_len=3,
+        action_history_padding=padding,
+    )
+
+    for index in range(4):
+        replay_buffer.add(
+            {"low_dim_state": np.asarray([index], dtype=np.float32)},
+            np.asarray([index + 5], dtype=np.float32),
+            0.0,
+            index == 3,
+            False,
+        )
+    replay_buffer.add_final({"low_dim_state": np.asarray([4], dtype=np.float32)})
+
+    scalar_batch = replay_buffer.sample(batch_size=2, indices=[0, 3])
+    vector_batch = replay_buffer.sample_batch_indices(np.asarray([0, 3]))
+
+    expected_history = np.asarray([expected_start, [5, 6, 7]])
+    expected_mask = np.asarray([[True, True, True], [False, False, False]])
+    for batch in (scalar_batch, vector_batch):
+        np.testing.assert_array_equal(
+            batch["action_history"][:, :, 0], expected_history
+        )
+        np.testing.assert_array_equal(batch["action_history_pad_mask"], expected_mask)
+
+
+def test_uniform_replay_a2a_history_never_crosses_episode_boundaries():
+    observation_space = spaces.Dict(
+        {
+            "low_dim_state": spaces.Box(
+                low=-np.inf,
+                high=np.inf,
+                shape=(1, 1),
+                dtype=np.float32,
+            )
+        }
+    )
+    replay_buffer = UniformReplayBuffer(
+        batch_size=1,
+        replay_capacity=16,
+        action_shape=(2, 1),
+        action_dtype=np.float32,
+        nstep=1,
+        reward_shape=(),
+        reward_dtype=np.float32,
+        observation_elements=observation_space,
+        extra_replay_elements=spaces.Dict({}),
+        num_workers=0,
+        action_history_len=3,
+        action_history_padding="edge",
+    )
+
+    for episode, base in enumerate((0, 10)):
+        for step in range(2):
+            replay_buffer.add(
+                {"low_dim_state": np.asarray([base + step], dtype=np.float32)},
+                np.asarray([base + step], dtype=np.float32),
+                0.0,
+                step == 1,
+                False,
+            )
+        replay_buffer.add_final(
+            {"low_dim_state": np.asarray([base + 2], dtype=np.float32)}
+        )
+
+    second_episode_start = replay_buffer.episode_index_metadata()[1][0]
+    batch = replay_buffer.sample_batch_indices(np.asarray([second_episode_start]))
+
+    np.testing.assert_array_equal(batch["action_history"][0, :, 0], [10, 10, 10])
+    np.testing.assert_array_equal(
+        batch["action_history_pad_mask"][0], [True, True, True]
+    )

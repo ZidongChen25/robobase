@@ -1,0 +1,15 @@
+# @package _global_
+
+# Stage-XX matched high-UTD direct-C51 control.  All value-fidelity choices are
+# inherited from the strict two-tower coherent-MC gate; only the number of
+# replay updates per environment step changes from 1 to 4.
+defaults:
+  - cqn_as_pixel_bigym_two_tower_coherent_mc_gate
+  - _self_
+
+method:
+  num_update_steps: 4
+
+hydra:
+  run:
+    dir: ./exp_local/cqn_flow_high_utd/bigym_${env.task_name}_direct_c51_two_tower_utd4_${now:%Y%m%d%H%M%S}

@@ -1,0 +1,11 @@
+# @package _global_
+defaults:
+  - a2a
+
+method:
+  name: a2a
+  policy_label: a2a_noise
+  flow_source:
+    type: a2a_noise
+    train_history_noise_std: 0.02
+    eval_history_noise_std: 0.02

@@ -4,15 +4,70 @@ from __future__ import annotations
 
 import hashlib
 import re
-from functools import lru_cache
+from pathlib import Path
 from typing import Mapping
 
 import numpy as np
 
 
 LANG_TOKEN_LENGTH = 77
-CLIP_LANG_FEATURE_DIM = 512
-CLIP_MODEL_NAME = "ViT-B/32"
+
+
+def load_precomputed_language_features(
+    path: str | Path | None,
+    *,
+    feature_dim: int = 512,
+) -> np.ndarray:
+    """Load one fixed language feature row without enabling pickle loading."""
+
+    feature_dim = int(feature_dim)
+    if feature_dim <= 0:
+        raise ValueError("feature_dim must be positive.")
+    if path is None or not str(path).strip():
+        raise ValueError("A precomputed language feature path is required.")
+
+    feature_path = Path(path).expanduser()
+    if not feature_path.is_file():
+        raise FileNotFoundError(
+            f"Precomputed language feature file does not exist: {feature_path}"
+        )
+    try:
+        loaded = np.load(feature_path, allow_pickle=False)
+    except (OSError, ValueError) as exc:
+        raise ValueError(
+            "Failed to safely load precomputed language features from "
+            f"{feature_path}: {exc}"
+        ) from exc
+
+    if not isinstance(loaded, np.ndarray):
+        close = getattr(loaded, "close", None)
+        if callable(close):
+            close()
+        raise ValueError(
+            "Precomputed language features must be stored as a single .npy array."
+        )
+    if loaded.ndim == 1:
+        loaded = loaded[None, :]
+    expected_shape = (1, feature_dim)
+    if loaded.shape != expected_shape:
+        raise ValueError(
+            "Precomputed language features must have shape "
+            f"{expected_shape}, got {loaded.shape}."
+        )
+    if not np.issubdtype(loaded.dtype, np.number) or np.issubdtype(
+        loaded.dtype, np.complexfloating
+    ):
+        raise ValueError(
+            "Precomputed language features must contain real numeric values, "
+            f"got dtype {loaded.dtype}."
+        )
+
+    features = np.asarray(loaded, dtype=np.float32)
+    if not np.isfinite(features).all():
+        raise ValueError(
+            "Precomputed language features must contain only finite values."
+        )
+    return np.array(features, dtype=np.float32, copy=True)
 
 
 def _latest_rows(array, *, dtype, context: str) -> np.ndarray:
@@ -22,7 +77,9 @@ def _latest_rows(array, *, dtype, context: str) -> np.ndarray:
     elif rows.ndim >= 3:
         rows = rows.reshape(rows.shape[0], -1, rows.shape[-1])[:, -1, :]
     if rows.ndim != 2:
-        raise ValueError(f"{context} expected rows with shape (B, D), got {rows.shape}.")
+        raise ValueError(
+            f"{context} expected rows with shape (B, D), got {rows.shape}."
+        )
     return rows
 
 
@@ -66,75 +123,14 @@ def lang_feature_rows(batch_or_obs: Mapping, *, context: str) -> np.ndarray:
     )
 
 
-def clip_tokenize_text(
-    text: str,
-    *,
-    context_length: int = LANG_TOKEN_LENGTH,
+def tokens_to_feature_array(
+    tokens: np.ndarray, *, feature_dim: int = 512
 ) -> np.ndarray:
-    import clip
-
-    return (
-        clip.tokenize([str(text)], context_length=int(context_length))
-        .numpy()
-        .astype(np.int32, copy=False)
-    )
-
-
-@lru_cache(maxsize=4)
-def _clip_text_model(model_name: str, device: str):
-    import clip
-    import torch
-
-    model, _ = clip.load(str(model_name), device=str(device))
-    if hasattr(model, "visual"):
-        del model.visual
-    model.eval()
-    return model, torch
-
-
-def clip_tokens_to_feature_array(
-    tokens: np.ndarray,
-    *,
-    device: str = "cpu",
-    model_name: str = CLIP_MODEL_NAME,
-) -> np.ndarray:
-    model, torch = _clip_text_model(str(model_name), str(device))
-    token_rows = _latest_rows(
-        tokens,
-        dtype=np.int64,
-        context="CLIP language feature extraction",
-    )
-    with torch.no_grad():
-        tks = torch.as_tensor(token_rows, dtype=torch.long, device=str(device))
-        dtype = torch.float16 if tks.device.type == "cuda" else torch.float32
-        x = model.token_embedding(tks).type(dtype)
-        x = x + model.positional_embedding.type(dtype)
-        x = x.permute(1, 0, 2)
-        x = model.transformer(x)
-        x = x.permute(1, 0, 2)
-        x = model.ln_final(x).type(dtype)
-        x = x[torch.arange(x.shape[0], device=tks.device), tks.argmax(dim=-1)]
-        x = x @ model.text_projection
-    return x.float().cpu().numpy().astype(np.float32, copy=False)
-
-
-def clip_text_feature_array(
-    text: str,
-    *,
-    device: str = "cpu",
-    model_name: str = CLIP_MODEL_NAME,
-) -> np.ndarray:
-    return clip_tokens_to_feature_array(
-        clip_tokenize_text(text),
-        device=device,
-        model_name=model_name,
-    )
-
-
-def tokens_to_feature_array(tokens: np.ndarray, *, feature_dim: int = 512) -> np.ndarray:
     token_rows = np.asarray(tokens, dtype=np.float32)
     if token_rows.ndim != 2:
-        raise ValueError(f"Expected language tokens with shape (B, L), got {token_rows.shape}.")
+        raise ValueError(
+            f"Expected language tokens with shape (B, L), got {token_rows.shape}."
+        )
     feature_dim = int(feature_dim)
     if feature_dim <= 0:
         raise ValueError("feature_dim must be positive.")
@@ -156,7 +152,9 @@ def tokens_to_feature_jax(tokens, *, feature_dim: int = 512):
 
     token_rows = jnp.asarray(tokens, dtype=jnp.float32)
     if token_rows.ndim != 2:
-        raise ValueError(f"Expected language tokens with shape (B, L), got {token_rows.shape}.")
+        raise ValueError(
+            f"Expected language tokens with shape (B, L), got {token_rows.shape}."
+        )
     feature_dim = int(feature_dim)
     if feature_dim <= 0:
         raise ValueError("feature_dim must be positive.")

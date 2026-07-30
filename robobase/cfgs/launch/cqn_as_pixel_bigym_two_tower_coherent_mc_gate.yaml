@@ -1,0 +1,18 @@
+# @package _global_
+
+# Matched direct-C51 control for Stage-X. It uses the same completed-return
+# anchor, replay-next target, coherent local interventions, and strict
+# policy/value encoder split as the Flow-V + direct-A hybrid.
+defaults:
+  - cqn_as_pixel_bigym_coherent_exploration_gate
+  - _self_
+
+method:
+  mc_return_weight: 0.1
+  mc_return_stop_gradient_encoder: false
+  mc_return_value_only: false
+  distinct_policy_encoder: true
+
+hydra:
+  run:
+    dir: ./exp_local/cqn_value_fidelity_stage_x/bigym_${env.task_name}_direct_c51_two_tower_${now:%Y%m%d%H%M%S}

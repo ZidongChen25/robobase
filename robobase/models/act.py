@@ -46,7 +46,9 @@ def _sinusoid_encoding_table(n_position: int, d_hid: int) -> jnp.ndarray:
     positions = jnp.arange(n_position, dtype=jnp.float32)[:, None]
     dims = jnp.arange(d_hid, dtype=jnp.float32)[None, :]
     angles = positions / (10000 ** (2 * jnp.floor(dims / 2) / d_hid))
-    return jnp.where((dims.astype(jnp.int32) % 2) == 0, jnp.sin(angles), jnp.cos(angles))
+    return jnp.where(
+        (dims.astype(jnp.int32) % 2) == 0, jnp.sin(angles), jnp.cos(angles)
+    )
 
 
 def _build_2d_sincos_pos_embed(hidden_dim: int, height: int, width: int) -> jnp.ndarray:
@@ -74,10 +76,49 @@ def _key_padding_mask(mask: jnp.ndarray | None, query_len: int):
     return jnp.logical_not(mask)[:, None, None, :].repeat(query_len, axis=2)
 
 
+def _assemble_campose_conditioning_memory(
+    image_features: jnp.ndarray | None,
+    image_pos: jnp.ndarray | None,
+    camera_tokens: jnp.ndarray,
+    proprio_input: jnp.ndarray,
+    latent_input: jnp.ndarray,
+    conditioning_pos_embed: jnp.ndarray,
+    task_input: jnp.ndarray | None = None,
+) -> tuple[jnp.ndarray, jnp.ndarray]:
+    """Assemble official CamPose ACT token and position ordering."""
+
+    batch_size = int(camera_tokens.shape[0])
+    additional_tokens = [
+        camera_tokens,
+        proprio_input[:, None, :],
+        latent_input[:, None, :],
+    ]
+    if task_input is not None:
+        additional_tokens.append(task_input[:, None, :])
+    additional = jnp.concatenate(additional_tokens, axis=1)
+    additional_pos = jnp.broadcast_to(
+        conditioning_pos_embed[None, : additional.shape[1]],
+        additional.shape,
+    )
+
+    if image_features is None:
+        return additional, additional_pos
+    if image_pos is None:
+        raise ValueError("CamPose ACT image features require image positions.")
+    image_tokens = image_features.reshape((batch_size, -1, image_features.shape[-1]))
+    image_positions = image_pos.reshape((batch_size, -1, image_pos.shape[-1]))
+    return (
+        jnp.concatenate([image_tokens, additional], axis=1),
+        jnp.concatenate([image_positions, additional_pos], axis=1),
+    )
+
+
 class ACTImageProjection(nn.Module):
     """Project ResNet spatial maps to hidden_dim and concatenate camera views."""
 
     hidden_dim: int
+    position_embedding_type: str = "sincos_legacy"
+    max_position_tokens: int | None = None
 
     @nn.compact
     def __call__(self, features: jnp.ndarray) -> tuple[jnp.ndarray, jnp.ndarray]:
@@ -94,6 +135,45 @@ class ACTImageProjection(nn.Module):
             name="input_proj",
         )(x)
         x = x.reshape((batch_size, num_views, height, width, self.hidden_dim))
+
+        position_embedding_type = str(self.position_embedding_type).lower()
+        if position_embedding_type == "campose_learned":
+            # CamPose flattens each camera independently, concatenates cameras,
+            # then slices a shared learned 2*8*8 position table.
+            x = x.reshape(
+                (batch_size, num_views, height * width, self.hidden_dim)
+            ).reshape((batch_size, num_views * height * width, self.hidden_dim))
+            token_count = int(x.shape[1])
+            max_position_tokens = (
+                token_count
+                if self.max_position_tokens is None
+                else int(self.max_position_tokens)
+            )
+            if token_count > max_position_tokens:
+                raise ValueError(
+                    "CamPose learned ACT positions support at most "
+                    f"{max_position_tokens} image tokens, got {token_count}."
+                )
+            position_embedding = self.param(
+                "position_embedding",
+                nn.initializers.normal(stddev=1.0),
+                (max_position_tokens, self.hidden_dim),
+            )
+            # Keep a rank-4 image contract so ACTDetrTransformer prepends the
+            # latent/proprio/task tokens before flattening. A singleton spatial
+            # axis preserves the official camera-major flattened token order.
+            x = x[:, None, :, :]
+            pos = jnp.broadcast_to(
+                position_embedding[None, None, :token_count],
+                x.shape,
+            )
+            return x, pos
+        if position_embedding_type != "sincos_legacy":
+            raise ValueError(
+                "ACT position_embedding_type must be 'campose_learned' or "
+                f"'sincos_legacy', got {self.position_embedding_type!r}."
+            )
+
         x = jnp.concatenate([x[:, view_idx] for view_idx in range(num_views)], axis=2)
 
         pos_single = _build_2d_sincos_pos_embed(self.hidden_dim, height, width)
@@ -223,7 +303,12 @@ class ACTTransformerDecoderLayer(nn.Module):
                 bias_init=_ZERO_BIAS_INIT,
                 out_bias_init=_ZERO_BIAS_INIT,
                 name="self_attn",
-            )(with_query_pos(normed), with_query_pos(normed), normed, deterministic=deterministic)
+            )(
+                with_query_pos(normed),
+                with_query_pos(normed),
+                normed,
+                deterministic=deterministic,
+            )
             queries = queries + nn.Dropout(rate=self.dropout)(
                 self_attn,
                 deterministic=deterministic,
@@ -273,7 +358,8 @@ class ACTTransformerDecoderLayer(nn.Module):
             deterministic=deterministic,
         )
         queries = nn.LayerNorm(name="norm1")(
-            queries + nn.Dropout(rate=self.dropout)(self_attn, deterministic=deterministic)
+            queries
+            + nn.Dropout(rate=self.dropout)(self_attn, deterministic=deterministic)
         )
         cross_attn = nn.MultiHeadDotProductAttention(
             num_heads=self.nheads,
@@ -291,7 +377,8 @@ class ACTTransformerDecoderLayer(nn.Module):
             deterministic=deterministic,
         )
         queries = nn.LayerNorm(name="norm2")(
-            queries + nn.Dropout(rate=self.dropout)(cross_attn, deterministic=deterministic)
+            queries
+            + nn.Dropout(rate=self.dropout)(cross_attn, deterministic=deterministic)
         )
         ff = _ACTMLP(
             self.hidden_dim,
@@ -311,6 +398,7 @@ class ACTDetrTransformer(nn.Module):
     dim_feedforward: int
     dropout: float
     pre_norm: bool
+    decoder_output_layer: str = "final"
 
     @nn.compact
     def __call__(
@@ -325,12 +413,24 @@ class ACTDetrTransformer(nn.Module):
         task_emb: jnp.ndarray | None = None,
         deterministic: bool,
     ) -> jnp.ndarray:
+        decoder_output_layer = str(self.decoder_output_layer).lower()
+        if decoder_output_layer not in {"final", "first"}:
+            raise ValueError(
+                "decoder_output_layer must be 'final' or 'first', got "
+                f"{self.decoder_output_layer!r}."
+            )
         batch_size = src.shape[0]
         if src.ndim == 4:
             memory = src.reshape((batch_size, -1, src.shape[-1]))
             pos = pos_embed.reshape((batch_size, -1, pos_embed.shape[-1]))
-            if latent_input is None or proprio_input is None or additional_pos_embed is None:
-                raise ValueError("Image ACT transformer requires latent/proprio inputs.")
+            if (
+                latent_input is None
+                or proprio_input is None
+                or additional_pos_embed is None
+            ):
+                raise ValueError(
+                    "Image ACT transformer requires latent/proprio inputs."
+                )
             additional = [latent_input, proprio_input]
             if task_emb is not None:
                 additional.append(task_emb)
@@ -359,14 +459,19 @@ class ACTDetrTransformer(nn.Module):
                 self.pre_norm,
                 name=f"encoder_{layer}",
             )(memory, None, pos, deterministic)
+        if self.pre_norm:
+            memory = nn.LayerNorm(name="encoder_norm")(memory)
 
-        query_pos = jnp.broadcast_to(query_embed[None], (batch_size, *query_embed.shape))
+        query_pos = jnp.broadcast_to(
+            query_embed[None], (batch_size, *query_embed.shape)
+        )
         queries = jnp.zeros_like(query_pos)
         decoder_layer = nn.remat(
             ACTTransformerDecoderLayer,
             prevent_cse=False,
             static_argnums=(6,),
         )
+        first_queries = None
         for layer in range(self.dec_layers):
             queries = decoder_layer(
                 self.hidden_dim,
@@ -376,7 +481,12 @@ class ACTDetrTransformer(nn.Module):
                 self.pre_norm,
                 name=f"decoder_{layer}",
             )(queries, memory, None, pos, query_pos, deterministic)
-        return nn.LayerNorm(name="decoder_norm")(queries)
+            if layer == 0:
+                first_queries = queries
+        if first_queries is None:
+            raise ValueError("ACT transformer requires at least one decoder layer.")
+        decoder_output = first_queries if decoder_output_layer == "first" else queries
+        return nn.LayerNorm(name="decoder_norm")(decoder_output)
 
 
 class JaxACTPolicy(nn.Module):
@@ -394,6 +504,12 @@ class JaxACTPolicy(nn.Module):
     num_queries: int
     latent_dim: int = 32
     use_lang_cond: bool = False
+    use_camera_extrinsics: bool = False
+    num_camera_extrinsics: int = 2
+    proprio_dropout_prob: float = 0.0
+    proprio_projection_type: str = "legacy_mlp"
+    style_cls_type: str = "learned"
+    decoder_output_layer: str = "final"
 
     @nn.compact
     def __call__(
@@ -405,25 +521,74 @@ class JaxACTPolicy(nn.Module):
         actions: jnp.ndarray | None = None,
         is_pad: jnp.ndarray | None = None,
         task_emb: jnp.ndarray | None = None,
+        camera_extrinsics: jnp.ndarray | None = None,
         deterministic: bool = True,
         latent_key=None,
     ) -> tuple[jnp.ndarray, jnp.ndarray | None, jnp.ndarray | None]:
+        proprio_projection_type = str(self.proprio_projection_type).lower()
+        if proprio_projection_type not in {"legacy_mlp", "campose_single"}:
+            raise ValueError(
+                "proprio_projection_type must be 'legacy_mlp' or "
+                f"'campose_single', got {self.proprio_projection_type!r}."
+            )
+        style_cls_type = str(self.style_cls_type).lower()
+        if style_cls_type not in {"learned", "zero"}:
+            raise ValueError(
+                "style_cls_type must be 'learned' or 'zero', got "
+                f"{self.style_cls_type!r}."
+            )
+        decoder_output_layer = str(self.decoder_output_layer).lower()
+        if decoder_output_layer not in {"final", "first"}:
+            raise ValueError(
+                "decoder_output_layer must be 'final' or 'first', got "
+                f"{self.decoder_output_layer!r}."
+            )
         batch_size = qpos.shape[0]
+        proprio_dropout_prob = float(self.proprio_dropout_prob)
+        if not 0.0 <= proprio_dropout_prob <= 1.0:
+            raise ValueError("proprio_dropout_prob must be between 0 and 1.")
+        if proprio_dropout_prob >= 1.0:
+            qpos = jnp.zeros_like(qpos)
+        elif proprio_dropout_prob > 0.0 and not deterministic:
+            # Partial dropout is sampled only in training; evaluation keeps
+            # proprio deterministic unless the official full-drop profile is used.
+            drop_mask = jax.random.bernoulli(
+                self.make_rng("dropout"),
+                proprio_dropout_prob,
+                (batch_size, 1),
+            )
+            qpos = jnp.where(drop_mask, jnp.zeros_like(qpos), qpos)
         query_embed = self.param(
             "query_embed",
             nn.initializers.normal(stddev=1.0),
             (self.num_queries, self.hidden_dim),
         )
-        cls_embed = self.param(
-            "cls_embed",
-            nn.initializers.normal(stddev=1.0),
-            (1, self.hidden_dim),
-        )
-        additional_pos_embed = self.param(
-            "additional_pos_embed",
-            nn.initializers.normal(stddev=1.0),
-            (3 if self.use_lang_cond else 2, self.hidden_dim),
-        )
+        cls_embed = None
+        if style_cls_type == "learned":
+            cls_embed = self.param(
+                "cls_embed",
+                nn.initializers.normal(stddev=1.0),
+                (1, self.hidden_dim),
+            )
+        if self.use_camera_extrinsics:
+            if int(self.num_camera_extrinsics) < 1:
+                raise ValueError("num_camera_extrinsics must be >= 1.")
+            conditioning_pos_embed = self.param(
+                "input_embed",
+                nn.initializers.normal(stddev=1.0),
+                (
+                    int(self.num_camera_extrinsics)
+                    + 2
+                    + (1 if self.use_lang_cond else 0),
+                    self.hidden_dim,
+                ),
+            )
+        else:
+            additional_pos_embed = self.param(
+                "additional_pos_embed",
+                nn.initializers.normal(stddev=1.0),
+                (3 if self.use_lang_cond else 2, self.hidden_dim),
+            )
 
         if actions is not None:
             actions = actions[:, : self.num_queries]
@@ -442,13 +607,24 @@ class JaxACTPolicy(nn.Module):
                 kernel_init=_PYTORCH_DEFAULT_KERNEL_INIT,
                 name="encoder_joint_proj",
             )[:, None]
-            cls = jnp.broadcast_to(cls_embed[None], (batch_size, 1, self.hidden_dim))
+            if cls_embed is None:
+                cls = jnp.zeros(
+                    (batch_size, 1, self.hidden_dim),
+                    dtype=action_embed.dtype,
+                )
+            else:
+                cls = jnp.broadcast_to(
+                    cls_embed[None],
+                    (batch_size, 1, self.hidden_dim),
+                )
             style_tokens = jnp.concatenate([cls, qpos_embed, action_embed], axis=1)
             style_is_pad = jnp.concatenate(
                 [jnp.zeros((batch_size, 2), dtype=jnp.bool_), is_pad],
                 axis=1,
             )
-            pos_table = _sinusoid_encoding_table(1 + 1 + self.num_queries, self.hidden_dim)
+            pos_table = _sinusoid_encoding_table(
+                1 + 1 + self.num_queries, self.hidden_dim
+            )
             style_pos = jnp.broadcast_to(
                 pos_table[None, : style_tokens.shape[1]],
                 style_tokens.shape,
@@ -469,6 +645,8 @@ class JaxACTPolicy(nn.Module):
                     attention_out_kernel_init=_PYTORCH_DEFAULT_KERNEL_INIT,
                     name=f"style_encoder_{layer}",
                 )(style_tokens, style_is_pad, style_pos, deterministic)
+            if self.pre_norm:
+                style_tokens = nn.LayerNorm(name="style_encoder_norm")(style_tokens)
             latent_info = _dense_with_pytorch_bias(
                 style_tokens[:, 0],
                 self.latent_dim * 2,
@@ -497,22 +675,33 @@ class JaxACTPolicy(nn.Module):
                 name="latent_out_proj",
             )
 
-        proprio_input = _dense_with_pytorch_bias(
-            qpos,
-            self.hidden_dim,
-            kernel_init=_PYTORCH_DEFAULT_KERNEL_INIT,
-            name="input_proj_robot_state_0",
-        )
-        proprio_input = nn.Dropout(rate=0.3, name="input_proj_robot_state_dropout")(
-            proprio_input,
-            deterministic=deterministic,
-        )
-        proprio_input = _dense_with_pytorch_bias(
-            proprio_input,
-            self.hidden_dim,
-            kernel_init=_PYTORCH_DEFAULT_KERNEL_INIT,
-            name="input_proj_robot_state_1",
-        )
+        if proprio_projection_type == "campose_single":
+            proprio_input = _dense_with_pytorch_bias(
+                qpos,
+                self.hidden_dim,
+                kernel_init=_PYTORCH_DEFAULT_KERNEL_INIT,
+                name="input_proj_robot_state",
+            )
+        else:
+            proprio_input = _dense_with_pytorch_bias(
+                qpos,
+                self.hidden_dim,
+                kernel_init=_PYTORCH_DEFAULT_KERNEL_INIT,
+                name="input_proj_robot_state_0",
+            )
+            proprio_input = nn.Dropout(
+                rate=0.3,
+                name="input_proj_robot_state_dropout",
+            )(
+                proprio_input,
+                deterministic=deterministic,
+            )
+            proprio_input = _dense_with_pytorch_bias(
+                proprio_input,
+                self.hidden_dim,
+                kernel_init=_PYTORCH_DEFAULT_KERNEL_INIT,
+                name="input_proj_robot_state_1",
+            )
 
         task_input = None
         if task_emb is not None:
@@ -526,7 +715,54 @@ class JaxACTPolicy(nn.Module):
                     name="task_proj",
                 )
 
-        if image_features is None:
+        if self.use_camera_extrinsics:
+            expected_shape = (
+                batch_size,
+                int(self.num_camera_extrinsics),
+                4,
+                4,
+            )
+            if camera_extrinsics is None:
+                camera_extrinsics = jnp.zeros(expected_shape, dtype=jnp.float32)
+            if camera_extrinsics.shape != expected_shape:
+                raise ValueError(
+                    "CamPose ACT camera_extrinsics must have shape "
+                    f"{expected_shape}, got {camera_extrinsics.shape}."
+                )
+            camera_tokens = _dense_with_pytorch_bias(
+                camera_extrinsics.astype(jnp.float32).reshape(
+                    (batch_size, int(self.num_camera_extrinsics), 16)
+                ),
+                self.hidden_dim,
+                kernel_init=_PYTORCH_DEFAULT_KERNEL_INIT,
+                name="input_proj_cam_extrinsics",
+            )
+            memory, memory_pos = _assemble_campose_conditioning_memory(
+                image_features,
+                image_pos,
+                camera_tokens,
+                proprio_input,
+                latent_input,
+                conditioning_pos_embed,
+                task_input,
+            )
+            hs = ACTDetrTransformer(
+                hidden_dim=self.hidden_dim,
+                nheads=self.nheads,
+                enc_layers=self.enc_layers,
+                dec_layers=self.dec_layers,
+                dim_feedforward=self.dim_feedforward,
+                dropout=self.dropout,
+                pre_norm=self.pre_norm,
+                decoder_output_layer=decoder_output_layer,
+                name="transformer",
+            )(
+                memory,
+                query_embed,
+                memory_pos,
+                deterministic=deterministic,
+            )
+        elif image_features is None:
             memory_tokens = [latent_input, proprio_input]
             if task_input is not None:
                 memory_tokens.append(task_input)
@@ -543,6 +779,7 @@ class JaxACTPolicy(nn.Module):
                 dim_feedforward=self.dim_feedforward,
                 dropout=self.dropout,
                 pre_norm=self.pre_norm,
+                decoder_output_layer=decoder_output_layer,
                 name="transformer",
             )(
                 memory,
@@ -559,6 +796,7 @@ class JaxACTPolicy(nn.Module):
                 dim_feedforward=self.dim_feedforward,
                 dropout=self.dropout,
                 pre_norm=self.pre_norm,
+                decoder_output_layer=decoder_output_layer,
                 name="transformer",
             )(
                 image_features,

@@ -1,0 +1,12 @@
+# @package _global_
+defaults:
+  - flow_extensions_flip_cutlery_repaired_200e
+  - override /method: legato
+  - _self_
+
+# Legato requires retained previous-chunk overlap; H20/K20 is invalid.
+execution_length: 10
+
+method:
+  name: legato
+  policy_label: legato

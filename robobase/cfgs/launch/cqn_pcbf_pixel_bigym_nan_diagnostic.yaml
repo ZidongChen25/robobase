@@ -1,0 +1,30 @@
+# @package _global_
+
+# Short branch-isolation run for the PCBF 0--1k NaN.  Invoke once with
+# pcbf_lambda=0 (removes the successor-velocity control variate), and once
+# with bc_lambda=0 (removes demo endpoint BPTT).  Fine-grained gradient-group
+# metrics are logged every 25 updates; snapshots/evaluation are intentionally
+# disabled to keep this diagnostic cheap.
+defaults:
+  - cqn_pcbf_pixel_bigym_demo_driven
+  - _self_
+
+num_train_frames: 1100
+batch_size: 16
+demo_batch_size: 16
+use_self_imitation: false
+num_eval_episodes: 0
+eval_every_steps: 100000
+log_every: 25
+save_snapshot: false
+
+method:
+  critic_grad_clip: 1.0
+  num_flow_steps: 4
+  num_flow_samples: 4
+  num_target_flow_samples: 4
+  num_action_flow_samples: 4
+
+hydra:
+  run:
+    dir: ./exp_local/pixel_cqn_flow_diagnostics/bigym_${env.task_name}_pcbf_${now:%Y%m%d%H%M%S}

@@ -1,0 +1,20 @@
+# @package _global_
+
+# Stage-XIII continuation: exact simulator branch returns supervise only the
+# direct advantage head. Rollout can remain BC-only (policy_value_beta=null)
+# or use normalized A + beta * log pi_BC for a matched closed-loop test.
+defaults:
+  - cqn_flow_v_direct_a_coherent_value_gate
+  - _self_
+
+method:
+  causal_branch_weight: 0.1
+  causal_branch_delta_weight: 10.0
+  causal_branch_temperature: 0.05
+  causal_branch_batch_size: 32
+  causal_branch_level: 1
+  policy_value_beta: null
+
+hydra:
+  run:
+    dir: ./exp_local/cqn_value_fidelity_stage13/bigym_${env.task_name}_causal_a_${now:%Y%m%d%H%M%S}

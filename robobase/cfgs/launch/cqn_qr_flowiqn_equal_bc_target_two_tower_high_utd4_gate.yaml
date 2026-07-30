@@ -1,0 +1,18 @@
+# @package _global_
+
+# Add DBC's statistically primary all-pairs quantile-Huber endpoint objective
+# to the matched FlowIQN control while retaining equal weight on sorted CFM.
+# This isolates whether the missing all-pairs objective, rather than merely
+# model capacity or compute, explains the corrected FlowIQN failure.
+defaults:
+  - cqn_flowiqn_bc_target_two_tower_high_utd4_gate
+  - _self_
+
+method:
+  bcfm_lambda: 1.0
+  quantile_endpoint_lambda: 1.0
+  quantile_huber_kappa: 1.0
+
+hydra:
+  run:
+    dir: ./exp_local/cqn_flow_high_utd/bigym_${env.task_name}_qr_flowiqn_equal_two_tower_utd4_${now:%Y%m%d%H%M%S}

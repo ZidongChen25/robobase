@@ -1,0 +1,63 @@
+# @package _global_
+
+# FlowIQN critic-objective adaptation for CQN-AS after the mechanism-fidelity
+# audit. CQN-AS keeps its pixel encoder, coarse-to-fine bin enumeration, replay,
+# BC term, and optimizer. The return-flow mechanism follows Algorithm 1/Appendix
+# C where it can be transferred without replacing the CQN-AS policy:
+# monotone quantile coupling, terminal-aware kappa=.1 source interval, fixed
+# midpoint quantile scalarization, cube-like K=8/M=8, HL-Gauss z, Fourier time.
+defaults:
+  - cqn_flow_pixel_bigym_demo_driven
+  - _self_
+
+num_train_frames: 10500
+batch_size: 8
+demo_batch_size: 8
+use_self_imitation: false
+
+method:
+  critic_grad_clip: 1.0
+  critic_target_tau: 0.005
+  value_mode: return_sample
+  atom_ce_lambda: 0.0
+  demo_fosd: false
+  bcfm_lambda: 1.0
+  dcfm_lambda: 0.0
+  pcbf_loss_coeff: 0.0
+  pcbf_lambda: 0.0
+  flow_iqn_quantile_coupling: true
+  flow_source_type: uniform
+  # MovePlate has reward 0 until a terminal success reward of 1. Its feasible
+  # return support is [0,1], so kappa=.1 maps to g(tau)=.9+.1*tau.
+  flow_source_min: 0.9
+  flow_source_max: 1.0
+  antithetic_flow_sources: false
+  fixed_action_flow_sources: true
+  action_flow_quantile_grid: true
+  num_flow_steps: 8
+  num_flow_samples: 8
+  num_target_flow_samples: 8
+  # The full K=8 action grid makes the first JIT update request 43.53 GB on
+  # the available 32.61 GB GPU. Keep all eight Bellman/current quantiles and
+  # use four midpoint nodes only for train-time action scalarization; held-out
+  # evaluation overrides this back to the full K=8 grid.
+  num_action_flow_samples: 4
+  return_sample_aggregation: mean
+  return_sample_temperature: 1.0
+  clip_scalar_targets: true
+  clip_flow_trajectory: true
+  scalar_value_embedding: hl_gauss
+  scalar_embed_bins: 51
+  scalar_embed_sigma: 16.0
+  time_embedding_type: fourier
+  time_embed_dim: 64
+  time_scale: 1.0
+  endpoint_q_lambda: 0.0
+  source_consistency_lambda: 0.0
+  flow_distill_lambda: 0.0
+  flow_distill_action_readout: false
+  critic_architecture: flow_q
+
+hydra:
+  run:
+    dir: ./exp_local/cqn_flow_flowiqn/bigym_corrected_${env.task_name}_${now:%Y%m%d%H%M%S}

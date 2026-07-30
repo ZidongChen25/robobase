@@ -1,0 +1,60 @@
+# @package _global_
+
+defaults:
+  - ../env: null
+  - ../method: cqn_flow
+  # Dedicated launch variants override this slot after method defaults.
+  - ../profile: null
+  - _self_
+
+seed: 1
+demos: !!float .inf
+num_pretrain_steps: 0
+num_explore_steps: 0
+num_train_frames: 101000
+num_eval_episodes: 25
+eval_every_steps: 2500
+# Value-flow evaluates all K x D x N queries during action selection and demo
+# auxiliaries. Keep the first-run default below the CQN-AS 256 + 256 batch.
+batch_size: 32
+demo_batch_size: 32
+replay_size_before_train: 500
+save_snapshot: true
+
+pixels: true
+visual_observation_shape: [84, 84]
+frame_stack: 4
+action_repeat: 1
+action_sequence: 16
+execution_length: 1
+temporal_ensemble: false
+
+is_imitation_learning: false
+use_min_max_normalization: true
+use_standardization: false
+min_max_margin: 0.0
+norm_obs: true
+use_self_imitation: true
+update_every_steps: 1
+
+replay:
+  nstep: 1
+  size: 1000000
+  demo_size: 1000000
+  num_workers: 0
+  action_padding: edge
+  action_sequence_start_offset: 0
+  include_tp1: true
+
+lazy_replay:
+  use: false
+
+method:
+  v_min: -2.0
+  v_max: 2.0
+  use_target_network_for_rollout: true
+  query_hidden_dim: 64
+
+hydra:
+  run:
+    dir: ./exp_local/pixel_cqn_flow/bigym_${env.task_name}_${now:%Y%m%d%H%M%S}

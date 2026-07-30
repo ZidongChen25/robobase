@@ -130,6 +130,24 @@ class MetersGroup(object):
             if should_write_header:
                 self._csv_writer.writeheader()
 
+        new_fields = set(data) - set(self._csv_writer.fieldnames)
+        if new_fields:
+            # Online RL rows gain episode and optimizer metrics only after the
+            # first episode/update.  Preserve earlier rows while expanding the
+            # CSV schema instead of failing on those later fields.
+            self._csv_file.close()
+            with self._csv_file_name.open("r") as f:
+                rows = list(csv.DictReader(f))
+            fieldnames = sorted(set(self._csv_writer.fieldnames) | set(data))
+            with self._csv_file_name.open("w") as f:
+                writer = csv.DictWriter(f, fieldnames=fieldnames, restval=0.0)
+                writer.writeheader()
+                writer.writerows(rows)
+            self._csv_file = self._csv_file_name.open("a")
+            self._csv_writer = csv.DictWriter(
+                self._csv_file, fieldnames=fieldnames, restval=0.0
+            )
+
         self._csv_writer.writerow(data)
         self._csv_file.flush()
 
@@ -242,8 +260,12 @@ class Logger(object):
             elif np.isscalar(value) or value.size == 1:
                 self._wandb_logs[key] = value
             else:
-                v = value if value.ndim == 3 else value[0]  # assume image
-                channel_first = v.shape[0] == 3
+                # A 2-D diagnostic is already a valid grayscale image.  In
+                # particular, ActionSequenceWrapper reports executed_action as
+                # [executed_steps, action_dim]; slicing value[0] turned it into
+                # an invalid 1-D wandb.Image.
+                v = value if value.ndim in {2, 3} else value[0]
+                channel_first = v.ndim == 3 and v.shape[0] == 3
                 if channel_first:
                     v = np.moveaxis(v, 0, -1)
                 self._wandb_logs[key] = wandb.Image(v)
@@ -261,7 +283,10 @@ class Logger(object):
                 v = value.item() if value is np.ndarray else value
                 self._sw.add_scalar(key, v, step)
             else:
-                v = value if value.ndim == 3 else value[0]  # assume image
+                if value.ndim == 2:
+                    v = value[None, ...]
+                else:
+                    v = value if value.ndim == 3 else value[0]
                 self._sw.add_image(key, v, step)
 
     def _to_numpy_value(self, value):
@@ -329,6 +354,10 @@ class Logger(object):
 
     def log_metrics(self, metrics, step, prefix):
         for key, value in metrics.items():
+            # Normalize JAX/torch-like arrays before inspecting dimensionality;
+            # otherwise a 1-D non-NumPy diagnostic bypasses scalar expansion
+            # and is incorrectly routed to the image logger.
+            value = self._to_numpy_value(value)
             if isinstance(value, np.ndarray) and len(value.shape) == 1:
                 for i, v in enumerate(value):
                     self._log(f"{prefix}/{key}{i}", v, step)

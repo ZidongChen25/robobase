@@ -1,0 +1,35 @@
+# @package _global_
+
+# Expected-Q Flow Matching under the same value-fidelity protocol that passed
+# the corrected deepest-level direct-C51 gate: independent BC behavior policy,
+# replay-next TD target, completed-return anchor, and coherent H=4 randomized
+# action interventions. State/image, C2F level, zoom path, sequence position,
+# action dimension, and candidate bin remain flow-field conditions.
+defaults:
+  - cqn_flow_floq_anchored_pixel_bigym_stage1_gate
+  - _self_
+
+num_train_frames: 10500
+batch_size: 16
+demo_batch_size: 16
+use_self_imitation: false
+
+env:
+  truncate_demo_at_success: true
+
+method:
+  separate_bc_policy: true
+  bc_policy_stop_gradient: false
+  td_target_action_source: replay_next
+  critic_sequence_mode: effective_k0
+  mc_return_weight: 0.1
+  mc_return_stop_gradient_encoder: false
+  mc_return_value_only: false
+  stddev_schedule: "0.0"
+  structured_exploration_prob: 0.06
+  structured_exploration_level: 1
+  structured_exploration_horizon: 4
+
+hydra:
+  run:
+    dir: ./exp_local/cqn_value_fidelity_flow/bigym_${env.task_name}_floq_coherent_${now:%Y%m%d%H%M%S}

@@ -1,0 +1,83 @@
+# @package _global_
+action_sequence: 8
+
+method:
+  name: a2a
+  policy_label: a2a
+  is_rl: false
+  lr: 1e-4
+  num_train_steps: ${num_pretrain_steps}
+  num_flow_steps: 1
+  adaptive_lr: false
+  actor_grad_clip: null
+  use_ema: false
+  ema_decay: 0.9999
+  ema_decay_schedule: diffusers
+  weight_decay: 1.0e-6
+  noise_mask_steps: 0
+  repeat_action: false
+  image_augmentation_type: none
+  horizon_dropout_lengths: null
+  horizon_dropout_probs: null
+  horizon_loss_weights: null
+
+  objective:
+    type: rectified_flow
+    num_flow_steps: ${method.num_flow_steps}
+    sampler: euler
+    train_time_schedule: uniform
+    time_scale: 1000.0
+
+  flow_source:
+    type: a2a
+    history_horizon: 8
+    # Environment launches can opt into measured feedback when they expose it.
+    history_source: commanded_action
+    history_padding: zero
+    latent_dim: 512
+    hidden_dim: 512
+    encoder_layers: 3
+    decoder_layers: 4
+    kernel_size: 5
+    decoder_dropout: 0.0
+    train_history_noise_std: 0.0
+    eval_history_noise_std: 0.0
+    noise_exclude_last_n: 2
+    consistency_steps: 1
+    consistency_loss_type: mse
+    consistency_stop_gradient_target: false
+    fm_loss_weight: 1.0
+    autoencoder_loss_weight: 0.5
+    consistency_loss_weight: 1.0
+    consistency_action_loss_weight: 0.5
+
+  backbone:
+    type: transformer
+    # A2A transports one latent token, then decodes it to the physical horizon.
+    sequence_length: 1
+    diffusion_step_embed_dim: 256
+    down_dims: [256, 512, 1024]
+    kernel_size: 5
+    n_groups: 8
+    hidden_dims: [512, 512]
+    d_model: 256
+    n_heads: 4
+    num_layers: 8
+    n_cond_layers: 0
+    depth: 12
+    dropout: 0.0
+    operator_variant: legacy
+
+  encoder_model:
+    type: resnet
+    model: resnet18
+    pretrained: true
+    trainable: false
+    use_plucker: false
+    plucker_fusion_mode: null
+    plucker_hidden_channels: 64
+    plucker_identity_init: false
+
+  view_fusion_model:
+    type: multicam_feature
+    mode: flatten

@@ -1,0 +1,23 @@
+# @package _global_
+
+# Stage-158 (cqn-flow.md 39.1): the only un-refuted combination -- official
+# 100k config + hierarchical epsilon-bin exploration + margin decay.
+# Stage-157 measured that 10x same-distribution data leaves counterfactual
+# accuracy at chance (0.567); this arm adds the state-matched
+# action-counterfactual data that distribution lacks, and decays the
+# margin broadcast that suppressed TD.  Endpoint is the sibling probe,
+# not task success.
+defaults:
+  - cqn_as_pixel_bigym_demo_driven
+  - _self_
+
+save_csv: true
+snapshot_every_n: 20000
+
+method:
+  bin_explore_probs: [0.002, 0.004, 0.008]
+  bc_lambda_schedule: linear(1.0,0.25,100000)
+
+hydra:
+  run:
+    dir: ./exp_local/cqn_stage158_explore_100k/bigym_${env.task_name}_exp100k_${now:%Y%m%d%H%M%S}

@@ -1,0 +1,23 @@
+# @package _global_
+
+# Distributional Flow-C51 under the same decoupled-policy, completed-return,
+# and coherent-intervention protocol as the expected-Q FLOQ gate.  The flow
+# endpoint is a 51-atom logit vector; endpoint CE is an integration anchor,
+# while BCFM still supplies dense supervision along the full path.
+defaults:
+  - cqn_flow_floq_coherent_value_gate
+  - _self_
+
+method:
+  value_mode: categorical
+  scalar_value_embedding: raw
+  flow_source_type: gaussian
+  flow_source_std: 1.0
+  atom_ce_lambda: 1.0
+  endpoint_q_lambda: 0.0
+  source_consistency_lambda: 0.1
+  demo_fosd: false
+
+hydra:
+  run:
+    dir: ./exp_local/cqn_value_fidelity_flow/bigym_${env.task_name}_flow_c51_coherent_${now:%Y%m%d%H%M%S}

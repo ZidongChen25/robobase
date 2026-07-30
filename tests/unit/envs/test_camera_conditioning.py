@@ -21,8 +21,11 @@ def test_plucker_raymap_defaults_match_official_channel_order():
         camera_convention="opengl",
     )
 
-    np.testing.assert_allclose(raymap[:3, 0, 0], [0.0, 0.0, -1.0], atol=1e-6)
-    np.testing.assert_allclose(raymap[3:, 0, 0], [-2.0, 1.0, 0.0], atol=1e-6)
+    direction = np.asarray([0.25, -0.25, -1.0], dtype=np.float32)
+    direction /= np.linalg.norm(direction) + 1e-8
+    moment = np.cross(c2w[:3, 3], direction)
+    np.testing.assert_allclose(raymap[:3, 0, 0], moment, atol=1e-6)
+    np.testing.assert_allclose(raymap[3:, 0, 0], direction, atol=1e-6)
 
 
 def test_plucker_raymap_defaults_match_official_pixel_offset():
@@ -38,12 +41,12 @@ def test_plucker_raymap_defaults_match_official_pixel_offset():
         camera_convention="opengl",
     )
 
-    expected_dir = np.asarray([0.5, -0.5, -1.0], dtype=np.float32)
-    expected_dir = expected_dir / np.linalg.norm(expected_dir)
-    np.testing.assert_allclose(raymap[0, 0, :3], expected_dir, atol=1e-6)
+    expected_dir = np.asarray([1.0, -1.0, -1.0], dtype=np.float32)
+    expected_dir = expected_dir / (np.linalg.norm(expected_dir) + 1e-8)
+    np.testing.assert_allclose(raymap[0, 0, 3:], expected_dir, atol=1e-6)
 
 
-def test_plucker_raymap_supports_moment_first_layout():
+def test_plucker_raymap_supports_readme_direction_first_layout():
     intrinsic = np.asarray(
         [[1.0, 0.0, 0.5], [0.0, 1.0, 0.5], [0.0, 0.0, 1.0]],
         dtype=np.float32,
@@ -57,12 +60,12 @@ def test_plucker_raymap_supports_moment_first_layout():
         width=1,
         channels_first=True,
         principal_point_offset=0.0,
-        camera_convention="opengl",
-        channel_order="moment_direction",
+        camera_convention="opencv",
+        channel_order="direction_moment",
     )
 
-    np.testing.assert_allclose(raymap[:3, 0, 0], [0.0, 0.0, 0.0], atol=1e-6)
-    np.testing.assert_allclose(raymap[3:, 0, 0], [0.0, 0.0, -1.0], atol=1e-6)
+    np.testing.assert_allclose(raymap[:3, 0, 0], [0.0, 0.0, 1.0], atol=1e-6)
+    np.testing.assert_allclose(raymap[3:, 0, 0], [0.0, 0.0, 0.0], atol=1e-6)
 
 
 def test_plucker_raymap_invariants_hold_for_translated_camera():
@@ -74,8 +77,8 @@ def test_plucker_raymap_invariants_hold_for_translated_camera():
     c2w[:3, 3] = np.asarray([1.0, 2.0, 3.0], dtype=np.float32)
 
     raymap = plucker_raymap_from_c2w(intrinsic, c2w, height=4, width=5)
-    direction = np.moveaxis(raymap[:3], 0, -1).reshape(-1, 3)
-    moment = np.moveaxis(raymap[3:], 0, -1).reshape(-1, 3)
+    moment = np.moveaxis(raymap[:3], 0, -1).reshape(-1, 3)
+    direction = np.moveaxis(raymap[3:], 0, -1).reshape(-1, 3)
 
     np.testing.assert_allclose(np.linalg.norm(direction, axis=-1), 1.0, atol=1e-6)
     np.testing.assert_allclose(

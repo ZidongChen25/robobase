@@ -37,7 +37,11 @@ def apply_requested_gpu(cfg: DictConfig):
     if selected_gpu is None:
         return
 
-    os.environ["MUJOCO_EGL_DEVICE_ID"] = str(selected_gpu)
+    # Respect an externally chosen EGL device: EGL enumeration order can
+    # differ from CUDA order (e.g. a degraded card shifting indices), so
+    # callers may need to render on a different EGL device than they
+    # compute on.
+    os.environ.setdefault("MUJOCO_EGL_DEVICE_ID", str(selected_gpu))
 
     with open_dict(cfg):
         if cfg.get("env", None) is not None:

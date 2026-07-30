@@ -9,6 +9,7 @@ import logging
 from gymnasium import spaces
 from omegaconf import DictConfig
 
+from robobase import utils
 from robobase.factory import create_agent, method_name_from_cfg
 from robobase.envs.env import EnvFactory
 from robobase.logger import Logger
@@ -98,7 +99,9 @@ class _DemoMergedIterator:
             assert set(batch.keys()) == set(demo_batch.keys())
             self._is_safe = True
         demo_batch["demo"] = np.ones_like(demo_batch["demo"])
-        return {k: np.concatenate([batch[k], demo_batch[k]], axis=0) for k in batch.keys()}
+        return {
+            k: np.concatenate([batch[k], demo_batch[k]], axis=0) for k in batch.keys()
+        }
 
     def close(self):
         for iterator in (self.replay_iter, self.demo_replay_iter):
@@ -127,13 +130,56 @@ def _executed_action_steps(info: dict[str, Any]) -> int:
     return max(1, int(np.asarray(mask, dtype=np.int32).sum()))
 
 
+def _effective_episode_length(cfg: DictConfig) -> int:
+    """Return the number of wrapped environment decisions in one episode."""
+
+    episode_length = int(cfg.env.episode_length)
+    if (
+        str(cfg.env.get("env_name", "")).lower() == "bigym"
+        and not bool(cfg.env.get("episode_length_is_env_steps", False))
+    ):
+        episode_length //= int(cfg.env.demo_down_sample_rate)
+    return max(1, episode_length)
+
+
+def _replay_action_from_step(
+    commanded_action: np.ndarray,
+    next_info: dict[str, Any],
+) -> np.ndarray:
+    """Select the single action that the environment actually executed."""
+
+    replay_action = np.asarray(commanded_action)[0]
+    transition_info = next_info if isinstance(next_info, dict) else {}
+    final_info = transition_info.get("final_info")
+    if bool(transition_info.get("_final_info", False)) and isinstance(
+        final_info, dict
+    ):
+        transition_info = final_info
+    executed = transition_info.get("executed_action")
+    if executed is None:
+        return replay_action
+
+    executed = np.asarray(executed)
+    if executed.ndim == replay_action.ndim + 1:
+        if executed.shape[0] != 1:
+            raise ValueError(
+                "RL replay requires execution_length=1, but the environment "
+                "reported multiple executed actions."
+            )
+        executed = executed[0]
+    if executed.shape != replay_action.shape:
+        raise ValueError(
+            "Executed action shape does not match replay action shape: "
+            f"{executed.shape} != {replay_action.shape}."
+        )
+    return executed
+
+
 def _validate_eval_env_counts(cfg: DictConfig) -> None:
     num_eval_envs = int(cfg.num_eval_envs)
     num_eval_episodes = int(cfg.num_eval_episodes)
     if num_eval_episodes < 0:
-        raise ValueError(
-            f"num_eval_episodes must be >= 0, got {num_eval_episodes}."
-        )
+        raise ValueError(f"num_eval_episodes must be >= 0, got {num_eval_episodes}.")
     if num_eval_envs < 0:
         raise ValueError(f"num_eval_envs must be >= 0, got {num_eval_envs}.")
     if num_eval_episodes > 0 and num_eval_envs < 1:
@@ -141,6 +187,57 @@ def _validate_eval_env_counts(cfg: DictConfig) -> None:
             "num_eval_envs must be >= 1 when num_eval_episodes > 0, got "
             f"num_eval_envs={num_eval_envs} and num_eval_episodes={num_eval_episodes}."
         )
+
+
+def _validate_rl_action_sequence(cfg: DictConfig) -> None:
+    """Restrict multi-step RL chunks to methods that implement chunk rollout."""
+
+    method_name = method_name_from_cfg(cfg)
+    supported_methods = {"cqn_as", "cqn_flow", "q_chunking"}
+    if (
+        cfg.method.is_rl
+        and cfg.action_sequence != 1
+        and method_name not in supported_methods
+    ):
+        raise ValueError(
+            "Action sequence > 1 is only supported for the CQN-AS, "
+            "CQN-Flow, and Q-Chunking RL methods"
+        )
+
+
+def _online_updates_ready(
+    cfg: DictConfig,
+    *,
+    main_loop_iterations: int,
+    replay_size: int,
+) -> bool:
+    """Return whether replay and online-delay gates both permit updates."""
+
+    return bool(
+        replay_size >= int(cfg.replay_size_before_train)
+        and main_loop_iterations >= int(cfg.get("online_update_after_steps", 0))
+    )
+
+
+def _mc_return_anchor_enabled(cfg: DictConfig) -> bool:
+    method_name = method_name_from_cfg(cfg)
+    return bool(
+        method_name in {"cqn_as", "cqn_flow"}
+        and (
+            float(cfg.method.get("mc_return_weight", 0.0)) > 0.0
+            or (
+                method_name == "cqn_flow"
+                and float(cfg.method.get("evor_td_lambda", 0.0)) > 0.0
+            )
+        )
+    )
+
+
+def _structured_exploration_enabled(cfg: DictConfig) -> bool:
+    return (
+        method_name_from_cfg(cfg) in {"cqn_as", "cqn_flow"}
+        and float(cfg.method.get("structured_exploration_prob", 0.0)) > 0.0
+    )
 
 
 def _create_default_replay_buffer(
@@ -153,7 +250,14 @@ def _create_default_replay_buffer(
     save_snapshot: bool = False,
     reuse_saved: bool = False,
 ) -> ReplayBuffer:
+    use_mc_return_anchor = _mc_return_anchor_enabled(cfg)
+    use_structured_exploration = _structured_exploration_enabled(cfg)
     if lazy_replay_enabled(cfg):
+        if use_mc_return_anchor:
+            raise NotImplementedError(
+                "CQN-AS MC return anchoring requires episode-backed replay; "
+                "set lazy_replay.use=false."
+            )
         if demo_replay:
             raise NotImplementedError("lazy_replay does not support demo replay.")
         if cfg.env.env_name != "bigym":
@@ -161,6 +265,28 @@ def _create_default_replay_buffer(
         extra_replay_elements = spaces.Dict({})
         if cfg.demos != 0:
             extra_replay_elements["demo"] = spaces.Box(0, 1, shape=(), dtype=np.uint8)
+        if use_structured_exploration:
+            extra_replay_elements["structured_explore"] = spaces.Box(
+                0,
+                1,
+                shape=(),
+                dtype=np.uint8,
+            )
+            extra_replay_elements["structured_explore_start"] = spaces.Box(
+                0, 1, shape=(), dtype=np.uint8
+            )
+            extra_replay_elements["structured_explore_dimension"] = spaces.Box(
+                -1,
+                int(action_space.shape[-1]) - 1,
+                shape=(),
+                dtype=np.int16,
+            )
+            extra_replay_elements["structured_explore_delta"] = spaces.Box(
+                -np.inf, np.inf, shape=(), dtype=np.float32
+            )
+            extra_replay_elements[
+                "structured_explore_assignment_prob"
+            ] = spaces.Box(0.0, 1.0, shape=(), dtype=np.float32)
         return LazyBiGymReplayBuffer(
             cfg,
             observation_space,
@@ -170,6 +296,21 @@ def _create_default_replay_buffer(
         )
 
     multiprocessing_context = "spawn"
+    method_name = method_name_from_cfg(cfg)
+    source_cfg = cfg.method.get("flow_source", {})
+    default_source_type = (
+        method_name if method_name in {"a2a", "legato"} else "gaussian"
+    )
+    flow_source_type = str(source_cfg.get("type", default_source_type)).lower()
+    action_history_len = (
+        int(source_cfg.get("history_horizon", cfg.action_sequence))
+        if flow_source_type in {"a2a", "a2a_noise"}
+        else 0
+    )
+    action_history_padding = str(source_cfg.get("history_padding", "zero")).lower()
+    action_history_source = str(
+        source_cfg.get("history_source", "commanded_action")
+    ).lower()
     cache_plan = build_vision_feature_cache_plan(
         cfg=cfg,
         observation_space=observation_space,
@@ -188,6 +329,35 @@ def _create_default_replay_buffer(
     extra_replay_elements = spaces.Dict({})
     if cfg.demos != 0:
         extra_replay_elements["demo"] = spaces.Box(0, 1, shape=(), dtype=np.uint8)
+    if use_mc_return_anchor:
+        extra_replay_elements["mc_return"] = spaces.Box(
+            -np.inf,
+            np.inf,
+            shape=(),
+            dtype=np.float32,
+        )
+    if use_structured_exploration:
+        extra_replay_elements["structured_explore"] = spaces.Box(
+            0,
+            1,
+            shape=(),
+            dtype=np.uint8,
+        )
+        extra_replay_elements["structured_explore_start"] = spaces.Box(
+            0, 1, shape=(), dtype=np.uint8
+        )
+        extra_replay_elements["structured_explore_dimension"] = spaces.Box(
+            -1,
+            int(action_space.shape[-1]) - 1,
+            shape=(),
+            dtype=np.int16,
+        )
+        extra_replay_elements["structured_explore_delta"] = spaces.Box(
+            -np.inf, np.inf, shape=(), dtype=np.float32
+        )
+        extra_replay_elements[
+            "structured_explore_assignment_prob"
+        ] = spaces.Box(0.0, 1.0, shape=(), dtype=np.float32)
     # Create replay_class with buffer-specific hyperparameters
     replay_class = UniformReplayBuffer
     if cfg.replay.prioritization:
@@ -219,12 +389,16 @@ def _create_default_replay_buffer(
             cfg.replay.get("action_sequence_start_offset", 0)
         ),
         action_padding=str(cfg.replay.get("action_padding", "zero")),
+        action_history_len=action_history_len,
+        action_history_padding=action_history_padding,
+        action_history_source=action_history_source,
         max_cached_episodes=cfg.replay.get("max_cached_episodes", None),
-        max_cached_episode_bytes=cfg.replay.get(
-            "max_cached_episode_bytes", None
-        ),
+        max_cached_episode_bytes=cfg.replay.get("max_cached_episode_bytes", None),
         include_tp1=bool(cfg.replay.get("include_tp1", True)),
         multiprocessing_context=multiprocessing_context,
+        transition_uniform_sampling=bool(
+            cfg.replay.get("transition_uniform_sampling", False)
+        ),
     )
 
 
@@ -257,19 +431,6 @@ def _create_default_envs(cfg: DictConfig) -> EnvFactory:
     else:
         ValueError()
     return factory
-
-
-def _validate_rl_action_sequence(cfg: DictConfig) -> None:
-    """Allow action chunks only for RL methods that implement them."""
-
-    if (
-        cfg.method.is_rl
-        and cfg.action_sequence != 1
-        and method_name_from_cfg(cfg) != "cqn_as"
-    ):
-        raise ValueError(
-            "Action sequence > 1 is only supported for the CQN-AS RL method"
-        )
 
 
 class Workspace:
@@ -326,16 +487,20 @@ class Workspace:
                 f"action_sequence={cfg.action_sequence}, "
                 f"noise_mask_steps={noise_mask_steps}."
             )
+        effective_episode_length = _effective_episode_length(cfg)
         if (
             not cfg.is_imitation_learning
-            and cfg.replay_size_before_train * cfg.action_repeat * cfg.action_sequence
-            < cfg.env.episode_length
+            and str(cfg.method.get("name", "")).lower() != "ppo"
+            and cfg.replay_size_before_train * cfg.action_repeat * cfg.execution_length
+            < effective_episode_length
             and cfg.replay_size_before_train > 0
         ):
             raise ValueError(
-                "replay_size_before_train * action_repeat "
-                f"({cfg.replay_size_before_train} * {cfg.action_repeat}) "
-                f"must be >= episode_length ({cfg.env.episode_length})."
+                "replay_size_before_train * action_repeat * execution_length "
+                f"({cfg.replay_size_before_train} * {cfg.action_repeat} * "
+                f"{cfg.execution_length}) "
+                f"must be >= effective episode length "
+                f"({effective_episode_length})."
             )
 
         _validate_rl_action_sequence(cfg)
@@ -397,9 +562,7 @@ class Workspace:
             self._ensure_eval_envs_created()
 
         if cfg.get("intrinsic_reward_module", None):
-            raise NotImplementedError(
-                "Intrinsic reward modules are not yet supported."
-            )
+            raise NotImplementedError("Intrinsic reward modules are not yet supported.")
 
         self.agent = create_agent(
             cfg,
@@ -471,7 +634,9 @@ class Workspace:
         self._previous_sigint_handler = None
         self._snapshot_loaded = False
         self._snapshot_cfg = None
-        train_agent_count = self.train_envs.num_envs if self.train_envs is not None else 0
+        train_agent_count = (
+            self.train_envs.num_envs if self.train_envs is not None else 0
+        )
         self._eval_agent_indices = list(
             range(train_agent_count, train_agent_count + self.cfg.num_eval_envs)
         )
@@ -537,9 +702,7 @@ class Workspace:
                     load_all_episodes=bool(
                         self.cfg.replay.get("epoch_load_all_episodes", False)
                     ),
-                    batch_chunk_size=self.cfg.replay.get(
-                        "epoch_batch_chunk_size", 0
-                    ),
+                    batch_chunk_size=self.cfg.replay.get("epoch_batch_chunk_size", 0),
                 )
             else:
                 _replay_iter = create_jax_replay_iterator(
@@ -551,9 +714,7 @@ class Workspace:
                     self.demo_replay_buffer,
                     num_workers=self.demo_replay_num_workers,
                 )
-                _replay_iter = _merge_replay_demo_iter(
-                    _replay_iter, _demo_replay_iter
-                )
+                _replay_iter = _merge_replay_demo_iter(_replay_iter, _demo_replay_iter)
             prefetch_size = int(
                 self.cfg.get("backend", {}).get("replay_prefetch_size", 0)
                 if self.cfg.get("backend", None)
@@ -564,9 +725,8 @@ class Workspace:
                 lazy_cfg = self.cfg.get("lazy_replay", {})
                 prefetch_workers = max(1, int(lazy_cfg.get("num_workers", 1)))
                 if prefetch_size <= 0:
-                    prefetch_size = (
-                        prefetch_workers
-                        * int(lazy_cfg.get("prefetch_factor", 2))
+                    prefetch_size = prefetch_workers * int(
+                        lazy_cfg.get("prefetch_factor", 2)
                     )
             if prefetch_size > 0:
                 backend_cfg = self.cfg.get("backend", {})
@@ -754,7 +914,11 @@ class Workspace:
         if prefer_final:
             final_infos = infos.get("final_info")
             final_info_mask = infos.get("_final_info")
-            if final_infos is not None and final_info_mask is not None and final_info_mask[env_idx]:
+            if (
+                final_infos is not None
+                and final_info_mask is not None
+                and final_info_mask[env_idx]
+            ):
                 return final_infos[env_idx]
 
         extracted = {}
@@ -837,7 +1001,9 @@ class Workspace:
             self.eval_envs.observations = observation
         return observation
 
-    def _run_single_env_eval(self, eval_record_all_episode: bool = False) -> dict[str, Any]:
+    def _run_single_env_eval(
+        self, eval_record_all_episode: bool = False
+    ) -> dict[str, Any]:
         step, episode, total_reward, successes = 0, 0, 0, 0
         eval_until_episode = _Until(self.cfg.num_eval_episodes)
         first_rollout = []
@@ -892,7 +1058,9 @@ class Workspace:
             metrics["eval_rollout"] = dict(video=first_rollout, fps=4)
         return metrics
 
-    def _run_vector_env_eval(self, eval_record_all_episode: bool = False) -> dict[str, Any]:
+    def _run_vector_env_eval(
+        self, eval_record_all_episode: bool = False
+    ) -> dict[str, Any]:
         del eval_record_all_episode
         active_eval_seeds = [
             self._eval_seed_for_episode(episode)
@@ -968,7 +1136,9 @@ class Workspace:
                             success_supported = False
                             completed_successes = []
                         else:
-                            completed_successes.append(int(np.asarray(success).astype(int).item()))
+                            completed_successes.append(
+                                int(np.asarray(success).astype(int).item())
+                            )
                 active_episode_is_target[env_idx] = False
                 episode_rewards[env_idx] = 0.0
                 episode_lengths[env_idx] = 0
@@ -1009,7 +1179,9 @@ class Workspace:
         metrics.update(
             {
                 "episode_reward": float(np.mean(completed_rewards)),
-                "episode_length": float(np.mean(completed_lengths) * self.cfg.action_repeat),
+                "episode_length": float(
+                    np.mean(completed_lengths) * self.cfg.action_repeat
+                ),
             }
         )
         if success_supported and completed_successes:
@@ -1020,7 +1192,9 @@ class Workspace:
         # TODO: In future, this func could do with a further refactor
         self._ensure_eval_envs_created()
         if self.eval_env is None and self.eval_envs is None:
-            raise ValueError("Evaluation requested but no evaluation environment is configured.")
+            raise ValueError(
+                "Evaluation requested but no evaluation environment is configured."
+            )
         reset_aligned_eval_noise = getattr(
             self.agent,
             "reset_aligned_eval_noise",
@@ -1031,12 +1205,17 @@ class Workspace:
         self.agent.set_eval_env_running(True)
         try:
             if self.eval_envs is not None:
-                return self._run_vector_env_eval(
+                metrics = self._run_vector_env_eval(
                     eval_record_all_episode=eval_record_all_episode
                 )
-            return self._run_single_env_eval(
-                eval_record_all_episode=eval_record_all_episode
-            )
+            else:
+                metrics = self._run_single_env_eval(
+                    eval_record_all_episode=eval_record_all_episode
+                )
+            rollout_diagnostics = getattr(self.agent, "rollout_diagnostics", None)
+            if callable(rollout_diagnostics):
+                metrics.update(rollout_diagnostics())
+            return metrics
         finally:
             self._set_agent_active_eval_seeds(None)
             self.agent.set_eval_env_running(False)
@@ -1063,9 +1242,93 @@ class Workspace:
         list_of_obs_dicts = [
             dict(zip(observations, t)) for t in zip(*observations.values())
         ]
+        store_structured_explore = (
+            "structured_explore" in self.extra_replay_elements.keys()
+        )
+        structured_explore_mask = np.asarray(
+            getattr(
+                self.agent,
+                "_last_structured_exploration_mask",
+                np.zeros((self.train_envs.num_envs,), dtype=np.bool_),
+            ),
+            dtype=np.bool_,
+        )
+        structured_explore_start = np.asarray(
+            getattr(
+                self.agent,
+                "_last_structured_exploration_start",
+                np.zeros((self.train_envs.num_envs,), dtype=np.bool_),
+            ),
+            dtype=np.bool_,
+        )
+        structured_explore_dimension = np.asarray(
+            getattr(
+                self.agent,
+                "_last_structured_exploration_dimension",
+                np.full((self.train_envs.num_envs,), -1, dtype=np.int16),
+            ),
+            dtype=np.int16,
+        )
+        structured_explore_delta = np.asarray(
+            getattr(
+                self.agent,
+                "_last_structured_exploration_delta",
+                np.zeros((self.train_envs.num_envs,), dtype=np.float32),
+            ),
+            dtype=np.float32,
+        )
+        structured_explore_assignment_prob = np.asarray(
+            getattr(
+                self.agent,
+                "_last_structured_exploration_assignment_prob",
+                np.ones((self.train_envs.num_envs,), dtype=np.float32),
+            ),
+            dtype=np.float32,
+        )
+        if store_structured_explore and structured_explore_mask.shape != (
+            self.train_envs.num_envs,
+        ):
+            raise ValueError(
+                "agent structured-exploration mask does not match train envs"
+            )
+        if store_structured_explore:
+            expected_shape = (self.train_envs.num_envs,)
+            metadata = {
+                "start": structured_explore_start,
+                "dimension": structured_explore_dimension,
+                "delta": structured_explore_delta,
+                "assignment_prob": structured_explore_assignment_prob,
+            }
+            mismatched = {
+                name: value.shape
+                for name, value in metadata.items()
+                if value.shape != expected_shape
+            }
+            if mismatched:
+                raise ValueError(
+                    "agent structured-exploration metadata does not match "
+                    f"train envs: {mismatched}"
+                )
         agents_reset = []
         for i in range(self.train_envs.num_envs):
             # Add transitions to episode rollout
+            transition_info = {k: infos[k][i] for k in infos.keys()}
+            if store_structured_explore:
+                transition_info["structured_explore"] = np.uint8(
+                    structured_explore_mask[i]
+                )
+                transition_info["structured_explore_start"] = np.uint8(
+                    structured_explore_start[i]
+                )
+                transition_info["structured_explore_dimension"] = np.int16(
+                    structured_explore_dimension[i]
+                )
+                transition_info["structured_explore_delta"] = np.float32(
+                    structured_explore_delta[i]
+                )
+                transition_info[
+                    "structured_explore_assignment_prob"
+                ] = np.float32(structured_explore_assignment_prob[i])
             self._episode_rollouts[i].append(
                 (
                     actions[i],
@@ -1073,7 +1336,7 @@ class Workspace:
                     rewards[i],
                     terminations[i],
                     truncations[i],
-                    {k: infos[k][i] for k in infos.keys()},
+                    transition_info,
                     {k: next_infos[k][i] for k in next_infos.keys()},
                 )
             )
@@ -1096,18 +1359,40 @@ class Workspace:
                     and self.use_demo_replay
                     and self.cfg.use_self_imitation
                 )
-                for act, obs, rew, term, trunc, info, next_info in ep:
+                store_mc_return = "mc_return" in self.extra_replay_elements.keys()
+                mc_returns = utils.discounted_episode_returns(
+                    [transition[2] for transition in ep],
+                    self.cfg.replay.gamma,
+                )
+                for transition_index, (
+                    act,
+                    obs,
+                    rew,
+                    term,
+                    trunc,
+                    info,
+                    next_info,
+                ) in enumerate(ep):
                     # Only keep the last frames regardless of frame stacks because
                     # replay buffer always store single-step transitions
                     obs = {k: v[-1] for k, v in obs.items()}
 
-                    # Strip out temporal dimension as action_sequence = 1
-                    act = act[0]
+                    # Online replay stores one transition per actually executed
+                    # environment action. Receding-horizon wrappers expose that
+                    # action explicitly because it may be a temporal ensemble of
+                    # several predicted chunks rather than ``act[0]``.
+                    replay_act = (
+                        _replay_action_from_step(act, next_info)
+                        if self.cfg.method.is_rl
+                        else np.asarray(act)[0]
+                    )
 
                     if relabeling_as_demo:
                         info["demo"] = 1
                     else:
                         info["demo"] = 0
+                    if store_mc_return:
+                        info["mc_return"] = mc_returns[transition_index]
 
                     # Filter out unwanted keys in info
                     extra_replay_elements = {
@@ -1117,11 +1402,11 @@ class Workspace:
                     }
 
                     self.replay_buffer.add(
-                        obs, act, rew, term, trunc, **extra_replay_elements
+                        obs, replay_act, rew, term, trunc, **extra_replay_elements
                     )
                     if relabeling_as_demo:
                         self.demo_replay_buffer.add(
-                            obs, act, rew, term, trunc, **extra_replay_elements
+                            obs, replay_act, rew, term, trunc, **extra_replay_elements
                         )
 
                 # Add final obs
@@ -1137,6 +1422,17 @@ class Workspace:
                 self._episode_rollouts[i].clear()
 
         self.agent.reset(self.main_loop_iterations, agents_reset)  # clear hidden dim
+
+    def _handle_on_policy_resets(self, terminations, truncations):
+        agents_reset = [
+            index
+            for index, (terminated, truncated) in enumerate(
+                zip(terminations, truncations, strict=True)
+            )
+            if terminated or truncated
+        ]
+        self._global_env_episode += len(agents_reset)
+        self.agent.reset(self.main_loop_iterations, agents_reset)
 
     def _signal_handler(self, sig, frame):
         del sig, frame
@@ -1154,7 +1450,9 @@ class Workspace:
             logging.info("Using lazy replay; skipping DemoEnv replay import.")
             return
         if self.replay_buffer.reused_existing and not self.use_demo_replay:
-            logging.info("Reusing saved replay episodes from disk. Skipping demo import.")
+            logging.info(
+                "Reusing saved replay episodes from disk. Skipping demo import."
+            )
             return
         if (num_demos := self.cfg.demos) != 0:
             # NOTE: Currently we do not protect demos from being evicted from replay
@@ -1283,9 +1581,7 @@ class Workspace:
                     else self.cfg.snapshot_every_n
                 )
             should_pretrain_save_snapshot = _Every(snapshot_every_n)
-            snapshot_save_start_step = int(
-                self.cfg.get("snapshot_save_start_step", 0)
-            )
+            snapshot_save_start_step = int(self.cfg.get("snapshot_save_start_step", 0))
             if len(self.replay_buffer) <= 0:
                 raise ValueError(
                     "there is no sample to pre-train with in the replay buffer "
@@ -1366,7 +1662,6 @@ class Workspace:
         if self.train_envs is None or self.cfg.num_train_frames <= 0:
             return
         train_until_frame = _Until(self.cfg.num_train_frames)
-        seed_until_size = _Until(self.cfg.replay_size_before_train)
         should_log = _Every(self.cfg.log_every)
         eval_every_n = self.cfg.eval_every_steps if self.eval_env is not None else 0
         should_eval = _Every(eval_every_n)
@@ -1374,6 +1669,7 @@ class Workspace:
         should_save_snapshot = _Every(snapshot_every_n)
         snapshot_save_start_step = int(self.cfg.get("snapshot_save_start_step", 0))
         observations, info = self.train_envs.reset()
+        on_policy = bool(getattr(self.agent, "on_policy", False))
         #  We use agent 0 to accumulate stats about how the training agents are doing
         agent_0_ep_len = agent_0_reward = 0
         agent_0_prev_ep_len = agent_0_prev_reward = None
@@ -1382,7 +1678,11 @@ class Workspace:
             self.agent.logging = False
             if should_log(self.main_loop_iterations):
                 self.agent.logging = True
-            if not seed_until_size(len(self.replay_buffer)):
+            if not on_policy and _online_updates_ready(
+                self.cfg,
+                main_loop_iterations=self.main_loop_iterations,
+                replay_size=len(self.replay_buffer),
+            ):
                 update_metrics = self._perform_updates()
                 metrics.update(update_metrics)
 
@@ -1400,15 +1700,36 @@ class Workspace:
                 agent_0_ep_len = agent_0_reward = 0
 
             metrics.update(env_metrics)
-            self._add_to_replay(
-                action,
-                observations,
-                rewards,
-                terminations,
-                truncations,
-                info,
-                next_info,
-            )
+            if on_policy:
+                self.agent.observe_transition(
+                    rewards=rewards,
+                    terminations=terminations,
+                    truncations=truncations,
+                    next_observations=next_observations,
+                    next_info=next_info,
+                )
+                if self.agent.rollout_ready:
+                    self.agent.train(True)
+                    metrics.update(
+                        self.agent.update(
+                            None,
+                            self.main_loop_iterations,
+                            None,
+                        )
+                    )
+                    self.agent.train(False)
+            if on_policy:
+                self._handle_on_policy_resets(terminations, truncations)
+            else:
+                self._add_to_replay(
+                    action,
+                    observations,
+                    rewards,
+                    terminations,
+                    truncations,
+                    info,
+                    next_info,
+                )
             observations = next_observations
             info = next_info
             if should_log(self.main_loop_iterations):

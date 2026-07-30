@@ -1,0 +1,16 @@
+# @package _global_
+
+# DBC-inspired ratio arm: all-pairs endpoint quantile regression is primary,
+# while the sorted empirical-quantile CFM path is a small 0.01 auxiliary.  It
+# is an FM critic adaptation to CQN-AS, not a claim of reproducing DBC's
+# diffusion bridge or actor.
+defaults:
+  - cqn_qr_flowiqn_equal_bc_target_two_tower_high_utd4_gate
+  - _self_
+
+method:
+  bcfm_lambda: 0.01
+
+hydra:
+  run:
+    dir: ./exp_local/cqn_flow_high_utd/bigym_${env.task_name}_qr_flowiqn_dbc_ratio_two_tower_utd4_${now:%Y%m%d%H%M%S}

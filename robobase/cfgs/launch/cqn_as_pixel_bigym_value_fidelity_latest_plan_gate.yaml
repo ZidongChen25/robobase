@@ -1,0 +1,16 @@
+# @package _global_
+
+# Value-fidelity ablation: keep CQN-AS replanning/history machinery, but make
+# the newest plan dominate the temporal ensemble. With K=16, gain=0.01 gives
+# the selected plan only about 1/15 of the executed-action weight; gain=5 makes
+# the critic-selected current bin and the executed current action nearly match.
+defaults:
+  - cqn_as_pixel_bigym_value_fidelity_gate
+  - _self_
+
+method:
+  temporal_ensemble_gain: 5.0
+
+hydra:
+  run:
+    dir: ./exp_local/cqn_value_fidelity_stage2/bigym_${env.task_name}_latest_plan_first_success_${now:%Y%m%d%H%M%S}

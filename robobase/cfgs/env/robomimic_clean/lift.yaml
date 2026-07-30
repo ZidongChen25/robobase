@@ -1,0 +1,14 @@
+# @package _global_
+
+env:
+  env_name: robomimic
+  task_name: Lift
+  dataset_path: third_party_datasets/robomimic/lift/ph/low_dim_v141.hdf5
+  filter_key: all
+  random_traj: false
+  use_live_env: false
+  abs_action: true
+  episode_length: 400
+  obs_keys: [object, robot0_eef_pos, robot0_eef_quat, robot0_gripper_qpos]
+  cameras: []
+  render_gpu_device_id: -1

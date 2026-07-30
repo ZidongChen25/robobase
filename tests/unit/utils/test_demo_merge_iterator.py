@@ -3,10 +3,7 @@ import numpy as np
 import robobase.utils as utils
 
 
-def test_demo_merged_iterator_supports_numpy_without_torch(monkeypatch):
-    monkeypatch.setattr(utils, "_TORCH_AVAILABLE", False)
-    monkeypatch.setattr(utils, "torch", None)
-
+def test_demo_merged_iterator_supports_numpy():
     replay_iter = iter(
         [
             {

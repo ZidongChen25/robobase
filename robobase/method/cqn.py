@@ -39,6 +39,7 @@ class CQNSpec:
     always_bootstrap: bool
     stddev_schedule: str
     bc_lambda: float
+    bc_lambda_schedule: str | None
     bc_margin: float
     use_target_network_for_rollout: bool
     num_update_steps: int
@@ -69,6 +70,11 @@ def cqn_spec_from_cfg(cfg: DictConfig) -> CQNSpec:
         always_bootstrap=bool(method.get("always_bootstrap", False)),
         stddev_schedule=str(method.get("stddev_schedule", "0.1")),
         bc_lambda=float(method.get("bc_lambda", 0.0)),
+        bc_lambda_schedule=(
+            None
+            if method.get("bc_lambda_schedule", None) is None
+            else str(method.get("bc_lambda_schedule"))
+        ),
         bc_margin=float(method.get("bc_margin", 0.0)),
         use_target_network_for_rollout=bool(
             method.get("use_target_network_for_rollout", False)
@@ -308,6 +314,7 @@ class CQN(JaxRLMethodBase, OffPolicyMethod):
         platform: str | None = None,
         seed: int = 0,
         update_block_every_steps: int = 1,
+        bc_lambda_schedule: str | None = None,
     ):
         super().__init__(
             lr=critic_lr,
@@ -346,6 +353,9 @@ class CQN(JaxRLMethodBase, OffPolicyMethod):
         self.always_bootstrap = bool(always_bootstrap)
         self.stddev_schedule = str(stddev_schedule)
         self.bc_lambda = float(bc_lambda)
+        self.bc_lambda_schedule = (
+            None if bc_lambda_schedule is None else str(bc_lambda_schedule)
+        )
         self.bc_margin = float(bc_margin)
         self.use_target_network_for_rollout = bool(use_target_network_for_rollout)
         self.num_update_steps = int(num_update_steps)
@@ -505,8 +515,13 @@ class CQN(JaxRLMethodBase, OffPolicyMethod):
     def _build_update_fn(self):
         optimizer = self.optimizer
         tau = self.critic_target_tau
+        use_canonical_mc = bool(getattr(self, "_canonical_mc_anchor", False))
+        use_bc_schedule = (
+            getattr(self, "bc_lambda_schedule", None) is not None
+        )
+        use_coarse_flow = bool(getattr(self, "coarse_flow", False))
 
-        def update_fn(
+        def update_impl(
             params,
             target_critic_params,
             opt_state,
@@ -518,6 +533,8 @@ class CQN(JaxRLMethodBase, OffPolicyMethod):
             bootstrap,
             loss_weights,
             demos,
+            mc_returns,
+            bc_weight,
             action_key,
         ):
             obs_inputs, next_obs_inputs, action_key = (
@@ -578,17 +595,22 @@ class CQN(JaxRLMethodBase, OffPolicyMethod):
                     per_sample * loss_weights
                 )
 
-                if self.bc_lambda > 0.0:
-                    chosen_cdf = jnp.cumsum(chosen_probabilities, axis=-1)
-                    all_cdf = jnp.cumsum(all_probabilities, axis=-1)
-                    fosd = jnp.maximum(
-                        chosen_cdf[..., None, :] - all_cdf,
-                        0.0,
-                    ).sum(axis=-1).mean(axis=(1, 2, 3))
+                if self.bc_lambda > 0.0 or use_bc_schedule:
                     demo_count = jnp.maximum(jnp.sum(demos), 1.0)
-                    critic_loss = critic_loss + self.bc_lambda * (
-                        jnp.sum(fosd * demos) / demo_count
-                    )
+                    # CQN-AS historically uses both FOSD and an expected-Q
+                    # margin.  Keep that behavior by default, while allowing
+                    # a margin-only baseline for objective-matched flow
+                    # experiments.
+                    if getattr(self, "demo_fosd", True):
+                        chosen_cdf = jnp.cumsum(chosen_probabilities, axis=-1)
+                        all_cdf = jnp.cumsum(all_probabilities, axis=-1)
+                        fosd = jnp.maximum(
+                            chosen_cdf[..., None, :] - all_cdf,
+                            0.0,
+                        ).sum(axis=-1).mean(axis=(1, 2, 3))
+                        critic_loss = critic_loss + bc_weight * (
+                            jnp.sum(fosd * demos) / demo_count
+                        )
                     if self.bc_margin > 0.0:
                         all_q = jnp.sum(
                             all_probabilities * self.support,
@@ -603,9 +625,119 @@ class CQN(JaxRLMethodBase, OffPolicyMethod):
                             - (chosen_q[..., None] - all_q),
                             0.0,
                         ).mean(axis=(1, 2, 3))
-                        critic_loss = critic_loss + self.bc_lambda * (
+                        critic_loss = critic_loss + bc_weight * (
                             jnp.sum(margin * demos) / demo_count
                         )
+                mc_zero = jnp.asarray(0.0, dtype=jnp.float32)
+                mc_return_loss = mc_zero
+                mc_return_mae = mc_zero
+                if use_canonical_mc:
+                    # Stage-147: completed-episode discounted return projected
+                    # onto the fixed C51 support supervises the executed
+                    # action's own Q head.  Return regression, not imitation.
+                    mc_target = project_categorical(
+                        jax.nn.softmax(chosen_logits, axis=-1),
+                        mc_returns,
+                        jnp.zeros_like(discounts),
+                        jnp.zeros_like(bootstrap),
+                        self.support,
+                    )
+                    mc_target = jax.lax.stop_gradient(mc_target)
+                    mc_per_sample = -jnp.sum(
+                        mc_target * chosen_log_probabilities,
+                        axis=-1,
+                    ).mean(axis=(1, 2))
+                    mc_return_loss = float(
+                        self.mc_return_weight
+                    ) * jnp.mean(mc_per_sample * loss_weights)
+                    critic_loss = critic_loss + mc_return_loss
+                    chosen_expected_q = jnp.sum(
+                        jax.nn.softmax(chosen_logits, axis=-1)
+                        * self.support,
+                        axis=-1,
+                    )
+                    mc_return_mae = jnp.mean(
+                        jnp.abs(
+                            chosen_expected_q
+                            - mc_returns[:, None, None]
+                        )
+                    )
+                coarse_flow_loss = jnp.asarray(0.0, dtype=jnp.float32)
+                if use_coarse_flow:
+                    # Stage-152 coarse-flow: bin-conditioned CFM on the
+                    # within-cell residual of the recorded action.  Features
+                    # are stop-gradient and the flow head has its own
+                    # parameters, so the critic's gradients are exactly the
+                    # legacy ones.
+                    flow_features = jax.lax.stop_gradient(features)
+                    cfm_key = jax.random.fold_in(action_key, 152)
+                    noise_key, time_key = jax.random.split(cfm_key)
+                    if getattr(self, "coarse_flow_pure", False):
+                        # Stage-155 no-selection control: full-range
+                        # coordinates, no conditioning.
+                        bin_context = None
+                        cell_low = jnp.broadcast_to(
+                            self.action_low, actions.shape
+                        )
+                        cell_width = jnp.broadcast_to(
+                            self.action_high - self.action_low,
+                            actions.shape,
+                        )
+                    else:
+                        cell_indices = encode_action(
+                            actions,
+                            self.action_low,
+                            self.action_high,
+                            self.levels,
+                            self.bins,
+                        )
+                        bin_context, cell_low, cell_width = (
+                            self._coarse_flow_cell(cell_indices)
+                        )
+                    u1 = jnp.clip(
+                        2.0 * (actions - cell_low) / cell_width - 1.0,
+                        -1.0,
+                        1.0,
+                    )
+                    x0 = jax.random.normal(
+                        noise_key, u1.shape, dtype=jnp.float32
+                    )
+                    t = jax.random.uniform(
+                        time_key, (u1.shape[0],), dtype=jnp.float32
+                    )
+                    x_t = (1.0 - t[:, None]) * x0 + t[:, None] * u1
+                    predicted_velocity = self.flow_policy_model.apply(
+                        current_params["flow_policy"],
+                        flow_features,
+                        x_t,
+                        t,
+                        bin_context=bin_context,
+                    )
+                    flow_per_sample = jnp.square(
+                        predicted_velocity - (u1 - x0)
+                    ).mean(axis=-1)
+                    flow_weights = demos
+                    if self.coarse_flow_selfdistill_weight is not None:
+                        # mc_returns are zeros unless the canonical MC anchor
+                        # supplies completed-episode returns, in which case
+                        # high-return online chunks join the flow's training
+                        # set with a reduced weight.
+                        qualified = (
+                            (
+                                mc_returns
+                                >= self.coarse_flow_selfdistill_threshold
+                            )
+                            & (demos < 0.5)
+                        ).astype(jnp.float32)
+                        flow_weights = (
+                            demos
+                            + self.coarse_flow_selfdistill_weight * qualified
+                        )
+                    coarse_flow_loss = self.flow_policy_lambda * (
+                        jnp.sum(flow_per_sample * flow_weights)
+                        / jnp.maximum(jnp.sum(flow_weights), 1.0)
+                    )
+                    critic_loss = critic_loss + coarse_flow_loss
                 entropy = -jnp.sum(
                     chosen_probabilities
                     * jnp.log(jnp.maximum(chosen_probabilities, 1e-9)),
@@ -616,7 +748,14 @@ class CQN(JaxRLMethodBase, OffPolicyMethod):
                     * jnp.log(jnp.maximum(target_distribution, 1e-9)),
                     axis=-1,
                 ).mean()
-                return critic_loss, (per_sample, entropy, target_entropy)
+                return critic_loss, (
+                    per_sample,
+                    entropy,
+                    target_entropy,
+                    mc_return_loss,
+                    mc_return_mae,
+                    coarse_flow_loss,
+                )
 
             (critic_loss, aux), grads = jax.value_and_grad(
                 loss_fn,
@@ -629,21 +768,71 @@ class CQN(JaxRLMethodBase, OffPolicyMethod):
                 target_critic_params,
                 params["critic"],
             )
-            per_sample, entropy, projected_entropy = aux
+            (
+                per_sample,
+                entropy,
+                projected_entropy,
+                mc_return_loss,
+                mc_return_mae,
+                coarse_flow_loss,
+            ) = aux
             priority = jnp.sqrt(per_sample + 1e-10)
             priority = priority / jnp.maximum(jnp.max(priority), 1e-10)
+            metrics = {
+                "critic_loss": critic_loss,
+                "entropy": entropy,
+                "target_entropy": projected_entropy,
+                "loss_coeff": jnp.mean(loss_weights),
+            }
+            if use_canonical_mc:
+                metrics["mc_return_loss"] = mc_return_loss
+                metrics["mc_return_mae"] = mc_return_mae
+            if use_coarse_flow:
+                metrics["coarse_flow_loss"] = coarse_flow_loss
             return (
                 params,
                 target_critic_params,
                 opt_state,
                 priority,
-                {
-                    "critic_loss": critic_loss,
-                    "entropy": entropy,
-                    "target_entropy": projected_entropy,
-                    "loss_coeff": jnp.mean(loss_weights),
-                },
+                metrics,
             )
+
+        base_bc_weight = float(self.bc_lambda)
+
+        def call_impl(core_args, mc_returns, bc_weight, action_key):
+            return update_impl(*core_args, mc_returns, bc_weight, action_key)
+
+        if use_canonical_mc and use_bc_schedule:
+
+            def update_fn(*args):
+                (*core, mc_returns, bc_weight, action_key) = args
+                return call_impl(core, mc_returns, bc_weight, action_key)
+
+        elif use_canonical_mc:
+
+            def update_fn(*args):
+                (*core, mc_returns, action_key) = args
+                return call_impl(
+                    core, mc_returns, base_bc_weight, action_key
+                )
+
+        elif use_bc_schedule:
+
+            def update_fn(*args):
+                (*core, bc_weight, action_key) = args
+                rewards = core[6]
+                return call_impl(
+                    core, jnp.zeros_like(rewards), bc_weight, action_key
+                )
+
+        else:
+
+            def update_fn(*args):
+                (*core, action_key) = args
+                rewards = core[6]
+                return call_impl(
+                    core, jnp.zeros_like(rewards), base_bc_weight, action_key
+                )
 
         return update_fn
 
@@ -719,6 +908,21 @@ class CQN(JaxRLMethodBase, OffPolicyMethod):
                 batch.get("demo", np.zeros_like(batch["reward"])),
                 self.jnp.float32,
             ).reshape(-1)
+            canonical_mc_args = ()
+            if getattr(self, "_canonical_mc_anchor", False):
+                canonical_mc_args = (
+                    self._as_jax_array(
+                        batch.get(
+                            "mc_return",
+                            np.zeros_like(batch["reward"]),
+                        ),
+                        self.jnp.float32,
+                    ).reshape(-1),
+                )
+            if getattr(self, "bc_lambda_schedule", None) is not None:
+                canonical_mc_args = canonical_mc_args + (
+                    float(utils.schedule(self.bc_lambda_schedule, step)),
+                )
             start_time = time.perf_counter()
             (
                 self.params,
@@ -738,6 +942,7 @@ class CQN(JaxRLMethodBase, OffPolicyMethod):
                 bootstrap,
                 loss_weights,
                 demos,
+                *canonical_mc_args,
                 self._next_action_key(),
             )
             uses_priorities = self._uses_replay_priorities(replay_buffer)

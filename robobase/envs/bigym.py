@@ -1,7 +1,11 @@
 from bigym.bigym_env import BiGymEnv, CONTROL_FREQUENCY_MAX
 from bigym.action_modes import JointPositionActionMode
 from robobase.utils import DemoEnv, add_demo_to_replay_buffer
-from robobase.envs.utils.bigym_utils import TASK_MAP
+from robobase.envs.utils.bigym_utils import (
+    TASK_MAP,
+    build_actuated_qpos_state,
+    build_actuated_qpos_stats,
+)
 import gymnasium as gym
 from gymnasium import spaces
 from gymnasium.wrappers import TimeLimit
@@ -14,13 +18,15 @@ from robobase.envs.wrappers import (
     AppendDemoInfo,
     FrameStack,
     ConcatDim,
+    AppendKeysToLowDim,
     RecedingHorizonControl,
+    RawProprioDropout,
 )
 from robobase.envs.camera_conditioning import (
     camera_conditioning_enabled,
     intrinsic_from_fovy,
 )
-from robobase.language import clip_text_feature_array, clip_tokenize_text, tokenize_text
+from robobase.language import load_precomputed_language_features, tokenize_text
 from omegaconf import DictConfig
 from bigym.utils.observation_config import ObservationConfig, CameraConfig
 from bigym.action_modes import PelvisDof
@@ -78,6 +84,53 @@ def _demo_observation_array(value):
     return array.astype(np.float32, copy=False)
 
 
+class AddBiGymExecutedActionFeedback(gym.ObservationWrapper):
+    """Expose measured H1 actuator positions in policy action coordinates."""
+
+    KEY = "executed_action_feedback"
+
+    def __init__(self, env: gym.Env, *, obs_stats, norm_obs, norm_type):
+        gym.ObservationWrapper.__init__(self, env)
+        self._feedback_stats = build_actuated_qpos_stats(obs_stats)
+        self._norm_obs = bool(norm_obs)
+        self._norm_type = str(norm_type).lower()
+        obs_spaces = dict(self.observation_space.spaces)
+        obs_spaces[self.KEY] = spaces.Box(
+            low=-np.inf,
+            high=np.inf,
+            shape=self.action_space.shape,
+            dtype=np.float32,
+        )
+        self.observation_space = spaces.Dict(obs_spaces)
+
+    def observation(self, observation):
+        obs = dict(observation)
+        feedback = build_actuated_qpos_state(
+            obs["proprioception"],
+            obs["proprioception_floating_base"],
+            obs["proprioception_grippers"],
+        )
+        if feedback.shape != self.action_space.shape:
+            raise ValueError(
+                "BiGym executed-action feedback must match action shape; got "
+                f"{feedback.shape} and {self.action_space.shape}."
+            )
+        if self._norm_obs and self._norm_type in {"min_max", "minmax"}:
+            minimum = self._feedback_stats["min"]
+            value_range = self._feedback_stats["max"] - minimum
+            nonconstant = value_range != 0
+            value_range = np.where(nonconstant, value_range, 1.0)
+            feedback = np.where(
+                nonconstant, (feedback - minimum) / value_range * 2.0 - 1.0, 0.0
+            )
+        elif self._norm_obs:
+            feedback = (feedback - self._feedback_stats["mean"]) / (
+                self._feedback_stats["std"] + 1e-10
+            )
+        obs[self.KEY] = feedback.astype(np.float32, copy=False)
+        return obs
+
+
 class AddBiGymLanguageTokens(gym.ObservationWrapper):
     def __init__(
         self,
@@ -86,6 +139,8 @@ class AddBiGymLanguageTokens(gym.ObservationWrapper):
         *,
         lang_feature_source: str = "tokens",
         lang_feature_device: str = "cpu",
+        lang_feature_path=None,
+        lang_feature_dim: int = 512,
         description: str | None = None,
     ):
         gym.ObservationWrapper.__init__(self, env)
@@ -94,20 +149,22 @@ class AddBiGymLanguageTokens(gym.ObservationWrapper):
             if description is None
             else str(description)
         )
+        del lang_feature_device
         source = str(lang_feature_source).lower()
-        if source in {"clip", "clip_text"}:
-            self._lang_tokens = clip_tokenize_text(description)
-            self._lang_features = clip_text_feature_array(
-                description,
-                device=str(lang_feature_device),
-            )
-        elif source in {"tokens", "jax", "hash"}:
+        if source in {"tokens", "jax", "hash"}:
             self._lang_tokens = tokenize_text(description).astype(np.int32, copy=False)
             self._lang_features = None
+        elif source == "precomputed":
+            self._lang_tokens = tokenize_text(description).astype(np.int32, copy=False)
+            self._lang_features = load_precomputed_language_features(
+                lang_feature_path,
+                feature_dim=lang_feature_dim,
+            )
         else:
             raise ValueError(
-                "lang_feature_source must be one of 'clip', 'tokens', 'jax', or "
-                f"'hash'; got {lang_feature_source!r}."
+                "The JAX-only runtime supports lang_feature_source='tokens' "
+                "(aliases: 'jax', 'hash') or 'precomputed'; "
+                f"got {lang_feature_source!r}."
             )
         obs_spaces = dict(self.observation_space.spaces)
         obs_spaces["lang_tokens"] = spaces.Box(
@@ -188,9 +245,38 @@ class AddBiGymCameraConditioning(gym.ObservationWrapper):
     def observation(self, observation):
         obs = dict(observation)
         for camera in self._cameras:
-            intrinsic, c2w = self._camera_params(camera)
-            obs[f"camera_intrinsic_{camera}"] = intrinsic
-            obs[f"camera_c2w_{camera}"] = c2w
+            intrinsic_key = f"camera_intrinsic_{camera}"
+            c2w_key = f"camera_c2w_{camera}"
+            has_intrinsic = intrinsic_key in obs
+            has_c2w = c2w_key in obs
+            if has_intrinsic != has_c2w:
+                raise ValueError(
+                    "BiGym camera conditioning requires paired intrinsic/c2w "
+                    f"values for camera {camera!r}."
+                )
+            if has_intrinsic:
+                intrinsic = np.asarray(obs[intrinsic_key], dtype=np.float32)
+                c2w = np.asarray(obs[c2w_key], dtype=np.float32)
+                if intrinsic.shape != (3, 3) or c2w.shape != (4, 4):
+                    raise ValueError(
+                        f"Invalid cached camera parameters for {camera!r}: "
+                        f"intrinsic={intrinsic.shape}, c2w={c2w.shape}."
+                    )
+                if not np.all(np.isfinite(intrinsic)) or not np.all(np.isfinite(c2w)):
+                    raise ValueError(
+                        f"Cached camera parameters for {camera!r} must be finite."
+                    )
+            else:
+                if not hasattr(self.env.unwrapped, "mojo"):
+                    raise ValueError(
+                        "BiGym demonstration camera conditioning needs cached "
+                        "per-frame camera parameters. Rebuild the pixel demos with "
+                        "scripts/cache_bigym_pixel_demos.py --include-camera-params "
+                        "--force-recache."
+                    )
+                intrinsic, c2w = self._camera_params(camera)
+            obs[intrinsic_key] = intrinsic
+            obs[c2w_key] = c2w
         return obs
 
 
@@ -251,9 +337,43 @@ class BiGymEnvFactory(EnvFactory):
                 action_stats=self._action_stats,
                 min_max_margin=cfg.min_max_margin,
             )
+        source_cfg = cfg.method.get("flow_source", {})
+        if str(source_cfg.get("history_source", "commanded_action")).lower() == (
+            "executed_action_feedback"
+        ):
+            env = AddBiGymExecutedActionFeedback(
+                env,
+                obs_stats=self._obs_stats,
+                norm_obs=cfg.norm_obs,
+                norm_type=cfg.obs_norm_type,
+            )
         obs_stats = None
         if cfg.norm_obs:
             obs_stats = self._obs_stats
+
+        proprio_dropout_stage = str(
+            cfg.method.get("proprio_dropout_stage", "model")
+        ).lower()
+        if proprio_dropout_stage not in {"model", "raw"}:
+            raise ValueError("method.proprio_dropout_stage must be 'model' or 'raw'.")
+        if proprio_dropout_stage == "raw":
+            probability = float(cfg.method.get("proprio_dropout_prob", 0.0))
+            if probability not in {0.0, 1.0}:
+                raise ValueError(
+                    "BiGym offline raw proprio dropout supports probabilities 0 or 1; "
+                    "fractional dropout must be implemented in the replay sampler."
+                )
+            if probability > 0.0:
+                env = RawProprioDropout(
+                    env,
+                    keys=tuple(
+                        str(key)
+                        for key in cfg.method.get(
+                            "proprio_dropout_keys", ["proprioception"]
+                        )
+                    ),
+                    probability=probability,
+                )
 
         # We normalize the low dimensional observations in the ConcatDim wrapper.
         # This is to be consistent with the original ACT implementation.
@@ -268,11 +388,22 @@ class BiGymEnvFactory(EnvFactory):
             keys_to_ignore=[
                 "proprioception_floating_base",
                 "proprioception_floating_base_actions",
+                AddBiGymExecutedActionFeedback.KEY,
             ],
         )
-        if (
-            bool(cfg.get("pixels", False))
-            and camera_conditioning_enabled(cfg.env.get("camera_conditioning", "none"))
+        if bool(cfg.env.get("append_floating_base_to_low_dim", False)):
+            # Stage-160: give the floating-base state a fixed position (the
+            # last dims of low_dim_state) so training-time low-dim masking
+            # can zero everything except it.
+            env = AppendKeysToLowDim(
+                env,
+                keys=["proprioception_floating_base"],
+                norm_obs=cfg.norm_obs,
+                obs_stats=obs_stats,
+                obs_norm_type=cfg.obs_norm_type,
+            )
+        if bool(cfg.get("pixels", False)) and camera_conditioning_enabled(
+            cfg.env.get("camera_conditioning", "none")
         ):
             env = AddBiGymCameraConditioning(
                 env,
@@ -283,12 +414,7 @@ class BiGymEnvFactory(EnvFactory):
             lang_feature_source = cfg.method.get("lang_feature_source", None)
             lang_description = cfg.method.get("lang_description", None)
             if lang_feature_source is None:
-                # Legacy BiGym runs supplied CLIP tokens and used this exact
-                # fallback for tasks missing from BIGYM_TASK_DESCRIPTIONS.
-                # Their snapshots condition on that vector, so silently
-                # switching to hashed tokens or humanized text invalidates the
-                # checkpoint even though all parameter shapes still load.
-                lang_feature_source = "clip"
+                lang_feature_source = "tokens"
                 if lang_description is None:
                     lang_description = BIGYM_TASK_DESCRIPTIONS.get(
                         str(cfg.env.task_name),
@@ -299,6 +425,8 @@ class BiGymEnvFactory(EnvFactory):
                 cfg.env.task_name,
                 lang_feature_source=lang_feature_source,
                 lang_feature_device=cfg.method.get("lang_feature_device", "cpu"),
+                lang_feature_path=cfg.method.get("lang_feature_path", None),
+                lang_feature_dim=int(cfg.method.get("lang_feature_dim", 512)),
                 description=lang_description,
             )
         episode_limit_steps = _episode_limit_steps(cfg)
@@ -307,7 +435,6 @@ class BiGymEnvFactory(EnvFactory):
         if not demo_env:
             env = FrameStack(env, cfg.frame_stack)
         env = TimeLimit(env, episode_limit_steps)
-
 
         if not demo_env:
             if int(cfg.execution_length) == int(cfg.action_sequence):
@@ -421,10 +548,17 @@ class BiGymEnvFactory(EnvFactory):
             amount=num_demos,
             frequency=CONTROL_FREQUENCY_MAX // cfg.env.demo_down_sample_rate,
         )
+        camera_wrapper = None
+        if bool(cfg.get("pixels", False)) and camera_conditioning_enabled(
+            cfg.env.get("camera_conditioning", "none")
+        ):
+            camera_wrapper = AddBiGymCameraConditioning(
+                env,
+                cameras=list(cfg.env.cameras),
+                image_size=tuple(cfg.visual_observation_shape),
+            )
 
-        demo_alignment = str(
-            cfg.env.get("demo_alignment", "reset_prepend")
-        ).lower()
+        demo_alignment = str(cfg.env.get("demo_alignment", "reset_prepend")).lower()
         for demo in demos:
             timesteps = list(demo.timesteps)
             if demo_alignment in {
@@ -441,8 +575,7 @@ class BiGymEnvFactory(EnvFactory):
                 ]
                 for i, ts in enumerate(timesteps):
                     ts.observation = {
-                        k: _demo_observation_array(v)
-                        for k, v in ts.observation.items()
+                        k: _demo_observation_array(v) for k, v in ts.observation.items()
                     }
                     ts.info = dict(ts.info)
                     if i == 0:
@@ -454,6 +587,8 @@ class BiGymEnvFactory(EnvFactory):
                 # DemoStore timesteps are post-action observations; prepend reset obs
                 # so the first replay transition is reset_obs -> first demo action.
                 reset_obs, _ = env.reset(seed=demo.seed)
+                if camera_wrapper is not None:
+                    reset_obs = camera_wrapper.observation(reset_obs)
                 reset_obs = {
                     k: _demo_observation_array(v) for k, v in reset_obs.items()
                 }
@@ -469,8 +604,7 @@ class BiGymEnvFactory(EnvFactory):
                 demo._steps = [reset_step] + timesteps
                 for ts in demo.timesteps:
                     ts.observation = {
-                        k: _demo_observation_array(v)
-                        for k, v in ts.observation.items()
+                        k: _demo_observation_array(v) for k, v in ts.observation.items()
                     }
 
         env.close()
@@ -478,6 +612,23 @@ class BiGymEnvFactory(EnvFactory):
         return demos
 
     def collect_or_fetch_demos(self, cfg: DictConfig, num_demos: int):
+        if bool(cfg.get("pixels", False)) and camera_conditioning_enabled(
+            cfg.env.get("camera_conditioning", "none")
+        ):
+            lazy_setting = cfg.get("lazy_replay", {}).get("use", "auto")
+            lazy_disabled = (
+                not lazy_setting
+                if isinstance(lazy_setting, bool)
+                else str(lazy_setting).strip().lower() in {"false", "0", "off", "no"}
+            )
+            if lazy_disabled:
+                raise ValueError(
+                    "BiGym camera-conditioned demonstrations require lazy replay "
+                    "with cached per-frame camera parameters. Set "
+                    "lazy_replay.use=auto or true and rebuild pixel demos with "
+                    "scripts/cache_bigym_pixel_demos.py --include-camera-params "
+                    "--force-recache."
+                )
         demos = self._get_demo_fn(cfg, num_demos)
         self._all_raw_demos = demos
         success_flags = [self._demo_success(demo) for demo in demos]
@@ -489,14 +640,18 @@ class BiGymEnvFactory(EnvFactory):
         )
 
         expected_successful = cfg.env.get("expected_successful_demos", None)
-        if expected_successful is not None and successful_count != int(expected_successful):
+        if expected_successful is not None and successful_count != int(
+            expected_successful
+        ):
             raise ValueError(
                 "BiGym successful demonstration count mismatch: "
                 f"expected {expected_successful}, got {successful_count}."
             )
 
         if bool(cfg.env.get("filter_successful_demos", True)):
-            demos = [demo for demo, successful in zip(demos, success_flags) if successful]
+            demos = [
+                demo for demo, successful in zip(demos, success_flags) if successful
+            ]
             if not demos:
                 raise ValueError("No successful BiGym demonstrations were found.")
             logging.info("Keeping %d successful BiGym demonstrations.", len(demos))
@@ -528,8 +683,8 @@ class BiGymEnvFactory(EnvFactory):
             "There's no _demo attribute inside the factory, "
             "Check `collect_or_fetch_demos` is called before calling this method."
         )
-        
-        if is_demo_buffer and bool(cfg.env.get("filter_successful_demos", True)):
+
+        if is_demo_buffer:
             # Keep this guard so older cached factories that were not filtered during
             # collection still only load successful demonstrations for IL/demo replay.
             demos = []
@@ -559,18 +714,21 @@ class BiGymEnvFactory(EnvFactory):
         self, cfg: DictConfig, demo_list: List[List[DemoStep]]
     ) -> List[DemoStep]:
         ret_demos = []
+        truncate_at_success = bool(
+            cfg.env.get("truncate_demo_at_success", False)
+        )
 
         for demo in demo_list:
             cur_demo = []
             last_timestep = False
-            
+
             # Detect whether this demo is successful or not
             rewards = []
             for step in demo:
                 reward = step.reward
                 rewards.append(reward)
             successful_demo = sum(rewards) > 0.25
-            
+
             for i, step in enumerate(demo):
                 step.info.update({"demo": int(successful_demo)})
                 if i == 0:
@@ -578,7 +736,15 @@ class BiGymEnvFactory(EnvFactory):
                 else:
                     term, trunc = step.termination, step.truncation
                     reward = step.reward
-                    if i == len(demo) - 1:
+                    if truncate_at_success and reward > 0.25:
+                        # Match the live BiGym MDP, whose terminate property is
+                        # true immediately on success. This also prevents a
+                        # recorded post-success tail from contributing the same
+                        # sparse reward dozens of times.
+                        term = True
+                        trunc = False
+                        last_timestep = True
+                    elif i == len(demo) - 1:
                         if not (term or trunc):
                             term = False
                             trunc = True
@@ -635,9 +801,7 @@ class BiGymEnvFactory(EnvFactory):
                 obs.append(step.observation)
 
         keys = [
-            key
-            for key in obs[0].keys()
-            if np.asarray(obs[0][key]).dtype != np.uint8
+            key for key in obs[0].keys() if np.asarray(obs[0][key]).dtype != np.uint8
         ]
         if not keys:
             raise ValueError("BiGym demos do not contain low-dimensional observations.")

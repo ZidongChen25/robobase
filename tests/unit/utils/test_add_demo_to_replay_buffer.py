@@ -2,7 +2,7 @@ import numpy as np
 from gymnasium import spaces
 import pytest
 
-from robobase.utils import add_demo_to_replay_buffer
+from robobase.utils import add_demo_to_replay_buffer, discounted_episode_returns
 from robobase.envs.env import DemoEnv
 from tests.unit.wrappers.utils import DummyEnv
 from robobase.replay_buffer.uniform_replay_buffer import UniformReplayBuffer
@@ -43,6 +43,87 @@ def wrap_env(env, frame_stack, action_sequence, execution_step, demo_env=False):
             )
 
     return env
+
+
+def test_discounted_episode_returns_runs_backward_over_completed_episode():
+    np.testing.assert_allclose(
+        discounted_episode_returns([0.0, 2.0, 4.0], gamma=0.5),
+        [2.0, 4.0, 4.0],
+    )
+
+
+def test_add_demo_to_replay_buffer_stores_mc_return():
+    env = DummyEnv(episode_len=3)
+    demos = collect_demo_from_dummy_env(env, num_demo=1)
+    demo_env = DemoEnv(demos, env.action_space, env.observation_space)
+    demo_env = wrap_env(
+        demo_env,
+        frame_stack=1,
+        action_sequence=1,
+        execution_step=1,
+        demo_env=True,
+    )
+    replay_env = wrap_env(
+        env,
+        frame_stack=1,
+        action_sequence=1,
+        execution_step=1,
+        demo_env=False,
+    )
+    info_elements = spaces.Dict(
+        {
+            "demo": spaces.Box(0, 1, shape=(), dtype=np.uint8),
+            "mc_return": spaces.Box(
+                -np.inf,
+                np.inf,
+                shape=(),
+                dtype=np.float32,
+            ),
+            "structured_explore": spaces.Box(
+                0,
+                1,
+                shape=(),
+                dtype=np.uint8,
+            ),
+            "structured_explore_start": spaces.Box(
+                0, 1, shape=(), dtype=np.uint8
+            ),
+            "structured_explore_dimension": spaces.Box(
+                -1, 1, shape=(), dtype=np.int16
+            ),
+            "structured_explore_delta": spaces.Box(
+                -np.inf, np.inf, shape=(), dtype=np.float32
+            ),
+            "structured_explore_assignment_prob": spaces.Box(
+                0.0, 1.0, shape=(), dtype=np.float32
+            ),
+        }
+    )
+    replay_buffer = UniformReplayBuffer(
+        action_shape=replay_env.action_space.shape,
+        action_dtype=replay_env.action_space.dtype,
+        nstep=1,
+        gamma=0.5,
+        reward_shape=(),
+        reward_dtype=np.float32,
+        observation_elements=replay_env.observation_space,
+        extra_replay_elements=info_elements,
+    )
+
+    add_demo_to_replay_buffer(demo_env, replay_buffer)
+    replay_buffer._try_fetch()
+    episode, _ = replay_buffer._sample_episode()
+
+    np.testing.assert_allclose(episode["mc_return"][:-1], [25.0, 50.0, 100.0])
+    np.testing.assert_array_equal(episode["structured_explore"][:-1], 0)
+    np.testing.assert_array_equal(episode["structured_explore_start"][:-1], 0)
+    np.testing.assert_array_equal(
+        episode["structured_explore_dimension"][:-1], -1
+    )
+    np.testing.assert_array_equal(episode["structured_explore_delta"][:-1], 0)
+    np.testing.assert_array_equal(
+        episode["structured_explore_assignment_prob"][:-1], 1
+    )
 
 
 @pytest.mark.parametrize(

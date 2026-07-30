@@ -1,0 +1,19 @@
+# @package _global_
+
+# Matched control for replay-only action-centered causal advantage learning.
+# Relative to the existing direct-Q arm this changes data identification to an
+# independently randomized one-step local intervention with p=0.2. The causal
+# moment itself remains disabled, so the treatment differs by one loss weight.
+defaults:
+  - cqn_direct_q_two_tower_coherent_mc_high_utd4_gate
+  - _self_
+
+method:
+  structured_exploration_prob: 0.2
+  structured_exploration_horizon: 1
+  causal_rct_weight: 0.0
+  causal_rct_level: 1
+
+hydra:
+  run:
+    dir: ./exp_local/cqn_flow_high_utd/bigym_${env.task_name}_direct_q_h1_rct_control_utd4_${now:%Y%m%d%H%M%S}

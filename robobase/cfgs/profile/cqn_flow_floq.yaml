@@ -1,0 +1,29 @@
+# @package _global_
+# CQN-adapted, paper-faithful floq core.  The 51 bins encode the scalar
+# interpolant with HL-Gauss; the velocity and endpoint remain scalar.
+method:
+  critic_target_tau: 0.005
+  value_mode: scalar
+  atom_ce_lambda: 0.0
+  demo_fosd: false
+  bcfm_lambda: 1.0
+  dcfm_lambda: 0.0
+  num_flow_steps: 8
+  num_flow_samples: 8
+  num_target_flow_samples: 8
+  num_action_flow_samples: 8
+  flow_source_type: uniform
+  # Null derives 0.1 * [v_min, v_max], so support overrides keep 10% coverage.
+  flow_source_min: null
+  flow_source_max: null
+  antithetic_flow_sources: true
+  fixed_action_flow_sources: true
+  scalar_value_embedding: hl_gauss
+  scalar_embed_bins: 51
+  scalar_embed_sigma: 16.0
+  time_embedding_type: fourier
+  time_embed_dim: 64
+  time_scale: 1.0
+  # Direct bin enumeration does not need floq's actor-gradient distillation.
+  endpoint_q_lambda: 0.0
+  source_consistency_lambda: 0.0

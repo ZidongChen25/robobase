@@ -176,7 +176,9 @@ def _filter_obs_dict_for_cfg(
         return {
             key: value
             for key, value in obs_dict.items()
-            if not (value.dtype == np.uint8 and value.ndim == 3 and key.endswith("_rgb"))
+            if not (
+                value.dtype == np.uint8 and value.ndim == 3 and key.endswith("_rgb")
+            )
         }
 
     dataset_rgb_keys = _rgb_keys_from_obs_dict(obs_dict)
@@ -231,8 +233,7 @@ def _load_obs_sequence_for_cfg(
             for key in obs_keys
         }
         return [
-            {key: arrays[key][index] for key in obs_keys}
-            for index in range(length)
+            {key: arrays[key][index] for key in obs_keys} for index in range(length)
         ]
     return [
         _filter_obs_dict_for_cfg(_convert_obs_group(obs_group, index), cfg)
@@ -275,6 +276,10 @@ def _cfg_get(cfg: DictConfig, key: str, default):
     return cfg.get(key, default)
 
 
+def _shift_reward(reward: float, *, shift: float) -> float:
+    return float(reward) + shift
+
+
 def _normalize_vectors(vectors: np.ndarray, eps: float = 1e-12) -> np.ndarray:
     norms = np.linalg.norm(vectors, axis=-1, keepdims=True)
     return vectors / np.maximum(norms, eps)
@@ -293,8 +298,10 @@ def _rotation_6d_to_axis_angle(rotation_6d: np.ndarray) -> np.ndarray:
     b2 = _normalize_vectors(a2 - np.sum(b1 * a2, axis=-1, keepdims=True) * b1)
     b3 = np.cross(b1, b2, axis=-1)
     matrices = np.stack([b1, b2, b3], axis=-2)
-    return Rotation.from_matrix(matrices.reshape(-1, 3, 3)).as_rotvec().reshape(
-        *rotation_6d.shape[:-1], 3
+    return (
+        Rotation.from_matrix(matrices.reshape(-1, 3, 3))
+        .as_rotvec()
+        .reshape(*rotation_6d.shape[:-1], 3)
     )
 
 
@@ -316,7 +323,9 @@ def _raw_action_to_abs_action(raw_actions: np.ndarray) -> np.ndarray:
 def _abs_action_to_raw_action(abs_actions: np.ndarray) -> np.ndarray:
     raw_shape = abs_actions.shape
     is_dual_arm = raw_shape[-1] == 20
-    actions = abs_actions.reshape(*raw_shape[:-1], 2, 10) if is_dual_arm else abs_actions
+    actions = (
+        abs_actions.reshape(*raw_shape[:-1], 2, 10) if is_dual_arm else abs_actions
+    )
     pos = actions[..., :3]
     rot = _rotation_6d_to_axis_angle(actions[..., 3:-1])
     gripper = actions[..., -1:]
@@ -403,6 +412,13 @@ class RobomimicRobosuiteEnv(gym.Env):
         abs_action: bool = False,
         obs_keys: list[str] | None = None,
     ):
+        if not has_offscreen_renderer and os.environ.get("CUDA_VISIBLE_DEVICES"):
+            # Low-dim mode never renders, but robosuite still imports an EGL
+            # context class at module import. Under a CUDA_VISIBLE_DEVICES pin
+            # NVIDIA filters EGL device enumeration, so an absolute
+            # MUJOCO_EGL_DEVICE_ID (e.g. from robobase.gpu.apply_requested_gpu)
+            # is out of range; drop it and let EGL pick a visible device.
+            os.environ.pop("MUJOCO_EGL_DEVICE_ID", None)
         try:
             import robosuite
         except ImportError as exc:
@@ -457,6 +473,10 @@ class RobomimicRobosuiteEnv(gym.Env):
 
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
+        if seed is not None:
+            # robosuite draws initial placements from the global numpy RNG;
+            # seed it like the official robomimic low-dim wrapper does.
+            np.random.seed(seed)
         self._env.reset()
         return self._get_observation(), {"demo": 0}
 
@@ -479,7 +499,9 @@ class RobomimicRobosuiteEnv(gym.Env):
 
         observation = {}
         if "object-state" in raw_obs:
-            observation["object"] = np.asarray(raw_obs["object-state"], dtype=np.float32)
+            observation["object"] = np.asarray(
+                raw_obs["object-state"], dtype=np.float32
+            )
 
         for robot in self._env.robots:
             prefix = robot.robot_model.naming_prefix
@@ -557,6 +579,7 @@ class RobomimicEnvFactory(EnvFactory):
 
         self._dataset_path = dataset_path
         self._env_meta = env_meta
+        self._max_demo_episode_length = int(max_episode_length)
         self._raw_observation_space = spaces.Dict(
             {key: _space_from_array(value) for key, value in reset_observation.items()}
         )
@@ -722,7 +745,9 @@ class RobomimicEnvFactory(EnvFactory):
                         obs_arrays.setdefault(key, []).append(value[None])
 
         if len(obs_arrays) == 0:
-            raise ValueError("robomimic demos do not contain low-dimensional observations.")
+            raise ValueError(
+                "robomimic demos do not contain low-dimensional observations."
+            )
 
         stacked = {
             key: np.concatenate(values, axis=0) for key, values in obs_arrays.items()
@@ -739,16 +764,17 @@ class RobomimicEnvFactory(EnvFactory):
 
     def _make_rescale_from_tanh_cls(self, cfg: DictConfig):
         use_standardization = _cfg_get(cfg, "use_standardization", False)
-        use_min_max_normalization = _cfg_get(
-            cfg, "use_min_max_normalization", False
-        )
+        use_min_max_normalization = _cfg_get(cfg, "use_min_max_normalization", False)
         demos = _cfg_get(cfg, "demos", 0)
         min_max_margin = _cfg_get(cfg, "min_max_margin", 0.0)
 
         assert not (
             use_standardization and use_min_max_normalization
         ), "You can't use both standardization and min/max normalization."
-        if bool(_cfg_get(cfg.env, "abs_action", False)) and not use_min_max_normalization:
+        if (
+            bool(_cfg_get(cfg.env, "abs_action", False))
+            and not use_min_max_normalization
+        ):
             raise ValueError(
                 "env.abs_action=true requires use_min_max_normalization=true so "
                 "the 10D absolute action representation can be mapped to [-1, 1]."
@@ -771,9 +797,7 @@ class RobomimicEnvFactory(EnvFactory):
 
     def _rescale_demo_action_helper(self, info, cfg: DictConfig):
         use_standardization = _cfg_get(cfg, "use_standardization", False)
-        use_min_max_normalization = _cfg_get(
-            cfg, "use_min_max_normalization", False
-        )
+        use_min_max_normalization = _cfg_get(cfg, "use_min_max_normalization", False)
         min_max_margin = _cfg_get(cfg, "min_max_margin", 0.0)
 
         if use_standardization:
@@ -800,6 +824,14 @@ class RobomimicEnvFactory(EnvFactory):
     ):
         if bool(_cfg_get(cfg.env, "abs_action", False)):
             env = RobomimicAbsoluteAction(env)
+
+        reward_shift = float(_cfg_get(cfg.env, "reward_shift", 0.0))
+        if reward_shift != 0.0:
+            # The official ACFQL/Q-chunking robomimic setup trains on
+            # ``reward - 1`` so the sparse reward becomes {-1, 0}.
+            env = gym.wrappers.TransformReward(
+                env, partial(_shift_reward, shift=reward_shift)
+            )
 
         if return_raw_spaces:
             action_space = copy.deepcopy(env.action_space)
@@ -832,9 +864,24 @@ class RobomimicEnvFactory(EnvFactory):
                 norm_obs=norm_obs,
                 obs_stats=obs_stats,
                 obs_norm_type=obs_norm_type,
+                min_max_constant_value=float(
+                    _cfg_get(cfg, "obs_min_max_constant_value", 0.0)
+                ),
             )
 
-        env = TimeLimit(env, cfg.env.episode_length)
+        time_limit = int(cfg.env.episode_length)
+        if demo_env:
+            # Demonstrations may be longer than the online interaction horizon
+            # (square-mh contains demos up to 1051 steps versus the official
+            # 400-step online limit). Keep full demos like the official
+            # offline dataset does.
+            # +1 so gymnasium's TimeLimit never stamps a spurious truncation
+            # onto the final (terminal) step of the longest demo.
+            time_limit = max(
+                time_limit,
+                int(getattr(self, "_max_demo_episode_length", time_limit)) + 1,
+            )
+        env = TimeLimit(env, time_limit)
         if cfg.use_onehot_time_and_no_bootstrap:
             env = OnehotTime(env, cfg.env.episode_length)
         if not demo_env:
@@ -893,7 +940,10 @@ class RobomimicEnvFactory(EnvFactory):
     def make_train_env(self, cfg: DictConfig) -> gym.vector.VectorEnv:
         self._ensure_dataset_metadata(cfg)
         return gym.vector.SyncVectorEnv(
-            [lambda: self._wrap_env(self._make_base_env(cfg), cfg) for _ in range(cfg.num_train_envs)]
+            [
+                lambda: self._wrap_env(self._make_base_env(cfg), cfg)
+                for _ in range(cfg.num_train_envs)
+            ]
         )
 
     def get_spaces(self, cfg: DictConfig) -> tuple[gym.Space, gym.Space]:

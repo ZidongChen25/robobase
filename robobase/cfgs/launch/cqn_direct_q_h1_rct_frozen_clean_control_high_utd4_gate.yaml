@@ -1,0 +1,16 @@
+# @package _global_
+
+# Matched no-causal-loss control for the exact frozen-clean Route-A arm.
+# Structured H=1 interventions, completed returns, replay, optimization budget,
+# legacy-C51 behavior policy, and policy encoder are identical to treatment;
+# only the action-centered RCT objective coefficient is zero.
+defaults:
+  - cqn_direct_q_h1_rct_frozen_clean_high_utd4_gate
+  - _self_
+
+method:
+  causal_rct_weight: 0.0
+
+hydra:
+  run:
+    dir: ./exp_local/cqn_flow_high_utd/bigym_${env.task_name}_direct_q_h1_rct_frozen_clean_control_utd4_${now:%Y%m%d%H%M%S}

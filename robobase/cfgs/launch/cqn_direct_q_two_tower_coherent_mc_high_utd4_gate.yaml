@@ -1,0 +1,22 @@
+# @package _global_
+
+# Monolithic scalar-Q mechanism control for expected-FLOQ. It inherits the
+# exact strict two-tower, replay-next, coherent-exploration, MC-return, and
+# UTD=4 protocol from the direct-C51 control. Only the value parameterization
+# and Bellman loss change: one candidate-conditioned scalar head is optimized
+# with the squared Bellman regression used by the monolithic control in the
+# expected-FLOQ analysis.
+defaults:
+  - cqn_as_pixel_bigym_two_tower_coherent_mc_high_utd4_gate
+  - _self_
+
+method:
+  _target_: robobase.method.cqn_direct_q.CQNDirectQAS
+  direct_scalar_q: true
+  direct_q_loss: mse
+  direct_q_huber_delta: 1.0
+  demo_fosd: false
+
+hydra:
+  run:
+    dir: ./exp_local/cqn_flow_high_utd/bigym_${env.task_name}_direct_scalar_q_two_tower_utd4_${now:%Y%m%d%H%M%S}

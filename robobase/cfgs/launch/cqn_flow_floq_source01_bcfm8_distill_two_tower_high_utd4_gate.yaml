@@ -1,0 +1,19 @@
+# @package _global_
+
+# FLOQ key-mechanism combination after the two single-variable arms.
+# Relative to Stage-24/62 it uses MovePlate's FLOQ source interval [0, 0.1]
+# and restores the official eight-source flow-to-distillation loss ratio.
+# This remains a CQN-AS integration (with its matched encoder, target, and
+# auxiliary value anchors), not a line-for-line reproduction of FQL/FLOQ.
+defaults:
+  - cqn_flow_floq_distill_two_tower_high_utd4_gate
+  - _self_
+
+method:
+  flow_source_min: 0.0
+  flow_source_max: 0.1
+  bcfm_lambda: 8.0
+
+hydra:
+  run:
+    dir: ./exp_local/cqn_flow_high_utd/bigym_${env.task_name}_floq_source01_bcfm8_distill_two_tower_utd4_${now:%Y%m%d%H%M%S}

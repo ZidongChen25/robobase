@@ -5,14 +5,31 @@ import numpy as np
 import pytest
 from gymnasium import spaces
 from omegaconf import OmegaConf
+from safetensors.numpy import save_file
 
 from robobase.replay_buffer.bigym_lazy_replay import (
     LazyBiGymEpisode,
     LazyBiGymManifest,
     LazyBiGymReplayBuffer,
+    _load_camera_params_episode,
     _metadata_dirs,
+    _supported_observation_keys,
     lazy_replay_enabled,
 )
+
+
+def test_camera_param_cache_validation_is_eager_and_shape_safe(tmp_path):
+    path = tmp_path / "episode.safetensors"
+    save_file(
+        {
+            "obs_camera_intrinsic_head": np.zeros((3, 3), dtype=np.float32),
+            "obs_camera_c2w_head": np.zeros((1, 4, 4), dtype=np.float32),
+        },
+        path,
+    )
+
+    with pytest.raises(ValueError, match=r"shape \(T, 3, 3\)"):
+        _load_camera_params_episode(path, ("head",))
 
 
 def test_lazy_replay_explicit_false_disables_imitation_learning():
@@ -27,6 +44,10 @@ def test_lazy_replay_explicit_false_disables_imitation_learning():
     )
 
     assert not lazy_replay_enabled(cfg)
+
+
+def test_lazy_replay_supports_executed_action_feedback_observation():
+    assert "executed_action_feedback" in _supported_observation_keys(())
 
 
 def test_lazy_replay_disabled_for_non_bigym_imitation_learning():
@@ -290,6 +311,160 @@ def test_lazy_bigym_post_action_uses_next_action_index_and_pads_end():
     np.testing.assert_array_equal(last["action_pad_mask"][0], np.asarray([0, 1, 1]))
 
 
+def test_lazy_bigym_raw_zero_padding_is_transformed_after_padding():
+    buffer = _make_lazy_buffer("post_action")
+    buffer._action_padding = "raw_zero"
+    buffer._transform_actions = lambda actions: actions + 5.0
+
+    last = buffer.sample_batch_indices([3])
+
+    np.testing.assert_array_equal(last["action"][0, :, 0], np.asarray([9, 5, 5]))
+    np.testing.assert_array_equal(last["action_pad_mask"][0], np.asarray([0, 1, 1]))
+
+
+@pytest.mark.parametrize(
+    "observation_timing,index",
+    [("pre_action", 3), ("post_action", 2)],
+)
+def test_lazy_bigym_a2a_history_immediately_precedes_action_chunk(
+    observation_timing,
+    index,
+):
+    buffer = _make_lazy_buffer(observation_timing)
+    buffer._action_history_len = 3
+    buffer._action_history_padding = "edge"
+
+    batch = buffer.sample_batch_indices([index])
+
+    np.testing.assert_array_equal(batch["action_history"][0, :, 0], [0, 1, 2])
+    np.testing.assert_array_equal(
+        batch["action_history_pad_mask"][0],
+        [False, False, False],
+    )
+    np.testing.assert_array_equal(batch["action"][0, :, 0], [3, 4, 0])
+
+
+def test_lazy_bigym_a2a_feedback_history_ends_at_current_measured_state():
+    buffer = _make_lazy_buffer("pre_action")
+    buffer._action_history_len = 3
+    buffer._action_history_padding = "edge"
+    buffer._action_history_source = "executed_action_feedback"
+    buffer._action_shape = (16,)
+    buffer.observation_elements = {}
+
+    episode = buffer._cached_episode(0)
+    measured = np.arange(5 * 16, dtype=np.float32).reshape(5, 16)
+    proprioception = np.zeros((5, 60), dtype=np.float32)
+    limb_indices = [0, 1, 2, 3, 12, 13, 14, 15, 16, 25]
+    proprioception[:, limb_indices] = measured[:, 4:14]
+    episode["obs_proprioception"] = proprioception
+    episode["obs_proprioception_floating_base"] = measured[:, :4]
+    episode["obs_proprioception_grippers"] = measured[:, 14:]
+    episode["info_demo_action"] = np.full((5, 16), 999.0, dtype=np.float32)
+
+    batch = buffer.sample_batch_indices([2])
+
+    np.testing.assert_array_equal(batch["action_history"][0], measured[:3])
+    np.testing.assert_array_equal(
+        batch["action_history_pad_mask"][0], [False, False, False]
+    )
+
+
+def test_lazy_bigym_a2a_feedback_edge_padding_is_valid_repeated_state():
+    buffer = _make_lazy_buffer("pre_action")
+    buffer._action_history_len = 3
+    buffer._action_history_padding = "edge"
+    buffer._action_history_source = "executed_action_feedback"
+    buffer._action_shape = (16,)
+    buffer.observation_elements = {}
+
+    episode = buffer._cached_episode(0)
+    measured = np.arange(5 * 16, dtype=np.float32).reshape(5, 16)
+    proprioception = np.zeros((5, 60), dtype=np.float32)
+    proprioception[:, [0, 1, 2, 3, 12, 13, 14, 15, 16, 25]] = measured[:, 4:14]
+    episode["obs_proprioception"] = proprioception
+    episode["obs_proprioception_floating_base"] = measured[:, :4]
+    episode["obs_proprioception_grippers"] = measured[:, 14:]
+    episode["info_demo_action"] = np.full((5, 16), 999.0, dtype=np.float32)
+
+    batch = buffer.sample_batch_indices([0])
+
+    np.testing.assert_array_equal(
+        batch["action_history"][0], np.repeat(measured[:1], 3, axis=0)
+    )
+    np.testing.assert_array_equal(
+        batch["action_history_pad_mask"][0], [False, False, False]
+    )
+
+
+@pytest.mark.parametrize(
+    "observation_timing,expected_mask",
+    [
+        ("pre_action", [True, True, True]),
+        ("post_action", [True, True, False]),
+    ],
+)
+def test_lazy_bigym_a2a_history_edge_pads_only_before_episode_start(
+    observation_timing,
+    expected_mask,
+):
+    buffer = _make_lazy_buffer(observation_timing)
+    buffer._action_history_len = 3
+    buffer._action_history_padding = "edge"
+    buffer._cached_episode(0)["info_demo_action"] = np.arange(
+        10,
+        15,
+        dtype=np.float32,
+    ).reshape(5, 1)
+    buffer._transform_actions = lambda actions: actions + 100.0
+
+    batch = buffer.sample_batch_indices([0])
+
+    np.testing.assert_array_equal(
+        batch["action_history"][0, :, 0],
+        [110.0, 110.0, 110.0],
+    )
+    np.testing.assert_array_equal(
+        batch["action_history_pad_mask"][0],
+        expected_mask,
+    )
+
+
+@pytest.mark.parametrize(
+    "history_padding,expected_history",
+    [
+        ("edge", [15.0, 15.0, 15.0]),
+        ("repeat", [15.0, 15.0, 15.0]),
+        ("zero", [0.0, 0.0, 15.0]),
+        ("raw_zero", [5.0, 5.0, 15.0]),
+    ],
+)
+def test_lazy_bigym_a2a_history_padding_respects_action_normalization_order(
+    history_padding,
+    expected_history,
+):
+    buffer = _make_lazy_buffer("pre_action")
+    buffer._action_history_len = 3
+    buffer._action_history_padding = history_padding
+    buffer._cached_episode(0)["info_demo_action"] = np.arange(
+        10,
+        15,
+        dtype=np.float32,
+    ).reshape(5, 1)
+    buffer._transform_actions = lambda actions: actions + 5.0
+
+    batch = buffer.sample_batch_indices([1])
+
+    np.testing.assert_array_equal(
+        batch["action_history"][0, :, 0],
+        expected_history,
+    )
+    np.testing.assert_array_equal(
+        batch["action_history_pad_mask"][0],
+        [True, True, False],
+    )
+
+
 def test_lazy_bigym_returns_camera_params_for_model_side_plucker_generation():
     buffer = _make_lazy_buffer("pre_action")
     intrinsics = np.tile(np.eye(3, dtype=np.float32), (5, 1, 1))
@@ -324,6 +499,34 @@ def test_lazy_bigym_returns_camera_params_for_model_side_plucker_generation():
     np.testing.assert_allclose(batch["camera_c2w_head"][1, 0], c2ws[2])
 
 
+def test_lazy_bigym_raw_proprio_dropout_precedes_normalization():
+    buffer = _make_lazy_buffer("pre_action")
+    buffer.cfg.norm_obs = True
+    buffer.cfg.obs_norm_type = "standardization"
+    buffer._manifest = LazyBiGymManifest(
+        episodes=buffer._manifest.episodes,
+        action_stats=buffer._manifest.action_stats,
+        obs_stats={
+            "mean": {
+                "proprioception": np.asarray([2.0], dtype=np.float32),
+                "proprioception_grippers": np.asarray([0.0], dtype=np.float32),
+            },
+            "std": {
+                "proprioception": np.asarray([4.0], dtype=np.float32),
+                "proprioception_grippers": np.asarray([1.0], dtype=np.float32),
+            },
+            "min": {},
+            "max": {},
+        },
+    )
+    buffer._raw_proprio_dropout_prob = 1.0
+    buffer._raw_proprio_dropout_keys = frozenset({"proprioception"})
+
+    batch = buffer.sample_batch_indices([2])
+
+    np.testing.assert_allclose(batch["low_dim_state"][0, 0], [-0.5, 0.0])
+
+
 def test_lazy_bigym_returns_precomputed_lang_features():
     buffer = _make_lazy_buffer("pre_action")
     buffer.observation_elements["lang_features"] = spaces.Box(
@@ -340,11 +543,9 @@ def test_lazy_bigym_returns_precomputed_lang_features():
     np.testing.assert_allclose(batch["lang_features"], 0.125)
 
 
-def test_lazy_bigym_missing_language_source_preserves_legacy_clip_abi(monkeypatch):
+def test_lazy_bigym_missing_language_source_defaults_to_jax_tokens():
     buffer = object.__new__(LazyBiGymReplayBuffer)
-    buffer.cfg = OmegaConf.create(
-        {"env": {"task_name": "flip_cutlery"}, "method": {}}
-    )
+    buffer.cfg = OmegaConf.create({"env": {"task_name": "flip_cutlery"}, "method": {}})
     buffer.observation_elements = {
         "lang_tokens": spaces.Box(0, 100, shape=(1, 77), dtype=np.int32),
         "lang_features": spaces.Box(
@@ -354,30 +555,60 @@ def test_lazy_bigym_missing_language_source_preserves_legacy_clip_abi(monkeypatc
             dtype=np.float32,
         ),
     }
-    descriptions = []
-    monkeypatch.setattr(
-        "robobase.replay_buffer.bigym_lazy_replay.clip_tokenize_text",
-        lambda description: (
-            descriptions.append(description)
-            or np.full((1, 77), 7, dtype=np.int32)
-        ),
-    )
-    monkeypatch.setattr(
-        "robobase.replay_buffer.bigym_lazy_replay.clip_text_feature_array",
-        lambda description, device="cpu": (
-            descriptions.append(description)
-            or np.full((1, 512), 0.25, dtype=np.float32)
-        ),
-    )
-
     tokens = buffer._build_lang_tokens()
     buffer._lang_tokens = tokens
     features = buffer._build_lang_features()
 
-    assert buffer._lang_feature_source() == "clip"
-    assert descriptions == ["reach the target", "reach the target"]
-    np.testing.assert_array_equal(tokens, np.full((1, 77), 7))
-    np.testing.assert_allclose(features, 0.25)
+    assert buffer._lang_feature_source() == "tokens"
+    assert tokens.shape == (1, 77)
+    assert tokens.dtype == np.int32
+    assert features.shape == (1, 512)
+    assert features.dtype == np.float32
+    np.testing.assert_allclose(np.linalg.norm(features, axis=-1), 1.0, rtol=1e-5)
+
+
+def test_lazy_bigym_loads_precomputed_language_features(tmp_path):
+    path = tmp_path / "language.npy"
+    expected = np.linspace(-0.5, 0.5, 8, dtype=np.float32)[None, :]
+    np.save(path, expected)
+    buffer = object.__new__(LazyBiGymReplayBuffer)
+    buffer.cfg = OmegaConf.create(
+        {
+            "env": {"task_name": "flip_cutlery"},
+            "method": {
+                "lang_feature_source": "precomputed",
+                "lang_feature_path": str(path),
+            },
+        }
+    )
+    buffer.observation_elements = {
+        "lang_tokens": spaces.Box(0, 100, shape=(1, 77), dtype=np.int32),
+        "lang_features": spaces.Box(
+            -np.inf,
+            np.inf,
+            shape=(1, 8),
+            dtype=np.float32,
+        ),
+    }
+    buffer._lang_tokens = buffer._build_lang_tokens()
+
+    actual = buffer._build_lang_features()
+
+    assert buffer._lang_feature_source() == "precomputed"
+    np.testing.assert_array_equal(actual, expected)
+
+
+def test_lazy_bigym_rejects_torch_clip_source():
+    buffer = object.__new__(LazyBiGymReplayBuffer)
+    buffer.cfg = OmegaConf.create(
+        {
+            "env": {"task_name": "flip_cutlery"},
+            "method": {"lang_feature_source": "clip"},
+        }
+    )
+
+    with pytest.raises(ValueError, match="JAX-only"):
+        buffer._lang_feature_source()
 
 
 def test_lazy_bigym_returns_time_onehot_with_frame_stack_and_tp1():

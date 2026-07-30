@@ -1,0 +1,14 @@
+# @package _global_
+
+# Matched anchored-FLOQ gate with demonstrations truncated at the first
+# success, so offline and online transitions use the same terminal semantics.
+defaults:
+  - cqn_flow_floq_anchored_pixel_bigym_stage1_gate
+  - _self_
+
+env:
+  truncate_demo_at_success: true
+
+hydra:
+  run:
+    dir: ./exp_local/cqn_value_fidelity_stage2/bigym_${env.task_name}_floq_anchored_first_success_${now:%Y%m%d%H%M%S}

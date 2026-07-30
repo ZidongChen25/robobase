@@ -1,0 +1,22 @@
+# @package _global_
+
+# Stage-162 exploration-probability ablation arm "uniform" on the combined
+# (explore + margin-decay) recipe. Async-eval protocol: no in-loop eval,
+# snapshots every 5k, no videos.
+defaults:
+  - cqn_as_pixel_bigym_stage158_explore_100k
+  - _self_
+
+eval_every_steps: 1000000
+num_eval_episodes: 0
+num_eval_envs: 0
+save_snapshot: true
+snapshot_every_n: 5000
+log_eval_video: false
+
+method:
+  bin_explore_probs: [0.00467, 0.00467, 0.00467]
+
+hydra:
+  run:
+    dir: ./exp_local/cqn_stage162_eps_ablation/bigym_${env.task_name}_uniform_${now:%Y%m%d%H%M%S}

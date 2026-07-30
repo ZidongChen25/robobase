@@ -1,0 +1,8 @@
+# @package _global_
+# Use the reset-aligned pixel cache while retaining state/action metadata from
+# the original BiGym cache. This matches the repaired flip_cutlery FM baseline.
+
+env:
+  dataset_root: ${oc.env:HOME}/.bigym
+  pixel_dataset_root: ${oc.env:HOME}/.bigym_reset_aligned
+  state_dataset_root: ${oc.env:HOME}/.bigym

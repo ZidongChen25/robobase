@@ -284,6 +284,7 @@ def test_placeholder_eval_env_shapes(tmp_path):
 class _FakeReplayBuffer:
     def __init__(self):
         self.sequential = False
+        self.extra_replay_elements = {}
         self.transitions = []
         self.final_observations = []
 
@@ -493,3 +494,52 @@ def test_toolhang_clean_diffuser_lowdim_abs_parity(tmp_path):
         assert np.all(obs["low_dim_state"] >= -1.0)
     finally:
         env.close()
+
+
+def test_reward_shift_applies_to_demo_replay_and_live_step(tmp_path):
+    dataset_path = tmp_path / "robomimic_test.hdf5"
+    _write_dataset(dataset_path)
+    cfg = _make_cfg(dataset_path)
+    cfg.env.reward_shift = -1.0
+
+    factory = RobomimicEnvFactory()
+    factory.collect_or_fetch_demos(cfg, 1)
+    factory.post_collect_or_fetch_demos(cfg)
+    buffer = _FakeReplayBuffer()
+    factory.load_demos_into_replay(cfg, buffer, is_demo_buffer=True)
+
+    # demo_0 has sparse rewards (0, 0, 1); the official shift maps them to
+    # (-1, -1, 0).
+    rewards = [transition[2] for transition in buffer.transitions]
+    np.testing.assert_allclose(rewards, [-1.0, -1.0, 0.0])
+
+    env = factory.make_eval_env(cfg)
+    try:
+        env.reset()
+        _, reward, *_ = env.step(np.zeros(env.action_space.shape, np.float32))
+        # The placeholder env emits raw reward 0.0 for every step.
+        assert reward == -1.0
+    finally:
+        env.close()
+
+
+def test_demo_env_time_limit_keeps_demos_longer_than_online_horizon(tmp_path):
+    dataset_path = tmp_path / "robomimic_test.hdf5"
+    _write_dataset(dataset_path)
+    cfg = _make_cfg(dataset_path)
+    # demo_1 (filter key "valid") is 5 steps long; the online horizon is
+    # shorter. Demos must be stored in full like the official offline dataset.
+    cfg.env.episode_length = 3
+    cfg.env.filter_key = "valid"
+
+    factory = RobomimicEnvFactory()
+    factory.collect_or_fetch_demos(cfg, float("inf"))
+    factory.post_collect_or_fetch_demos(cfg)
+    buffer = _FakeReplayBuffer()
+    factory.load_demos_into_replay(cfg, buffer, is_demo_buffer=True)
+
+    assert len(buffer.transitions) == 5
+    *_, term, trunc, _ = buffer.transitions[-1]
+    assert term
+    assert not trunc
+    assert cfg.env.episode_length == 3

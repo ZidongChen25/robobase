@@ -1,0 +1,20 @@
+# @package _global_
+
+# Stage-XXI conditional follow-up: add FLOQ's online scalar critic distillation
+# to the matched UTD=4 flow run. Training and the built-in task evaluations
+# continue to use the independent BC policy, so replay coverage remains matched
+# and the value readout cannot degrade data collection. After training,
+# scripts/eval_cqn_flow_policy_value.py selects the checkpoint and BC-prior beta
+# on paired validation seeds, then confirms once on never-used held-out seeds.
+defaults:
+  - cqn_flow_floq_compute8_two_tower_high_utd4_gate
+  - _self_
+
+method:
+  flow_distill_lambda: 1.0
+  flow_distill_action_readout: false
+  policy_value_beta: null
+
+hydra:
+  run:
+    dir: ./exp_local/cqn_flow_high_utd/bigym_${env.task_name}_floq_distill_two_tower_utd4_${now:%Y%m%d%H%M%S}

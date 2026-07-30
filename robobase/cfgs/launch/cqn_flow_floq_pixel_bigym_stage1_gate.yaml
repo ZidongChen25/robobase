@@ -1,0 +1,21 @@
+# @package _global_
+
+# Ten-thousand-update FLOQ core correctness gate with frozen demonstrations.
+defaults:
+  - cqn_flow_floq_pixel_bigym_demo_driven
+  - _self_
+
+num_train_frames: 10500
+batch_size: 16
+demo_batch_size: 16
+use_self_imitation: false
+
+method:
+  num_flow_steps: 4
+  num_flow_samples: 4
+  num_target_flow_samples: 4
+  num_action_flow_samples: 4
+
+hydra:
+  run:
+    dir: ./exp_local/pixel_cqn_flow_stage1/bigym_${env.task_name}_floq_${now:%Y%m%d%H%M%S}

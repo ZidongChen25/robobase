@@ -1,0 +1,19 @@
+# @package _global_
+
+# Stage-147 (CQN-value line): canonical clean CQN-AS with a completed-episode
+# MC-return anchor on its own Q head.  Single variable vs the clean baseline
+# (mc_return_weight 0 -> 0.1).  Verdict is two-fold (cqn-flow.md 28.6):
+# task non-inferiority vs 72.00% and on-path calibration flipping from
+# rho=-0.54 to significantly positive.
+defaults:
+  - cqn_as_pixel_bigym_value_fidelity_gate
+  - _self_
+
+save_csv: true
+
+method:
+  mc_return_weight: 0.1
+
+hydra:
+  run:
+    dir: ./exp_local/cqn_stage147_clean_mc/bigym_${env.task_name}_cleanmc_${now:%Y%m%d%H%M%S}

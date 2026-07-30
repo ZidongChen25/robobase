@@ -1,0 +1,13 @@
+# @package _global_
+
+# Stage-146c arm b20k: EMA flow+rerank at doubled budget.
+defaults:
+  - cqn_as_pixel_bigym_stage146b_flow_ema_gate
+  - _self_
+
+num_train_frames: 20500
+snapshot_every_n: 5000
+
+hydra:
+  run:
+    dir: ./exp_local/cqn_stage146_flow_rerank/bigym_${env.task_name}_flowb20k_${now:%Y%m%d%H%M%S}

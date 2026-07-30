@@ -1,10 +1,11 @@
+import csv
 import sys
 import types
 
 import numpy as np
 from omegaconf import OmegaConf
 
-from robobase.logger import Logger
+from robobase.logger import Logger, MetersGroup
 
 
 class _GradTensorLike:
@@ -26,6 +27,14 @@ class _GradTensorLike:
 
     def __array__(self):
         raise RuntimeError("requires grad")
+
+
+class _ArrayLike:
+    def __init__(self, value):
+        self._value = np.asarray(value)
+
+    def __array__(self):
+        return self._value
 
 
 def test_logger_passes_wandb_resume_arguments(monkeypatch, tmp_path):
@@ -120,6 +129,65 @@ def test_logger_converts_grad_tensor_without_importing_torch(tmp_path):
     np.testing.assert_array_equal(value, np.array([1.0, 2.0]))
 
 
+def test_logger_keeps_executed_action_matrix_as_grayscale_image(
+    monkeypatch,
+    tmp_path,
+):
+    cfg = OmegaConf.create(
+        {
+            "save_csv": False,
+            "wandb": {"use": False},
+            "tb": {"use": False},
+        }
+    )
+    logger = Logger(tmp_path, cfg=cfg)
+    logger._use_wandb = True
+    captured = []
+    monkeypatch.setattr(
+        "robobase.logger.wandb.Image",
+        lambda value: captured.append(np.asarray(value)) or "image",
+    )
+    executed_action = np.arange(16 * 15, dtype=np.float32).reshape(16, 15)
+
+    logger._log(
+        "train/env_info/executed_action",
+        executed_action,
+        step=1,
+    )
+
+    assert len(captured) == 1
+    np.testing.assert_array_equal(captured[0], executed_action)
+
+
+def test_logger_expands_one_dimensional_array_like_diagnostic(monkeypatch, tmp_path):
+    cfg = OmegaConf.create(
+        {
+            "save_csv": False,
+            "wandb": {"use": False},
+            "tb": {"use": False},
+        }
+    )
+    logger = Logger(tmp_path, cfg=cfg)
+    logger._use_wandb = True
+    monkeypatch.setattr(logger, "_dump", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        "robobase.logger.wandb.Image",
+        lambda _value: (_ for _ in ()).throw(
+            AssertionError("1-D diagnostics must not be logged as images")
+        ),
+    )
+
+    logger.log_metrics(
+        {"per_action": _ArrayLike(np.arange(15, dtype=np.float32))},
+        step=1,
+        prefix="train",
+    )
+
+    assert set(logger._wandb_logs) == {
+        f"train/per_action{index}" for index in range(15)
+    }
+
+
 def test_tensorboard_logger_uses_tensorboardx(monkeypatch, tmp_path):
     captured_logdirs = []
 
@@ -171,3 +239,20 @@ def test_pretrain_console_log_uses_step_label(capsys, tmp_path):
     output = capsys.readouterr().out
     assert "Step: 123" in output
     assert "Iter:" not in output
+
+
+def test_csv_schema_expands_when_online_metrics_appear_later(tmp_path):
+    path = tmp_path / "train.csv"
+    meters = MetersGroup(path, [], save_csv=True)
+    meters.log("train_env_steps", 0)
+    meters.dump(0, "train")
+    meters.log("train_env_steps", 1000)
+    meters.log("train_episode_reward", 750.0)
+    meters.dump(1000, "train")
+
+    with path.open() as f:
+        rows = list(csv.DictReader(f))
+
+    assert len(rows) == 2
+    assert rows[0]["episode_reward"] == "0.0"
+    assert rows[1]["episode_reward"] == "750.0"

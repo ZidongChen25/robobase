@@ -19,6 +19,8 @@ def valid_group_count(num_channels: int, requested_groups: int) -> int:
 
 
 class SinusoidalPosEmb(nn.Module):
+    """CamPose/Diffusion-Policy sinusoidal timestep embedding."""
+
     dim: int
 
     @nn.compact
@@ -30,6 +32,26 @@ class SinusoidalPosEmb(nn.Module):
         emb = jnp.exp(jnp.arange(half_dim, dtype=jnp.float32) * -emb)
         emb = x.astype(jnp.float32)[:, None] * emb[None, :]
         emb = jnp.concatenate([jnp.sin(emb), jnp.cos(emb)], axis=-1)
+        if emb.shape[-1] < self.dim:
+            emb = jnp.pad(emb, ((0, 0), (0, self.dim - emb.shape[-1])))
+        return emb
+
+
+class CleanDiffuserPosEmb(nn.Module):
+    """CleanDiffuser positional embedding with endpoint=False."""
+
+    dim: int
+    max_positions: float = 10000.0
+
+    @nn.compact
+    def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
+        half_dim = self.dim // 2
+        if half_dim == 0:
+            return jnp.zeros((x.shape[0], 0), dtype=jnp.float32)
+        frequencies = jnp.arange(half_dim, dtype=jnp.float32) / half_dim
+        frequencies = (1.0 / self.max_positions) ** frequencies
+        emb = x.astype(jnp.float32)[:, None] * frequencies[None, :]
+        emb = jnp.concatenate([jnp.cos(emb), jnp.sin(emb)], axis=-1)
         if emb.shape[-1] < self.dim:
             emb = jnp.pad(emb, ((0, 0), (0, self.dim - emb.shape[-1])))
         return emb

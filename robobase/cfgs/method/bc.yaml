@@ -26,6 +26,7 @@ method:
     pretrained: true
     trainable: false
     use_plucker: false
+    plucker_fusion_mode: null
     plucker_hidden_channels: 64
     plucker_identity_init: false
 

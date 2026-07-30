@@ -1,0 +1,17 @@
+# @package _global_
+
+# Stage-144: data-scale test of the CV-adjusted causal RCT.  Identical to
+# Stage-141 except 50k environment steps, which raises per-dimension
+# intervention starts from ~35 to ~170 and extends detectable per-dim
+# effects from delta>=0.07 to delta>=0.04 (power ladder, cqn-flow.md 22.1).
+# Fresh training seeds 4/5; arms differ only in method.cv_rct_weight.
+defaults:
+  - cqn_as_pixel_bigym_stage141_cv_rct_gate
+  - _self_
+
+num_train_frames: 50500
+snapshot_every_n: 10000
+
+hydra:
+  run:
+    dir: ./exp_local/cqn_stage144_cv_rct_50k/bigym_${env.task_name}_cv_rct50k_${now:%Y%m%d%H%M%S}

@@ -15,10 +15,7 @@ def normalize_camera_conditioning(mode) -> str:
         return "none"
     if normalized in {"plucker", "raymap", "camera", "camera_pose"}:
         return "plucker"
-    raise ValueError(
-        "camera_conditioning must be one of none/plucker; "
-        f"got {mode!r}."
-    )
+    raise ValueError(f"camera_conditioning must be one of none/plucker; got {mode!r}.")
 
 
 def camera_conditioning_enabled(mode) -> bool:
@@ -65,7 +62,6 @@ def _camera_space_rays(
             "camera_convention must be opengl/mujoco/dm_control or opencv; "
             f"got {camera_convention!r}."
         )
-    ray_cam /= np.maximum(np.linalg.norm(ray_cam, axis=-1, keepdims=True), 1e-9)
     return np.ascontiguousarray(ray_cam, dtype=np.float32)
 
 
@@ -77,15 +73,18 @@ def plucker_raymap_from_c2w(
     *,
     channels_first: bool = True,
     pixel_center_offset: float = 0.5,
-    principal_point_offset: float = 0.0,
+    principal_point_offset: float = 0.5,
     camera_convention: str = "opengl",
-    channel_order: str = "direction_moment",
+    channel_order: str = "moment_direction",
 ) -> np.ndarray:
     """Build a per-pixel Plucker ray map from a camera-to-world pose.
 
-    The default layout follows the official controller implementation: pixel
-    centers use ``+0.5`` with no extra principal-point shift, and the output
-    channels are ``[direction, moment]``.
+    Defaults reproduce ``policy_*/cam_embedding.py`` from CamPoseOpensource:
+    the precomputed pixel-center grid uses ``+0.5``, the policy adds another
+    ``+0.5`` before applying the intrinsics, and channels are
+    ``[moment, view direction]``. The repository README contains a separate
+    generic OpenCV snippet with ``[direction, moment]``; callers targeting that
+    snippet must select those options explicitly.
 
     The default ``opengl`` convention matches MuJoCo/dm_control cameras:
     +X points right, +Y points up, and cameras look along -Z. Pixel
@@ -108,13 +107,20 @@ def plucker_raymap_from_c2w(
         str(camera_convention).strip().lower(),
     )
     direction = ray_cam @ c2w[:3, :3].T
+    direction /= np.linalg.norm(direction, axis=-1, keepdims=True) + 1e-8
     camera_center = c2w[:3, 3]
     moment = np.cross(np.broadcast_to(camera_center, direction.shape), direction)
     order = str(channel_order).strip().lower()
-    if order in {"direction_moment", "official", "readme", "snippet"}:
-        values = (direction, moment)
-    elif order in {"moment_direction", "cam_pose", "campose"}:
+    if order in {
+        "moment_direction",
+        "official",
+        "cam_pose",
+        "campose",
+        "campose_policy",
+    }:
         values = (moment, direction)
+    elif order in {"direction_moment", "readme", "snippet"}:
+        values = (direction, moment)
     else:
         raise ValueError(
             "channel_order must be moment_direction or direction_moment; "

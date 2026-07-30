@@ -1,0 +1,22 @@
+# @package _global_
+
+# Stage-161: official baseline + low-dim mask ONLY (no exploration, no
+# margin decay) -- isolates the mask's contribution on the vanilla paper
+# config, complementing stage160 (mask on the explore+decay recipe).
+defaults:
+  - cqn_as_pixel_bigym_demo_driven
+  - _self_
+
+save_csv: true
+snapshot_every_n: 20000
+
+env:
+  append_floating_base_to_low_dim: true
+
+method:
+  low_dim_mask_prob: 0.2
+  low_dim_mask_keep_last: 3
+
+hydra:
+  run:
+    dir: ./exp_local/cqn_stage161_official_mask/bigym_${env.task_name}_offmask_${now:%Y%m%d%H%M%S}

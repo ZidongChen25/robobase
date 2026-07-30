@@ -1,0 +1,25 @@
+# @package _global_
+
+# Stage-I follow-up for FLOQ: retain the scalar flow objective while directly
+# anchoring its integrated endpoint to the Bellman target and reducing
+# source-dependent bin-ranking noise.
+defaults:
+  - cqn_flow_floq_pixel_bigym_demo_driven
+  - _self_
+
+num_train_frames: 10500
+batch_size: 16
+demo_batch_size: 16
+use_self_imitation: false
+
+method:
+  num_flow_steps: 4
+  num_flow_samples: 4
+  num_target_flow_samples: 4
+  num_action_flow_samples: 4
+  endpoint_q_lambda: 1.0
+  source_consistency_lambda: 0.1
+
+hydra:
+  run:
+    dir: ./exp_local/pixel_cqn_flow_stage1/bigym_${env.task_name}_floq_anchored_${now:%Y%m%d%H%M%S}

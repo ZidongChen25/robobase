@@ -19,6 +19,11 @@ JAX_BC_FEATURE_KEY = "vision_features_jax_bc_v3"
 JAX_DIFFUSION_FEATURE_KEY = "vision_features_jax_diffusion_v3"
 JAX_FLOW_MATCHING_FEATURE_KEY = "vision_features_jax_flow_matching_v3"
 JAX_ACT_FEATURE_KEY = "vision_features_jax_act_v3"
+JAX_PPO_FEATURE_KEY = "vision_features_jax_ppo_v3"
+JAX_SAC_FEATURE_KEY = "vision_features_jax_sac_v3"
+JAX_CQN_FEATURE_KEY = "vision_features_jax_cqn_v3"
+JAX_CQN_AS_FEATURE_KEY = "vision_features_jax_cqn_as_v3"
+JAX_Q_CHUNKING_FEATURE_KEY = "vision_features_jax_q_chunking_v3"
 VISION_CACHE_FINGERPRINT_KEY = "vision_feature_cache_fingerprint_v1"
 DEFAULT_CACHE_BACKENDS = ("jax",)
 _SUPPORTED_FUSION_MODES = {"flatten", "average", "sum"}
@@ -32,6 +37,15 @@ def cached_feature_observation_key(method_name: str, backend_name: str = "jax") 
         "bc": JAX_BC_FEATURE_KEY,
         "diffusion": JAX_DIFFUSION_FEATURE_KEY,
         "flow_matching": JAX_FLOW_MATCHING_FEATURE_KEY,
+        "ppo": JAX_PPO_FEATURE_KEY,
+        "sac": JAX_SAC_FEATURE_KEY,
+        "cqn": JAX_CQN_FEATURE_KEY,
+        "cqn_as": JAX_CQN_AS_FEATURE_KEY,
+        "q_chunking": JAX_Q_CHUNKING_FEATURE_KEY,
+        "qchunking": JAX_Q_CHUNKING_FEATURE_KEY,
+        # CQN-Flow uses the identical state/image feature adapter as CQN-AS,
+        # so both methods can reuse one frozen-feature cache.
+        "cqn_flow": JAX_CQN_AS_FEATURE_KEY,
     }
     try:
         return mapping[method_name]
@@ -55,6 +69,8 @@ class FrozenVisionFeaturePreprocessor:
     rgb_keys: tuple[str, ...]
     encoder_model: str
     pretrained: bool
+    pretrained_weights_path: str | None
+    encoder_seed: int
     fusion_mode: str
     feature_keys: tuple[str, ...]
     method_name: str
@@ -126,6 +142,8 @@ class FrozenVisionFeaturePreprocessor:
                 model=self.encoder_model,
                 jit=True,
                 pretrained=self.pretrained,
+                pretrained_weights_path=self.pretrained_weights_path,
+                seed=self.encoder_seed,
             )
         feats = self._jax_encoder.encode(rgb_batch)
         return self._fuse_multi_view(np.asarray(jax.device_get(feats)))
@@ -150,11 +168,24 @@ def build_vision_feature_cache_plan(
         )
 
     method_name = str(cfg.method.get("name", "")).lower()
-    if method_name not in {"act", "bc", "diffusion", "flow_matching"}:
+    supported_methods = {
+        "act",
+        "bc",
+        "cqn",
+        "cqn_as",
+        "cqn_flow",
+        "diffusion",
+        "flow_matching",
+        "ppo",
+        "q_chunking",
+        "sac",
+    }
+    if method_name not in supported_methods:
         if cache_setting != "auto":
             raise ValueError(
-                "Frozen image-feature replay caching is only supported for "
-                "method=act, method=bc, method=diffusion, and method=flow_matching."
+                "Frozen image-feature replay caching is unsupported for "
+                f"method={method_name!r}. Supported methods: "
+                f"{sorted(supported_methods)}."
             )
         return None
 
@@ -189,9 +220,12 @@ def build_vision_feature_cache_plan(
     elif method_name == "diffusion":
         from robobase.method.diffusion import diffusion_model_spec_from_cfg
         model_spec = diffusion_model_spec_from_cfg(cfg)
-    else:
+    elif method_name == "flow_matching":
         from robobase.method.flow_matching import flow_matching_model_spec_from_cfg
         model_spec = flow_matching_model_spec_from_cfg(cfg)
+    else:
+        from robobase.method.rl_common import rl_model_spec_from_cfg
+        model_spec = rl_model_spec_from_cfg(cfg)
 
     if model_spec.encoder_model is None or model_spec.encoder_model.type != "resnet":
         message = "Frozen image-feature replay caching currently supports only ResNet encoders."
@@ -268,15 +302,20 @@ def build_vision_feature_cache_plan(
 
     from robobase.models.encoder import resnet_weight_fingerprint
 
+    encoder_seed = int(cfg.get("seed", 0))
+
+    cache_method_name = "cqn_as" if method_name == "cqn_flow" else method_name
     fingerprint_payload = {
         "schema": 3,
-        "method": method_name,
+        "method": cache_method_name,
         "backends": requested_backends,
         "encoder_model": model_spec.encoder_model.model,
         "pretrained": bool(model_spec.encoder_model.pretrained),
         "weight_fingerprint": resnet_weight_fingerprint(
             model_spec.encoder_model.model,
             bool(model_spec.encoder_model.pretrained),
+            model_spec.encoder_model.pretrained_weights_path,
+            seed=encoder_seed,
         ),
         "fusion_mode": fusion_mode,
         "rgb_keys": obs_layout.rgb_keys,
@@ -344,9 +383,13 @@ def build_vision_feature_cache_plan(
         rgb_keys=obs_layout.rgb_keys,
         encoder_model=model_spec.encoder_model.model,
         pretrained=bool(model_spec.encoder_model.pretrained),
+        pretrained_weights_path=(
+            model_spec.encoder_model.pretrained_weights_path
+        ),
+        encoder_seed=encoder_seed,
         fusion_mode=fusion_mode,
         feature_keys=feature_keys,
-        method_name=method_name,
+        method_name=cache_method_name,
         input_shape=obs_layout.rgb_input_shape,
         fingerprint=fingerprint,
     )

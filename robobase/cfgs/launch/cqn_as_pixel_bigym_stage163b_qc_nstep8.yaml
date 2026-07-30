@@ -1,0 +1,16 @@
+# @package _global_
+
+# Stage-163b: Q-chunking's within-chunk n-step backup grafted onto the
+# combined recipe, paired with replan-8 execution for train AND eval
+# (the pairing is what makes the 8-step reward sum (near-)unbiased:
+# executed actions match the stored chunk inside each segment).
+defaults:
+  - cqn_as_pixel_bigym_stage163_replan8
+  - _self_
+
+replay:
+  nstep: 8
+
+hydra:
+  run:
+    dir: ./exp_local/cqn_stage163_replan8/bigym_${env.task_name}_qc8_${now:%Y%m%d%H%M%S}

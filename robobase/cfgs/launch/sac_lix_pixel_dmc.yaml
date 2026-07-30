@@ -2,7 +2,7 @@
 
 defaults:
   - ../env: dmc/cartpole_swingup
-  - ../method: sac_lix
+  - ../method: sac
 
 pixels: true
 frame_stack: 3

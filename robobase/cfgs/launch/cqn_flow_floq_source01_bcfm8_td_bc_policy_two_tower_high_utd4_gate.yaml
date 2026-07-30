@@ -1,0 +1,19 @@
+# @package _global_
+
+# Full official-FLOQ fidelity interaction.  The source interval and BCFM
+# weighting match the task-specific FLOQ recipe, while the independently
+# trained BC policy supplies the Bellman next action.  Rollout remains exact
+# BC, so the Flow critic cannot improve its own replay distribution by
+# selecting actions during training.
+defaults:
+  - cqn_flow_floq_source01_bcfm8_distill_two_tower_high_utd4_gate
+  - _self_
+
+method:
+  td_target_action_source: bc_policy
+  td_target_policy_value_beta: null
+  policy_value_beta: null
+
+hydra:
+  run:
+    dir: ./exp_local/cqn_flow_high_utd/bigym_${env.task_name}_floq_source01_bcfm8_td_bc_policy_two_tower_utd4_${now:%Y%m%d%H%M%S}

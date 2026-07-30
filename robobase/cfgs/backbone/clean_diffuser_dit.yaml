@@ -1,0 +1,27 @@
+# @package method.backbone
+# CleanDiffuser dp_robomimic DiT1d + MLPCondition architecture in pure JAX.
+type: dit
+sequence_length: ${action_sequence}
+diffusion_step_embed_dim: 256
+d_model: 384
+n_heads: 12
+depth: 6
+dropout: 0.0
+conditioning_mode: global
+cond_predict_scale: false
+global_condition_embed_dim: 0
+timestep_embedding_type: fourier
+fourier_scale: 16.0
+operator_variant: torch
+compatibility_mode: clean_diffuser
+condition_adapter: clean_mlp
+condition_hidden_dims: [256]
+condition_dropout: 0.25
+
+# Unused by DiT; retained so this group is interchangeable with other backbones.
+down_dims: [256, 512, 1024]
+kernel_size: 5
+n_groups: 8
+hidden_dims: [256, 256]
+num_layers: 8
+n_cond_layers: 0

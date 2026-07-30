@@ -18,20 +18,40 @@ import math
 import random
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
+import flax.linen as nn
+import jax
+import jax.numpy as jnp
 import numpy as np
-import torch
-from torch import nn
+import optax
 
 
 DEFAULT_TASKS = {
-    "adroit_pen": "exp_local/adroit_fm_transformer_202606211318_bs1024_adroit_fm_transformer/pen/replay",
-    "adroit_door": "exp_local/adroit_fm_transformer_202606211318_bs1024_adroit_fm_transformer/door/replay",
-    "adroit_hammer": "exp_local/adroit_fm_transformer_202606211318_bs1024_adroit_fm_transformer/hammer/replay",
-    "adroit_relocate": "exp_local/adroit_fm_transformer_202606211318_bs1024_adroit_fm_transformer/relocate/replay",
-    "bigym_move_plate": "exp_local/bigym_move_plate_dp_transformer_trainable_lang_ddpm_500e_gpu2_20260526_161755/replay",
+    "adroit_pen": (
+        "exp_local/adroit_fm_transformer_202606211318_bs1024_"
+        "adroit_fm_transformer/pen/replay"
+    ),
+    "adroit_door": (
+        "exp_local/adroit_fm_transformer_202606211318_bs1024_"
+        "adroit_fm_transformer/door/replay"
+    ),
+    "adroit_hammer": (
+        "exp_local/adroit_fm_transformer_202606211318_bs1024_"
+        "adroit_fm_transformer/hammer/replay"
+    ),
+    "adroit_relocate": (
+        "exp_local/adroit_fm_transformer_202606211318_bs1024_"
+        "adroit_fm_transformer/relocate/replay"
+    ),
+    "bigym_move_plate": (
+        "exp_local/bigym_move_plate_dp_transformer_trainable_lang_ddpm_"
+        "500e_gpu2_20260526_161755/replay"
+    ),
     "pusht_lerobot_agent_pos": "hf://lerobot/pusht",
-    "pusht_expert_zarr": "third_party_datasets/diffusion_policy/pusht/pusht_cchi_v7_replay.zarr",
+    "pusht_expert_zarr": (
+        "third_party_datasets/diffusion_policy/pusht/pusht_cchi_v7_replay.zarr"
+    ),
 }
 
 
@@ -42,18 +62,42 @@ class Episode:
 
 
 class DynamicsMLP(nn.Module):
-    def __init__(self, in_dim: int, out_dim: int, hidden_dim: int):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(in_dim, hidden_dim),
-            nn.SiLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.SiLU(),
-            nn.Linear(hidden_dim, out_dim),
-        )
+    out_dim: int
+    hidden_dim: int
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.net(x)
+    @nn.compact
+    def __call__(self, x: jax.Array) -> jax.Array:
+        x = nn.Dense(self.hidden_dim)(x)
+        x = jax.nn.silu(x)
+        x = nn.Dense(self.hidden_dim)(x)
+        x = jax.nn.silu(x)
+        return nn.Dense(self.out_dim)(x)
+
+
+@dataclass
+class TrainedDynamicsModel:
+    module: DynamicsMLP
+    params: Any
+    device: jax.Device
+    apply_fn: Any
+
+
+def resolve_jax_device(device: str) -> jax.Device:
+    requested = str(device).lower()
+    platform = "gpu" if requested in {"cuda", "gpu"} else requested
+    if platform not in {"cpu", "gpu", "tpu"}:
+        raise ValueError("--device must be one of cpu, gpu, or cuda.")
+    try:
+        return jax.devices(platform)[0]
+    except RuntimeError as exc:
+        raise RuntimeError(f"Requested JAX device {device!r} is unavailable.") from exc
+
+
+def default_jax_device_name() -> str:
+    try:
+        return "gpu" if jax.devices("gpu") else "cpu"
+    except RuntimeError:
+        return "cpu"
 
 
 def load_episodes(replay_dir: Path, max_episodes: int | None) -> list[Episode]:
@@ -81,8 +125,12 @@ def load_episodes(replay_dir: Path, max_episodes: int | None) -> list[Episode]:
 
 
 def find_hf_snapshot(repo_id: str) -> Path | None:
-    repo_cache = Path.home() / ".cache" / "huggingface" / "hub" / (
-        "datasets--" + repo_id.replace("/", "--")
+    repo_cache = (
+        Path.home()
+        / ".cache"
+        / "huggingface"
+        / "hub"
+        / ("datasets--" + repo_id.replace("/", "--"))
     )
     ref_path = repo_cache / "refs" / "main"
     if ref_path.exists():
@@ -90,7 +138,9 @@ def find_hf_snapshot(repo_id: str) -> Path | None:
         snapshot = repo_cache / "snapshots" / revision
         if snapshot.exists():
             return snapshot
-    snapshots = sorted((repo_cache / "snapshots").glob("*")) if repo_cache.exists() else []
+    snapshots = (
+        sorted((repo_cache / "snapshots").glob("*")) if repo_cache.exists() else []
+    )
     return snapshots[-1] if snapshots else None
 
 
@@ -162,7 +212,9 @@ def load_zarr_episodes(dataset_root: Path, max_episodes: int | None) -> list[Epi
     return episodes
 
 
-def load_task_episodes(source: str, max_episodes: int | None) -> tuple[list[Episode], str]:
+def load_task_episodes(
+    source: str, max_episodes: int | None
+) -> tuple[list[Episode], str]:
     if source == "hf://lerobot/pusht":
         dataset_root = find_hf_snapshot("lerobot/pusht")
         if dataset_root is None:
@@ -200,7 +252,9 @@ def split_episodes(
     return train, test
 
 
-def transitions_from_episodes(episodes: list[Episode]) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+def transitions_from_episodes(
+    episodes: list[Episode],
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     states = []
     actions = []
     next_states = []
@@ -214,7 +268,9 @@ def transitions_from_episodes(episodes: list[Episode]) -> tuple[np.ndarray, np.n
     return s, a, ns
 
 
-def sample_rows(*arrays: np.ndarray, max_rows: int | None, seed: int) -> tuple[np.ndarray, ...]:
+def sample_rows(
+    *arrays: np.ndarray, max_rows: int | None, seed: int
+) -> tuple[np.ndarray, ...]:
     if max_rows is None or len(arrays[0]) <= max_rows:
         return arrays
     rng = np.random.default_rng(seed)
@@ -244,15 +300,38 @@ def train_model(
     lr: float,
     device: str,
     seed: int,
-) -> tuple[DynamicsMLP, dict[str, float]]:
-    torch.manual_seed(seed)
-    model = DynamicsMLP(x_train.shape[1], y_train.shape[1], hidden_dim).to(device)
-    opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
-    x_t = torch.from_numpy(x_train).float()
-    y_t = torch.from_numpy(y_train).float()
-    x_v = torch.from_numpy(x_val).float().to(device)
-    y_v = torch.from_numpy(y_val).float().to(device)
-    best_state = None
+) -> tuple[TrainedDynamicsModel, dict[str, float]]:
+    jax_device = resolve_jax_device(device)
+    model = DynamicsMLP(out_dim=y_train.shape[1], hidden_dim=hidden_dim)
+    with jax.default_device(jax_device):
+        params = model.init(
+            jax.random.PRNGKey(seed),
+            jnp.zeros((1, x_train.shape[1]), dtype=jnp.float32),
+        )["params"]
+        optimizer = optax.adamw(lr, weight_decay=1e-4)
+        opt_state = optimizer.init(params)
+
+    @jax.jit
+    def train_step(current_params, current_opt_state, xb, yb):
+        def loss_fn(candidate_params):
+            prediction = model.apply({"params": candidate_params}, xb)
+            return jnp.mean(jnp.square(prediction - yb))
+
+        loss, grads = jax.value_and_grad(loss_fn)(current_params)
+        updates, next_opt_state = optimizer.update(
+            grads, current_opt_state, current_params
+        )
+        next_params = optax.apply_updates(current_params, updates)
+        return next_params, next_opt_state, loss
+
+    @jax.jit
+    def eval_loss(current_params, xb, yb):
+        prediction = model.apply({"params": current_params}, xb)
+        return jnp.mean(jnp.square(prediction - yb))
+
+    x_v = jax.device_put(x_val, jax_device)
+    y_v = jax.device_put(y_val, jax_device)
+    best_params = None
     best_val = math.inf
     final_train = math.inf
     final_val = math.inf
@@ -261,46 +340,46 @@ def train_model(
     for _epoch in range(epochs):
         train_losses = []
         order = rng.permutation(len(x_train))
-        model.train()
         for start in range(0, len(order), batch_size):
             idx = order[start : start + batch_size]
-            xb = x_t[idx].to(device)
-            yb = y_t[idx].to(device)
-            pred = model(xb)
-            loss = torch.mean((pred - yb) ** 2)
-            opt.zero_grad(set_to_none=True)
-            loss.backward()
-            opt.step()
-            train_losses.append(float(loss.detach().cpu()))
-        model.eval()
-        with torch.no_grad():
-            val = torch.mean((model(x_v) - y_v) ** 2).item()
+            xb = jax.device_put(x_train[idx], jax_device)
+            yb = jax.device_put(y_train[idx], jax_device)
+            params, opt_state, loss = train_step(params, opt_state, xb, yb)
+            train_losses.append(float(jax.device_get(loss)))
+        val = float(jax.device_get(eval_loss(params, x_v, y_v)))
         final_train = float(np.mean(train_losses))
         final_val = float(val)
         if val < best_val:
             best_val = val
-            best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
-    if best_state is not None:
-        model.load_state_dict(best_state)
-    model.eval()
-    return model, {
+            best_params = params
+    if best_params is not None:
+        params = best_params
+    apply_fn = jax.jit(
+        lambda current_params, xb: model.apply({"params": current_params}, xb)
+    )
+    return TrainedDynamicsModel(model, params, jax_device, apply_fn), {
         "best_val_mse": float(best_val),
         "final_train_mse": float(final_train),
         "final_val_mse": float(final_val),
     }
 
 
-def predict(model: DynamicsMLP, x: np.ndarray, device: str, batch_size: int) -> np.ndarray:
+def predict(
+    model: TrainedDynamicsModel,
+    x: np.ndarray,
+    device: str,
+    batch_size: int,
+) -> np.ndarray:
+    del device
     outs = []
-    with torch.no_grad():
-        for start in range(0, len(x), batch_size):
-            xb = torch.from_numpy(x[start : start + batch_size]).float().to(device)
-            outs.append(model(xb).cpu().numpy())
+    for start in range(0, len(x), batch_size):
+        xb = jax.device_put(x[start : start + batch_size], model.device)
+        outs.append(np.asarray(jax.device_get(model.apply_fn(model.params, xb))))
     return np.concatenate(outs, axis=0)
 
 
 def eval_rollout(
-    model: DynamicsMLP,
+    model: TrainedDynamicsModel,
     episodes: list[Episode],
     *,
     horizons: list[int],
@@ -348,8 +427,12 @@ def eval_rollout(
             "rollout_state_z_rmse": model_rmse,
             "persistence_state_z_rmse": persist_rmse,
             "mean_delta_state_z_rmse": mean_delta_rmse,
-            "rollout_vs_persistence": model_rmse / persist_rmse if persist_rmse > 0 else math.nan,
-            "rollout_vs_mean_delta": model_rmse / mean_delta_rmse if mean_delta_rmse > 0 else math.nan,
+            "rollout_vs_persistence": model_rmse / persist_rmse
+            if persist_rmse > 0
+            else math.nan,
+            "rollout_vs_mean_delta": model_rmse / mean_delta_rmse
+            if mean_delta_rmse > 0
+            else math.nan,
             "windows": int(len(init_states_arr)),
         }
     return results
@@ -471,7 +554,9 @@ def write_outputs(results: list[dict[str, object]], out_dir: Path) -> None:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--task", action="append", default=[], help="name=path replay dir")
+    parser.add_argument(
+        "--task", action="append", default=[], help="name=path replay dir"
+    )
     parser.add_argument("--no-default-tasks", action="store_true")
     parser.add_argument("--out-dir", default="exp_local/dynamics_predictability_probe")
     parser.add_argument("--max-episodes", type=int, default=1200)
@@ -485,7 +570,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=2048)
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    parser.add_argument("--device", default=default_jax_device_name())
     return parser.parse_args()
 
 

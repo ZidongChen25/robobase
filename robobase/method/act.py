@@ -18,6 +18,7 @@ from robobase.method.bc import BCEncoderModelSpec, BCViewFusionModelSpec
 from robobase.method.bc_runtime import bc_observation_layout
 from robobase.method.jax_base import JaxMethodBase
 from robobase.models.act import ACTImageProjection, JaxACTPolicy
+from robobase.models.camera_augmentation import augment_campose_observation
 from robobase.models.encoder import JaxResNetEncoder
 from robobase.replay_buffer.replay_buffer import ReplayBuffer
 
@@ -40,6 +41,15 @@ class ACTActorModelSpec:
     data_augmentation: bool = True
     use_lang_cond: bool = False
     lang_feature_dim: int = 512
+    image_position_embedding_type: str = "sincos_legacy"
+    image_augmentation_type: str = "legacy"
+    use_camera_extrinsics: bool = False
+    num_camera_extrinsics: int = 2
+    image_position_max_tokens: int | None = None
+    proprio_dropout_prob: float = 0.0
+    proprio_projection_type: str = "legacy_mlp"
+    style_cls_type: str = "learned"
+    decoder_output_layer: str = "final"
 
 
 @dataclass(frozen=True)
@@ -122,6 +132,30 @@ def act_model_spec_from_cfg(cfg: DictConfig) -> ACTModelSpec:
                 method_cfg.get("lang_feature_dim", 512),
             )
         ),
+        image_position_embedding_type=str(
+            actor_model_cfg.get(
+                "image_position_embedding_type",
+                "sincos_legacy",
+            )
+        ).lower(),
+        image_augmentation_type=str(
+            actor_model_cfg.get("image_augmentation_type", "legacy")
+        ).lower(),
+        use_camera_extrinsics=bool(actor_model_cfg.get("use_camera_extrinsics", False)),
+        num_camera_extrinsics=int(actor_model_cfg.get("num_camera_extrinsics", 2)),
+        image_position_max_tokens=(
+            None
+            if actor_model_cfg.get("image_position_max_tokens", None) is None
+            else int(actor_model_cfg.get("image_position_max_tokens"))
+        ),
+        proprio_dropout_prob=float(actor_model_cfg.get("proprio_dropout_prob", 0.0)),
+        proprio_projection_type=str(
+            actor_model_cfg.get("proprio_projection_type", "legacy_mlp")
+        ).lower(),
+        style_cls_type=str(actor_model_cfg.get("style_cls_type", "learned")).lower(),
+        decoder_output_layer=str(
+            actor_model_cfg.get("decoder_output_layer", "final")
+        ).lower(),
     )
 
     encoder_model_cfg = method_cfg.get("encoder_model", None)
@@ -145,6 +179,10 @@ def act_model_spec_from_cfg(cfg: DictConfig) -> ACTModelSpec:
             ),
             trainable=bool(encoder_model_cfg.get("trainable", True)),
             pretrained=bool(encoder_model_cfg.get("pretrained", True)),
+            pretrained_weights_path=encoder_model_cfg.get(
+                "pretrained_weights_path",
+                None,
+            ),
             use_plucker=bool(encoder_model_cfg.get("use_plucker", False)),
             plucker_hidden_channels=int(
                 encoder_model_cfg.get("plucker_hidden_channels", 64)
@@ -152,6 +190,7 @@ def act_model_spec_from_cfg(cfg: DictConfig) -> ACTModelSpec:
             plucker_identity_init=bool(
                 encoder_model_cfg.get("plucker_identity_init", False)
             ),
+            plucker_fusion_mode=encoder_model_cfg.get("plucker_fusion_mode", None),
         )
 
     view_fusion_model_cfg = method_cfg.get("view_fusion_model", None)
@@ -217,13 +256,18 @@ def _build_model(
     observation_space: spaces.Dict,
     action_space: spaces.Box,
     encoder_jit: bool,
+    encoder_seed: int = 0,
 ) -> _BuiltACTModel:
     obs_layout = bc_observation_layout(observation_space)
     actor_spec = model_spec.actor_model
     if actor_spec.type != "transformer":
-        raise NotImplementedError(f"Unsupported ACT actor model type '{actor_spec.type}'.")
+        raise NotImplementedError(
+            f"Unsupported ACT actor model type '{actor_spec.type}'."
+        )
     if actor_spec.num_queries != int(action_space.shape[0]):
-        raise ValueError("ACT actor_model.num_queries must match action_space sequence length.")
+        raise ValueError(
+            "ACT actor_model.num_queries must match action_space sequence length."
+        )
 
     encoder_model = None
     image_projection_model = None
@@ -242,7 +286,10 @@ def _build_model(
             )
         if obs_layout.rgb_input_shape is None:
             raise ValueError("Pixel ACT expected a valid RGB input shape.")
-        if model_spec.encoder_model.use_plucker and not obs_layout.has_camera_conditioning:
+        if (
+            model_spec.encoder_model.use_plucker
+            and not obs_layout.has_camera_conditioning
+        ):
             raise ValueError(
                 "ACT encoder_model.use_plucker=true requires raymap or camera "
                 "parameter observations paired with every RGB observation."
@@ -252,16 +299,28 @@ def _build_model(
             model=model_spec.encoder_model.model,
             jit=encoder_jit,
             pretrained=model_spec.encoder_model.pretrained,
+            pretrained_weights_path=(
+                model_spec.encoder_model.pretrained_weights_path
+            ),
             resize_to_224=False,
             use_plucker=model_spec.encoder_model.use_plucker,
+            plucker_fusion_mode=model_spec.encoder_model.plucker_fusion_mode,
             plucker_hidden_channels=model_spec.encoder_model.plucker_hidden_channels,
             plucker_identity_init=model_spec.encoder_model.plucker_identity_init,
             use_film=actor_spec.use_lang_cond,
             film_task_input_dim=actor_spec.lang_feature_dim,
             film_task_hidden_dim=actor_spec.hidden_dim,
+            seed=encoder_seed,
         )
-        image_projection_model = ACTImageProjection(hidden_dim=actor_spec.hidden_dim)
-    elif model_spec.encoder_model is not None and model_spec.encoder_model.type != "resnet":
+        image_projection_model = ACTImageProjection(
+            hidden_dim=actor_spec.hidden_dim,
+            position_embedding_type=actor_spec.image_position_embedding_type,
+            max_position_tokens=actor_spec.image_position_max_tokens,
+        )
+    elif (
+        model_spec.encoder_model is not None
+        and model_spec.encoder_model.type != "resnet"
+    ):
         raise NotImplementedError(
             f"Unsupported ACT encoder model type '{model_spec.encoder_model.type}'."
         )
@@ -280,6 +339,12 @@ def _build_model(
             num_queries=actor_spec.num_queries,
             latent_dim=actor_spec.latent_dim,
             use_lang_cond=actor_spec.use_lang_cond,
+            use_camera_extrinsics=actor_spec.use_camera_extrinsics,
+            num_camera_extrinsics=actor_spec.num_camera_extrinsics,
+            proprio_dropout_prob=actor_spec.proprio_dropout_prob,
+            proprio_projection_type=actor_spec.proprio_projection_type,
+            style_cls_type=actor_spec.style_cls_type,
+            decoder_output_layer=actor_spec.decoder_output_layer,
         ),
         encoder_model=encoder_model,
         image_projection_model=image_projection_model,
@@ -291,6 +356,11 @@ def _optimizer_labels(params):
         keys = [getattr(item, "key", item) for item in path]
         if not keys or keys[0] != "encoder":
             return "main"
+        # CamPose ACT builds its ResNet with FrozenBatchNorm2d. Flax stores the
+        # equivalent affine values in the params collection, so keep those
+        # leaves in the checkpoint tree but exclude them from AdamW updates.
+        if any(str(key) == "BatchNorm_0" for key in keys):
+            return "frozen"
         if len(keys) == 1:
             return "backbone"
         second = str(keys[1])
@@ -320,6 +390,31 @@ def _identity_camera_param_batch(
         prefix = shape[:-2] or (1,)
         values.append(jnp.broadcast_to(eye, (1, *prefix, size, size)))
     return jnp.stack(values, axis=1)
+
+
+def _normalize_camera_extrinsics(
+    camera_extrinsics: jnp.ndarray,
+    *,
+    num_camera_extrinsics: int,
+) -> jnp.ndarray:
+    camera_extrinsics = camera_extrinsics.astype(jnp.float32)
+    if camera_extrinsics.ndim == 5:
+        # Direct observations may retain a leading frame-stack dimension.
+        camera_extrinsics = camera_extrinsics[:, -1]
+    if camera_extrinsics.ndim != 4 or camera_extrinsics.shape[-2:] != (4, 4):
+        raise ValueError(
+            "camera_extrinsics must have shape (batch, cameras, 4, 4) or "
+            "(batch, time, cameras, 4, 4); got "
+            f"{camera_extrinsics.shape}."
+        )
+    camera_extrinsics = camera_extrinsics[:, :num_camera_extrinsics]
+    missing = int(num_camera_extrinsics) - int(camera_extrinsics.shape[1])
+    if missing > 0:
+        camera_extrinsics = jnp.pad(
+            camera_extrinsics,
+            ((0, 0), (0, missing), (0, 0), (0, 0)),
+        )
+    return camera_extrinsics
 
 
 def _gaussian_kernel1d(sigma: float, radius: int) -> jnp.ndarray:
@@ -516,6 +611,59 @@ class ACT(JaxMethodBase):
         self.actor_spec = model.actor_model
         self.lr_backbone = float(lr if lr_backbone is None else lr_backbone)
         self.data_augmentation = bool(self.actor_spec.data_augmentation)
+        self.image_augmentation_type = str(
+            self.actor_spec.image_augmentation_type
+        ).lower()
+        if self.image_augmentation_type not in {"legacy", "campose_crop"}:
+            raise ValueError(
+                "actor_model.image_augmentation_type must be 'legacy' or "
+                f"'campose_crop', got {self.actor_spec.image_augmentation_type!r}."
+            )
+        self.use_camera_extrinsics = bool(self.actor_spec.use_camera_extrinsics)
+        self.num_camera_extrinsics = int(self.actor_spec.num_camera_extrinsics)
+        if self.num_camera_extrinsics < 1:
+            raise ValueError("actor_model.num_camera_extrinsics must be >= 1.")
+        if (
+            self.actor_spec.image_position_max_tokens is not None
+            and int(self.actor_spec.image_position_max_tokens) < 1
+        ):
+            raise ValueError("actor_model.image_position_max_tokens must be >= 1.")
+        if not 0.0 <= float(self.actor_spec.proprio_dropout_prob) <= 1.0:
+            raise ValueError(
+                "actor_model.proprio_dropout_prob must be between 0 and 1."
+            )
+        if self.actor_spec.proprio_projection_type not in {
+            "legacy_mlp",
+            "campose_single",
+        }:
+            raise ValueError(
+                "actor_model.proprio_projection_type must be 'legacy_mlp' or "
+                f"'campose_single', got {self.actor_spec.proprio_projection_type!r}."
+            )
+        if self.actor_spec.style_cls_type not in {"learned", "zero"}:
+            raise ValueError(
+                "actor_model.style_cls_type must be 'learned' or 'zero', got "
+                f"{self.actor_spec.style_cls_type!r}."
+            )
+        if self.actor_spec.decoder_output_layer not in {"final", "first"}:
+            raise ValueError(
+                "actor_model.decoder_output_layer must be 'final' or 'first', got "
+                f"{self.actor_spec.decoder_output_layer!r}."
+            )
+        self._uses_plucker = bool(
+            model.encoder_model is not None and model.encoder_model.use_plucker
+        )
+
+        def campose_augmentation(obs_inputs, rng_key):
+            return augment_campose_observation(
+                obs_inputs,
+                rng_key,
+                require_raymap=self._uses_plucker,
+            )
+
+        self._campose_augmentation = (
+            jax.jit(campose_augmentation) if self._jit_enabled else campose_augmentation
+        )
         self.use_lang_cond = bool(self.actor_spec.use_lang_cond)
         self.gripper_dims = int(self.actor_spec.gripper_dims)
         if self.gripper_dims < 0 or self.gripper_dims > self.action_dim:
@@ -557,6 +705,7 @@ class ACT(JaxMethodBase):
             observation_space=observation_space,
             action_space=action_space,
             encoder_jit=jit,
+            encoder_seed=seed,
         )
         self.actor_model = built_model.actor_model
         self.encoder = built_model.encoder_model
@@ -640,6 +789,14 @@ class ACT(JaxMethodBase):
             dtype=jnp.float32,
         )
         dummy_is_pad = jnp.zeros((1, self.action_sequence), dtype=jnp.bool_)
+        dummy_camera_extrinsics = (
+            jnp.zeros(
+                (1, self.num_camera_extrinsics, 4, 4),
+                dtype=jnp.float32,
+            )
+            if self.use_camera_extrinsics
+            else None
+        )
         params["actor"] = self.actor_model.init(
             {"params": actor_key, "dropout": dropout_key},
             image_features,
@@ -648,6 +805,7 @@ class ACT(JaxMethodBase):
             actions=dummy_actions,
             is_pad=dummy_is_pad,
             task_emb=dummy_task_emb,
+            camera_extrinsics=dummy_camera_extrinsics,
             deterministic=False,
             latent_key=latent_key,
         )
@@ -662,7 +820,10 @@ class ACT(JaxMethodBase):
         transforms = []
         if actor_grad_clip is not None:
             transforms.append(self.optax.clip_by_global_norm(float(actor_grad_clip)))
-        if self._trainable_encoder and self.lr_backbone != float(lr):
+        if self._trainable_encoder:
+            backbone_learning_rate = (
+                learning_rate if self.lr_backbone == float(lr) else self.lr_backbone
+            )
             transforms.append(
                 self.optax.multi_transform(
                     {
@@ -671,15 +832,18 @@ class ACT(JaxMethodBase):
                             weight_decay=float(weight_decay),
                         ),
                         "backbone": self.optax.adamw(
-                            self.lr_backbone,
+                            backbone_learning_rate,
                             weight_decay=float(weight_decay),
                         ),
+                        "frozen": self.optax.set_to_zero(),
                     },
                     _optimizer_labels,
                 )
             )
         else:
-            transforms.append(self.optax.adamw(learning_rate, weight_decay=float(weight_decay)))
+            transforms.append(
+                self.optax.adamw(learning_rate, weight_decay=float(weight_decay))
+            )
         self.optimizer = self.optax.chain(*transforms)
         self.opt_state = self.optimizer.init(self.params)
 
@@ -748,6 +912,25 @@ class ACT(JaxMethodBase):
                 inputs["camera_c2w"] = camera_c2w_obs
         if self.use_lang_cond:
             inputs["lang"] = self._extract_lang_features(batch_or_obs)
+        if self.use_camera_extrinsics:
+            direct_extrinsics = None
+            for key in ("camera_extrinsics", "cam_extrinsics"):
+                if key in batch_or_obs:
+                    direct_extrinsics = self._as_jax_array(
+                        batch_or_obs[key], self.jnp.float32
+                    )
+                    break
+            if direct_extrinsics is None and "camera_c2w" in inputs:
+                direct_extrinsics = inputs["camera_c2w"][:, :, -1]
+            if direct_extrinsics is None:
+                batch_size = self._batch_size_from_inputs(inputs)
+                direct_extrinsics = self.jnp.zeros(
+                    (batch_size, 0, 4, 4), dtype=self.jnp.float32
+                )
+            inputs["camera_extrinsics"] = _normalize_camera_extrinsics(
+                direct_extrinsics,
+                num_camera_extrinsics=self.num_camera_extrinsics,
+            )
         return inputs
 
     def _batch_size_from_inputs(self, obs_inputs: dict) -> int:
@@ -759,7 +942,9 @@ class ACT(JaxMethodBase):
         batch_size = self._batch_size_from_inputs(obs_inputs)
         qpos = obs_inputs.get("low_dim", None)
         if qpos is None:
-            qpos = self.jnp.zeros((batch_size, self.low_dim_size), dtype=self.jnp.float32)
+            qpos = self.jnp.zeros(
+                (batch_size, self.low_dim_size), dtype=self.jnp.float32
+            )
 
         image_features = None
         image_pos = None
@@ -787,7 +972,13 @@ class ACT(JaxMethodBase):
                 params["image_projection"],
                 spatial_features,
             )
-        return image_features, image_pos, qpos, task_emb
+        return (
+            image_features,
+            image_pos,
+            qpos,
+            task_emb,
+            obs_inputs.get("camera_extrinsics", None),
+        )
 
     def _augment_rgb(self, rgb: jnp.ndarray, rng_key) -> jnp.ndarray:
         if not self.data_augmentation or rgb.shape[2] != 3:
@@ -901,17 +1092,32 @@ class ACT(JaxMethodBase):
         flat = jnp.clip(flat, 0.0, 255.0)
         return flat.reshape((batch_size, num_views, channels, height, width))
 
+    def _augment_observation_images(self, obs_inputs: dict, rng_key) -> dict:
+        if not self.data_augmentation or "rgb" not in obs_inputs:
+            return obs_inputs
+        if self.image_augmentation_type == "legacy":
+            return {
+                **obs_inputs,
+                "rgb": self._augment_rgb(obs_inputs["rgb"], rng_key),
+            }
+
+        return self._campose_augmentation(obs_inputs, rng_key)
+
     def _predict_impl(self, params, obs_inputs):
-        image_features, image_pos, qpos, task_emb = self._policy_inputs_from_obs(
-            params,
-            obs_inputs,
-        )
+        (
+            image_features,
+            image_pos,
+            qpos,
+            task_emb,
+            camera_extrinsics,
+        ) = self._policy_inputs_from_obs(params, obs_inputs)
         action_pred, _, _ = self.actor_model.apply(
             params["actor"],
             image_features,
             image_pos,
             qpos,
             task_emb=task_emb,
+            camera_extrinsics=camera_extrinsics,
             deterministic=True,
         )
         return action_pred
@@ -961,10 +1167,13 @@ class ACT(JaxMethodBase):
                     )
 
             def loss_fn(current_params):
-                image_features, image_pos, qpos, task_emb = self._policy_inputs_from_obs(
-                    current_params,
-                    obs_inputs,
-                )
+                (
+                    image_features,
+                    image_pos,
+                    qpos,
+                    task_emb,
+                    camera_extrinsics,
+                ) = self._policy_inputs_from_obs(current_params, obs_inputs)
                 action_pred, mu, logvar = self.actor_model.apply(
                     current_params["actor"],
                     image_features,
@@ -973,6 +1182,7 @@ class ACT(JaxMethodBase):
                     actions=actions,
                     is_pad=effective_action_pad_mask,
                     task_emb=task_emb,
+                    camera_extrinsics=camera_extrinsics,
                     deterministic=False,
                     latent_key=latent_key,
                     rngs={"dropout": dropout_key},
@@ -987,7 +1197,8 @@ class ACT(JaxMethodBase):
                 l1_per_sample = jnp.zeros((actions.shape[0],), dtype=actions.dtype)
                 if continuous_dim > 0:
                     l1_values = jnp.abs(
-                        action_pred[..., :continuous_dim] - actions[..., :continuous_dim]
+                        action_pred[..., :continuous_dim]
+                        - actions[..., :continuous_dim]
                     )
                     l1_per_sample = masked_mean_per_sample(l1_values, valid_mask)
 
@@ -997,9 +1208,8 @@ class ACT(JaxMethodBase):
                         action_pred[..., continuous_dim:],
                         actions[..., continuous_dim:],
                     )
-                    gripper_per_sample = (
-                        gripper_loss_weight
-                        * masked_mean_per_sample(gripper_loss, valid_mask)
+                    gripper_per_sample = gripper_loss_weight * masked_mean_per_sample(
+                        gripper_loss, valid_mask
                     )
 
                 behavior_per_sample = l1_per_sample + gripper_per_sample
@@ -1008,9 +1218,7 @@ class ACT(JaxMethodBase):
                 if mu is None or logvar is None:
                     kl_loss = jnp.asarray(0.0, dtype=actions.dtype)
                 else:
-                    kl_loss = -0.5 * (
-                        1.0 + logvar - jnp.square(mu) - jnp.exp(logvar)
-                    )
+                    kl_loss = -0.5 * (1.0 + logvar - jnp.square(mu) - jnp.exp(logvar))
                     kl_loss = kl_loss.sum(axis=-1).mean()
 
                 total_loss = behavior_loss + kl_weight * kl_loss
@@ -1125,14 +1333,17 @@ class ACT(JaxMethodBase):
                     horizon_keys,
                 )
             (
-                new_params,
-                new_opt_state,
-            ), (
-                losses,
-                priorities,
-                l1_losses,
-                gripper_losses,
-                kl_losses,
+                (
+                    new_params,
+                    new_opt_state,
+                ),
+                (
+                    losses,
+                    priorities,
+                    l1_losses,
+                    gripper_losses,
+                    kl_losses,
+                ),
             ) = jax.lax.scan(
                 body_fn,
                 (params, opt_state),
@@ -1175,8 +1386,7 @@ class ACT(JaxMethodBase):
             self.rng_key,
             5,
         )
-        if self.data_augmentation and "rgb" in obs_inputs:
-            obs_inputs = {**obs_inputs, "rgb": self._augment_rgb(obs_inputs["rgb"], aug_key)}
+        obs_inputs = self._augment_observation_images(obs_inputs, aug_key)
         start_time = time.perf_counter()
         (
             self.params,
@@ -1260,8 +1470,7 @@ class ACT(JaxMethodBase):
             actions.append(self._as_jax_array(batch["action"], self.jnp.float32))
             loss_coeffs.append(self._loss_weights(batch))
             obs = self._prepare_trainable_obs_inputs(batch)
-            if self.data_augmentation and "rgb" in obs:
-                obs = {**obs, "rgb": self._augment_rgb(obs["rgb"], aug_keys[update_idx])}
+            obs = self._augment_observation_images(obs, aug_keys[update_idx])
             obs_inputs_list.append(obs)
             action_pad_mask = self._extract_action_pad_mask(batch)
             current_has_mask = action_pad_mask is not None
@@ -1281,9 +1490,7 @@ class ACT(JaxMethodBase):
         actions = self.jnp.stack(actions, axis=0)
         loss_coeffs = self.jnp.stack(loss_coeffs, axis=0)
         action_pad_mask = (
-            self.jnp.stack(action_pad_masks, axis=0)
-            if has_action_pad_mask
-            else None
+            self.jnp.stack(action_pad_masks, axis=0) if has_action_pad_mask else None
         )
 
         start_time = time.perf_counter()

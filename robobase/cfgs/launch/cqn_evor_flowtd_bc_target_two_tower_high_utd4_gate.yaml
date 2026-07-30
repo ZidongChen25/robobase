@@ -1,0 +1,65 @@
+# @package _global_
+
+# EVOR FlowTD adapted to CQN-AS.  The value critic follows EVOR Equations
+# 35/36 with one independently sampled Gaussian interpolant source and the
+# completed offline trajectory return as the paper-valid reward-to-go endpoint
+# z1.  The fixed two-tower CQN-AS BC policy supplies the Bellman next action.
+# MC return is an input to the FlowTD interpolant, not a separate regression
+# loss.  This is otherwise an isolated value-learning arm: BCFM, DCFM, PCBF,
+# endpoint losses, and distillation are all disabled.
+#
+# The adaptation deliberately retains CQN-AS's coarse-to-fine action bins and
+# categorical BC policy rather than reproducing EVOR's flow actor and sampled
+# rejection policy.  Evaluation can enable the integrated value readout and
+# sweeps the BC/value trade-off on validation seeds.
+defaults:
+  - cqn_flow_floq_compute8_two_tower_high_utd4_gate
+  - _self_
+
+method:
+  value_mode: return_sample
+  atom_ce_lambda: 0.0
+  demo_fosd: false
+
+  bcfm_lambda: 0.0
+  dcfm_lambda: 0.0
+  evor_td_lambda: 1.0
+  confidence_weight_temp: null
+  pcbf_loss_coeff: 0.0
+  pcbf_lambda: 0.0
+  endpoint_q_lambda: 0.0
+  source_consistency_lambda: 0.0
+  flow_distill_lambda: 0.0
+  flow_distill_action_readout: false
+  flow_iqn_quantile_coupling: false
+
+  num_flow_steps: 10
+  # EVOR uses one return sample while training and more samples at inference.
+  num_flow_samples: 1
+  num_target_flow_samples: 1
+  num_action_flow_samples: 16
+  flow_source_type: gaussian
+  flow_source_std: 1.0
+  antithetic_flow_sources: false
+  fixed_action_flow_sources: true
+  action_flow_quantile_grid: false
+
+  return_sample_aggregation: entropic
+  return_sample_temperature: 1.0
+  return_sample_truncate_top: 0
+  flow_q_action_readout: false
+
+  scalar_value_embedding: raw
+  time_embedding_type: raw
+  time_scale: 1.0
+  clip_scalar_targets: false
+  clip_flow_trajectory: false
+
+  td_target_action_source: bc_policy
+  td_target_policy_value_beta: null
+  policy_value_beta: null
+  mc_return_weight: 0.0
+
+hydra:
+  run:
+    dir: ./exp_local/cqn_flow_high_utd/bigym_${env.task_name}_evor_flowtd_bc_target_two_tower_utd4_${now:%Y%m%d%H%M%S}

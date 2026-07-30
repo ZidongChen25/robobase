@@ -1,0 +1,19 @@
+# @package _global_
+
+# Value-fidelity Stage III: an independent categorical BC policy controls the
+# robot while a TD-only critic evaluates the effective action actually stored
+# in replay.  This removes demo ranking losses from Q logits and avoids a
+# max-over-Q bootstrap during the diagnostic gate.
+defaults:
+  - cqn_as_pixel_bigym_value_fidelity_gate
+  - _self_
+
+method:
+  separate_bc_policy: true
+  bc_policy_stop_gradient: false
+  td_target_action_source: replay_next
+  critic_sequence_mode: effective_k0
+
+hydra:
+  run:
+    dir: ./exp_local/cqn_value_fidelity_stage3/bigym_${env.task_name}_decoupled_value_${now:%Y%m%d%H%M%S}

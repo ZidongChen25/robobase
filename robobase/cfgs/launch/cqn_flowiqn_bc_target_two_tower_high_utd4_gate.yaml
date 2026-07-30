@@ -1,0 +1,69 @@
+# @package _global_
+
+# Matched anchor-only control for the DBC-inspired FlowIQN gate.  Relative to
+# the corrected FlowIQN screen, this freezes an independent two-tower BC
+# continuation and effective-k0 value target so the critic cannot select its
+# own Bellman action.  It retains the original one-to-one sorted CFM objective.
+defaults:
+  - cqn_flow_floq_compute8_two_tower_high_utd4_gate
+  - _self_
+
+num_train_frames: 10500
+batch_size: 8
+demo_batch_size: 8
+use_self_imitation: false
+
+method:
+  critic_grad_clip: 1.0
+  critic_target_tau: 0.005
+  value_mode: return_sample
+  atom_ce_lambda: 0.0
+  demo_fosd: false
+
+  bcfm_lambda: 1.0
+  dcfm_lambda: 0.0
+  evor_td_lambda: 0.0
+  confidence_weight_temp: null
+  pcbf_loss_coeff: 0.0
+  pcbf_lambda: 0.0
+  quantile_endpoint_lambda: 0.0
+  quantile_huber_kappa: 1.0
+  endpoint_q_lambda: 0.0
+  source_consistency_lambda: 0.0
+  flow_distill_lambda: 0.0
+  flow_distill_action_readout: false
+
+  flow_iqn_quantile_coupling: true
+  flow_source_type: uniform
+  flow_source_min: 0.9
+  flow_source_max: 1.0
+  antithetic_flow_sources: false
+  fixed_action_flow_sources: true
+  action_flow_quantile_grid: true
+  num_flow_steps: 8
+  num_flow_samples: 8
+  num_target_flow_samples: 8
+  # K=8 action ranking exceeded one 32.6-GB card in the corrected screen.
+  # Training therefore keeps K=4; held-out evaluation may override it to 8.
+  num_action_flow_samples: 4
+  return_sample_aggregation: mean
+  return_sample_truncate_top: 0
+  flow_q_action_readout: false
+
+  clip_scalar_targets: true
+  clip_flow_trajectory: true
+  scalar_value_embedding: hl_gauss
+  scalar_embed_bins: 51
+  scalar_embed_sigma: 16.0
+  time_embedding_type: fourier
+  time_embed_dim: 64
+  time_scale: 1.0
+
+  td_target_action_source: bc_policy
+  td_target_policy_value_beta: null
+  policy_value_beta: null
+  mc_return_weight: 0.0
+
+hydra:
+  run:
+    dir: ./exp_local/cqn_flow_high_utd/bigym_${env.task_name}_flowiqn_bc_target_two_tower_utd4_${now:%Y%m%d%H%M%S}

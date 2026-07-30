@@ -1,0 +1,20 @@
+# @package _global_
+
+# Value-fidelity Stage VII: one randomized level-1 action intervention persists
+# for four decisions. A 0.06 start probability gives about 20% active coverage
+# at stationarity: H*p / (1-p+H*p) = 0.203 for H=4.
+defaults:
+  - cqn_as_pixel_bigym_decoupled_value_gate
+  - _self_
+
+method:
+  stddev_schedule: "0.0"
+  structured_exploration_prob: 0.06
+  structured_exploration_level: 1
+  structured_exploration_horizon: 4
+  mc_return_weight: 0.0
+  mc_return_value_only: false
+
+hydra:
+  run:
+    dir: ./exp_local/cqn_value_fidelity_stage7/bigym_${env.task_name}_coherent_${now:%Y%m%d%H%M%S}

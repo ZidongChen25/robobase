@@ -10,8 +10,16 @@ env:
   demo_down_sample_rate: 20
   render_mode: rgb_array
   camera_conditioning: none
+  # Stage-160: append the (normalized) floating-base state to the tail of
+  # low_dim_state so training-time masking can keep it while zeroing the
+  # rest. False keeps the official observation layout.
+  append_floating_base_to_low_dim: false
   enable_all_floating_dof: false
   filter_successful_demos: true
   expected_successful_demos: null
+  # Online BiGym terminates on the first successful step. Historical demos can
+  # continue recording after success and otherwise create repeated rewards in
+  # a different MDP. Keep legacy behavior unless an audit/run opts in.
+  truncate_demo_at_success: false
 
 demos: !!float .inf

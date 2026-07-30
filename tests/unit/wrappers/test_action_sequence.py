@@ -1,4 +1,6 @@
 import pytest
+import numpy as np
+from gymnasium import spaces
 from gymnasium.vector import SyncVectorEnv
 from tests.unit.wrappers.utils import DummyEnv, ACTION_SHAPE
 from robobase.envs.wrappers import ActionSequence, RecedingHorizonControl
@@ -39,6 +41,42 @@ def test_action_sequence_can_step():
         obs, *_, info = env.step(env.action_space.sample())
         assert "action_sequence_mask" in info
         assert info["action_sequence_mask"].shape == (SEQ_LEN,)
+
+
+def test_action_sequence_preserves_each_executed_feedback_state():
+    class FeedbackEnv(DummyEnv):
+        def __init__(self):
+            super().__init__(episode_len=10)
+            obs_spaces = dict(self.observation_space.spaces)
+            obs_spaces["executed_action_feedback"] = spaces.Box(
+                -np.inf, np.inf, shape=ACTION_SHAPE, dtype=np.float32
+            )
+            self.observation_space = spaces.Dict(obs_spaces)
+
+        def _with_feedback(self, observation):
+            observation["executed_action_feedback"] = np.full(
+                ACTION_SHAPE, self._steps, dtype=np.float32
+            )
+            return observation
+
+        def reset(self, *args, **kwargs):
+            observation, info = super().reset(*args, **kwargs)
+            return self._with_feedback(observation), info
+
+        def step(self, action):
+            observation, *rest = super().step(action)
+            return self._with_feedback(observation), *rest
+
+    env = ActionSequence(FeedbackEnv(), sequence_length=3)
+    reset_observation, _ = env.reset()
+    observation, *_ = env.step(env.action_space.sample())
+
+    np.testing.assert_array_equal(
+        reset_observation["executed_action_feedback"], np.zeros((3, 2))
+    )
+    np.testing.assert_array_equal(
+        observation["executed_action_feedback"][:, 0], [1, 2, 3]
+    )
 
 
 def test_action_sequence_can_step_vec_wrapped_env():

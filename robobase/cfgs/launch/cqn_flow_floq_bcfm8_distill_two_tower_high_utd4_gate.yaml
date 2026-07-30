@@ -1,0 +1,18 @@
+# @package _global_
+
+# Single-variable expected-FLOQ fidelity arm.  The official implementation
+# sums velocity MSE over its eight current source samples before adding the
+# one-step distilled-critic loss.  The local loss averages that axis, so
+# bcfm_lambda=8 (the local name for its Bellman-target flow loss) is the exact
+# relative-loss equivalent while leaving all
+# sampling, architecture, targets, and optimizer settings unchanged.
+defaults:
+  - cqn_flow_floq_distill_two_tower_high_utd4_gate
+  - _self_
+
+method:
+  bcfm_lambda: 8.0
+
+hydra:
+  run:
+    dir: ./exp_local/cqn_flow_high_utd/bigym_${env.task_name}_floq_bcfm8_distill_two_tower_utd4_${now:%Y%m%d%H%M%S}

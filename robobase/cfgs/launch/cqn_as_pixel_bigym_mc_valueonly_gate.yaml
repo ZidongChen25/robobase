@@ -1,0 +1,17 @@
+# @package _global_
+
+# Value-fidelity Stage V: use completed-episode return only to calibrate the
+# dueling value stream. The selected centered-advantage logits are detached
+# from this auxiliary loss, removing direct MC gradients to advantage params.
+# Because categorical logits are combined before softmax, causal ranking still
+# has to detect indirect changes through value logits and the shared encoder.
+defaults:
+  - cqn_as_pixel_bigym_mc_return_gate
+  - _self_
+
+method:
+  mc_return_value_only: true
+
+hydra:
+  run:
+    dir: ./exp_local/cqn_value_fidelity_stage5/bigym_${env.task_name}_mc_valueonly_${now:%Y%m%d%H%M%S}

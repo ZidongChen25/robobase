@@ -35,8 +35,17 @@ method:
     gripper_loss_weight: 0.05
     gripper_dims: 0
     data_augmentation: true
+    image_augmentation_type: legacy
+    use_camera_extrinsics: false
+    num_camera_extrinsics: 2
+    image_position_max_tokens: null
+    proprio_dropout_prob: 0.0
+    proprio_projection_type: legacy_mlp
+    style_cls_type: learned
+    decoder_output_layer: final
     use_lang_cond: ${method.use_lang_cond}
     lang_feature_dim: 512
+    image_position_embedding_type: sincos_legacy
 
   encoder_model:
     type: resnet
@@ -44,6 +53,7 @@ method:
     trainable: true
     pretrained: true
     use_plucker: false
+    plucker_fusion_mode: null
     plucker_hidden_channels: 64
     plucker_identity_init: false
 

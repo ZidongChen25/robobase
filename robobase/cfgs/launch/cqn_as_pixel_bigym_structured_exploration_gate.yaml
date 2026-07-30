@@ -1,0 +1,19 @@
+# @package _global_
+
+# Value-fidelity Stage VI: preserve the independent BC plan, then perturb one
+# actually executed action coordinate by one level-1 C2F cell with probability
+# 0.2. This supplies local online action coverage after temporal ensembling.
+defaults:
+  - cqn_as_pixel_bigym_decoupled_value_gate
+  - _self_
+
+method:
+  stddev_schedule: "0.0"
+  structured_exploration_prob: 0.2
+  structured_exploration_level: 1
+  mc_return_weight: 0.0
+  mc_return_value_only: false
+
+hydra:
+  run:
+    dir: ./exp_local/cqn_value_fidelity_stage6/bigym_${env.task_name}_structured_${now:%Y%m%d%H%M%S}

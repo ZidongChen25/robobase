@@ -80,6 +80,10 @@ def rl_model_spec_from_cfg(cfg: DictConfig) -> RLModelSpec:
             model=str(encoder_cfg.get("model", "resnet18")),
             trainable=bool(encoder_cfg.get("trainable", True)),
             pretrained=bool(encoder_cfg.get("pretrained", False)),
+            pretrained_weights_path=encoder_cfg.get(
+                "pretrained_weights_path",
+                None,
+            ),
             use_plucker=bool(encoder_cfg.get("use_plucker", False)),
             plucker_hidden_channels=int(
                 encoder_cfg.get("plucker_hidden_channels", 64)
@@ -87,6 +91,7 @@ def rl_model_spec_from_cfg(cfg: DictConfig) -> RLModelSpec:
             plucker_identity_init=bool(
                 encoder_cfg.get("plucker_identity_init", False)
             ),
+            plucker_fusion_mode=encoder_cfg.get("plucker_fusion_mode", None),
         )
 
     fusion_cfg = method_cfg.get("view_fusion_model", None)
@@ -118,6 +123,8 @@ def rl_model_spec_from_cfg(cfg: DictConfig) -> RLModelSpec:
 def activation(x: jax.Array, name: str) -> jax.Array:
     if name == "relu":
         return nn.relu(x)
+    if name == "gelu":
+        return nn.gelu(x)
     if name in {"silu", "swish"}:
         return nn.silu(x)
     if name == "tanh":
@@ -295,28 +302,32 @@ def next_observation_batch(batch: dict[str, Any], observation_keys) -> dict[str,
     return next_batch
 
 
+def _rl_bc_model_spec(model: RLModelSpec, action_sequence: int) -> BCModelSpec:
+    actor_spec = BCActorModelSpec(
+        type="mlp_bottleneck_sequence",
+        hidden_dims=model.hidden_dims,
+        num_rnn_layers=1,
+        rnn_hidden_size=128,
+        keys_to_bottleneck=(),
+        bottleneck_size=50,
+        norm_after_bottleneck=True,
+        tanh_after_bottleneck=True,
+        output_sequence_network_type="mlp",
+        output_sequence_length=action_sequence,
+    )
+    return BCModelSpec(
+        actor_model=actor_spec,
+        encoder_model=model.encoder_model,
+        view_fusion_model=model.view_fusion_model,
+    )
+
+
 class JaxRLMethodBase(JaxMethodBase):
     """JAX method base with a shared trainable/frozen visual feature adapter."""
 
     def _setup_rl_features(self, model: RLModelSpec, *, seed: int) -> int:
-        actor_spec = BCActorModelSpec(
-            type="mlp_bottleneck_sequence",
-            hidden_dims=model.hidden_dims,
-            num_rnn_layers=1,
-            rnn_hidden_size=128,
-            keys_to_bottleneck=(),
-            bottleneck_size=50,
-            norm_after_bottleneck=True,
-            tanh_after_bottleneck=True,
-            output_sequence_network_type="mlp",
-            output_sequence_length=self.action_sequence,
-        )
         built, input_dim = _build_model(
-            BCModelSpec(
-                actor_model=actor_spec,
-                encoder_model=model.encoder_model,
-                view_fusion_model=model.view_fusion_model,
-            ),
+            _rl_bc_model_spec(model, self.action_sequence),
             observation_space=self.observation_space,
             action_space=self.action_space,
             encoder_jit=self._jit_enabled,
@@ -336,7 +347,25 @@ class JaxRLMethodBase(JaxMethodBase):
             else 0
         )
         self._init_cached_pixel_feature_key(self.__class__.__name__.lower())
-        return int(input_dim) + self._time_feature_dim
+        self._rl_base_feature_dim = int(input_dim)
+        self._rl_feature_dim = int(input_dim) + self._time_feature_dim
+        return self._rl_feature_dim
+
+    def _independent_rl_encoder_params(self, *, seed: int):
+        if not self._trainable_encoder:
+            return None
+        built, input_dim = _build_model(
+            _rl_bc_model_spec(self.model_spec, self.action_sequence),
+            observation_space=self.observation_space,
+            action_space=self.action_space,
+            encoder_jit=self._jit_enabled,
+            encoder_seed=seed,
+        )
+        if int(input_dim) != self._rl_base_feature_dim:
+            raise RuntimeError("Independent RL encoder changed the feature dimension.")
+        if built.encoder_model is None:
+            raise RuntimeError("Trainable RL encoder construction returned no encoder.")
+        return jax.tree.map(jnp.array, built.encoder_model.trainable_params)
 
     @property
     def _encoder_params(self):

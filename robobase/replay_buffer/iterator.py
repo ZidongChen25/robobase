@@ -6,19 +6,12 @@ import queue
 import random
 import threading
 import traceback
+from dataclasses import dataclass
 from typing import Any, Iterator
 
 import numpy as np
 
 from robobase.replay_buffer.replay_buffer import ReplayBuffer
-
-try:
-    import torch as _torch
-    _TORCH_AVAILABLE = True
-except ImportError:
-    _torch = None
-    _TORCH_AVAILABLE = False
-
 
 _REPLAY_WORKER_ID: int | None = None
 
@@ -31,13 +24,7 @@ def set_replay_worker_id(worker_id: int | None):
 def get_replay_worker_id(default: int = 0) -> int:
     if _REPLAY_WORKER_ID is not None:
         return _REPLAY_WORKER_ID
-    try:
-        worker_info = _torch.utils.data.get_worker_info() if _TORCH_AVAILABLE else None
-    except Exception:
-        worker_info = None
-    if worker_info is None:
-        return default
-    return int(worker_info.id)
+    return default
 
 
 class ReplayBatchIterator:
@@ -178,13 +165,7 @@ class EpochReplayBatchIterator(ReplayBatchIterator):
         self._epoch_batches = None
         self._epoch_indices = self._all_indices.copy()
         if self._shuffle:
-            if _TORCH_AVAILABLE:
-                # Match Mobile-GENIMA's epoch replay order, which uses
-                # torch.randperm and therefore advances PyTorch's CPU RNG.
-                order = _torch.randperm(self._epoch_indices.size).cpu().numpy()
-                self._epoch_indices = self._epoch_indices[order]
-            else:
-                self._rng.shuffle(self._epoch_indices)
+            self._rng.shuffle(self._epoch_indices)
         self._cursor = 0
 
     def _build_locality_aware_batches(self) -> list[np.ndarray]:
@@ -232,8 +213,15 @@ class EpochReplayBatchIterator(ReplayBatchIterator):
         return int(np.ceil(self._all_indices.size / self._batch_size))
 
     def __next__(self):
-        batch_indices = self._next_batch_indices()
-        return self._sample_batch_indices(batch_indices)
+        request = self._reserve_batch_request()
+        return self._materialize_batch_request(request)
+
+    def _reserve_batch_request(self) -> np.ndarray:
+        """Reserve the next batch's indices without doing replay I/O."""
+        return self._next_batch_indices()
+
+    def _materialize_batch_request(self, request: np.ndarray):
+        return self._sample_batch_indices(request)
 
     def _next_batch_indices(self) -> np.ndarray:
         with self._cursor_lock:
@@ -258,7 +246,7 @@ class EpochReplayBatchIterator(ReplayBatchIterator):
             else:
                 batch_end = self._epoch_indices.size
 
-        batch_indices = self._epoch_indices[self._cursor:batch_end]
+        batch_indices = self._epoch_indices[self._cursor : batch_end]
         self._cursor = batch_end
         return batch_indices
 
@@ -278,6 +266,31 @@ class _ReplayWorkerError:
     def __init__(self, worker_id: int, traceback_text: str):
         self.worker_id = worker_id
         self.traceback_text = traceback_text
+
+
+@dataclass(frozen=True, slots=True)
+class _PrefetchRequest:
+    sequence_id: int
+    payload: Any
+    deferred: bool
+
+
+@dataclass(frozen=True, slots=True)
+class _PrefetchBatch:
+    sequence_id: int
+    batch: Any
+
+
+@dataclass(frozen=True, slots=True)
+class _PrefetchError:
+    sequence_id: int
+    worker_name: str
+    traceback_text: str
+
+
+@dataclass(frozen=True, slots=True)
+class _PrefetchEnd:
+    sequence_id: int
 
 
 def _replay_worker_loop(
@@ -361,38 +374,6 @@ class MultiProcessReplayBatchIterator(ReplayBatchIterator):
             pass
 
 
-def _numpy_to_torch(value: Any, pin_memory: bool):
-    if not _TORCH_AVAILABLE:
-        raise RuntimeError("torch is required for TorchReplayBatchIterator")
-    if _torch.is_tensor(value):
-        tensor = value
-    elif isinstance(value, np.ndarray):
-        tensor = _torch.from_numpy(value)
-    else:
-        tensor = _torch.as_tensor(value)
-    if pin_memory and tensor.device.type == "cpu":
-        tensor = tensor.pin_memory()
-    return tensor
-
-
-class TorchReplayBatchIterator(ReplayBatchIterator):
-    def __init__(self, replay_iter: Iterator[dict[str, Any]], pin_memory: bool):
-        self._replay_iter = replay_iter
-        self._pin_memory = pin_memory
-
-    def __next__(self):
-        batch = next(self._replay_iter)
-        return {
-            key: _numpy_to_torch(value, pin_memory=self._pin_memory)
-            for key, value in batch.items()
-        }
-
-    def close(self):
-        close = getattr(self._replay_iter, "close", None)
-        if callable(close):
-            close()
-
-
 class PrefetchReplayBatchIterator(ReplayBatchIterator):
     def __init__(
         self,
@@ -404,8 +385,25 @@ class PrefetchReplayBatchIterator(ReplayBatchIterator):
     ):
         self._replay_iter = replay_iter
         self._map_fn = map_fn
-        self._queue = queue.Queue(maxsize=max(2, queue_size))
+        prefetch_capacity = max(2, queue_size)
+        self._queue = queue.Queue(maxsize=prefetch_capacity)
+        self._request_slots = threading.BoundedSemaphore(prefetch_capacity)
         self._stop_event = threading.Event()
+        self._source_lock = threading.Lock()
+        self._source_exhausted = False
+        self._next_request_sequence = 0
+        self._next_output_sequence = 0
+        self._pending_results = {}
+        self._closed = False
+        self._finished = False
+        reserve_batch = getattr(replay_iter, "_reserve_batch_request", None)
+        materialize_batch = getattr(replay_iter, "_materialize_batch_request", None)
+        if callable(reserve_batch) and callable(materialize_batch):
+            self._reserve_batch = reserve_batch
+            self._materialize_batch = materialize_batch
+        else:
+            self._reserve_batch = None
+            self._materialize_batch = None
         self._threads = []
         for worker_idx in range(max(1, int(num_workers))):
             thread = threading.Thread(
@@ -416,41 +414,101 @@ class PrefetchReplayBatchIterator(ReplayBatchIterator):
             thread.start()
             self._threads.append(thread)
 
-    def _prefetch_loop(self, worker_name: str):
-        try:
-            while not self._stop_event.is_set():
+    def _reserve_request(self, worker_name: str):
+        with self._source_lock:
+            if self._source_exhausted:
+                return None
+
+            sequence_id = self._next_request_sequence
+            self._next_request_sequence += 1
+            try:
+                if self._reserve_batch is not None:
+                    payload = self._reserve_batch()
+                    return _PrefetchRequest(sequence_id, payload, deferred=True)
                 batch = next(self._replay_iter)
+                return _PrefetchRequest(sequence_id, batch, deferred=False)
+            except StopIteration:
+                self._source_exhausted = True
+                return _PrefetchEnd(sequence_id)
+            except Exception:
+                self._source_exhausted = True
+                return _PrefetchError(
+                    sequence_id,
+                    worker_name,
+                    traceback.format_exc(),
+                )
+
+    def _put_result(self, result):
+        while not self._stop_event.is_set():
+            try:
+                self._queue.put(result, timeout=0.1)
+                return
+            except queue.Full:
+                continue
+
+    def _acquire_request_slot(self) -> bool:
+        while not self._stop_event.is_set():
+            if self._request_slots.acquire(timeout=0.1):
+                return True
+        return False
+
+    def _prefetch_loop(self, worker_name: str):
+        while not self._stop_event.is_set():
+            if not self._acquire_request_slot():
+                return
+            request = self._reserve_request(worker_name)
+            if request is None:
+                self._request_slots.release()
+                return
+            if isinstance(request, (_PrefetchEnd, _PrefetchError)):
+                self._put_result(request)
+                return
+
+            try:
+                batch = request.payload
+                if request.deferred:
+                    batch = self._materialize_batch(batch)
                 if self._map_fn is not None:
                     batch = self._map_fn(batch)
-                while not self._stop_event.is_set():
-                    try:
-                        self._queue.put(batch, timeout=0.1)
-                        break
-                    except queue.Full:
-                        continue
-        except Exception:
-            if self._stop_event.is_set():
+                result = _PrefetchBatch(request.sequence_id, batch)
+            except Exception:
+                with self._source_lock:
+                    self._source_exhausted = True
+                result = _PrefetchError(
+                    request.sequence_id,
+                    worker_name,
+                    traceback.format_exc(),
+                )
+            self._put_result(result)
+            if isinstance(result, _PrefetchError):
                 return
-            error = _ReplayWorkerError(worker_name, traceback.format_exc())
-            while not self._stop_event.is_set():
-                try:
-                    self._queue.put(error, timeout=0.1)
-                    break
-                except queue.Full:
-                    continue
 
     def __next__(self):
-        item = self._queue.get()
-        if isinstance(item, _ReplayWorkerError):
+        if self._finished or self._closed:
+            raise StopIteration
+
+        while self._next_output_sequence not in self._pending_results:
+            item = self._queue.get()
+            self._pending_results[item.sequence_id] = item
+
+        item = self._pending_results.pop(self._next_output_sequence)
+        self._next_output_sequence += 1
+        self._request_slots.release()
+        if isinstance(item, _PrefetchEnd):
+            self._finished = True
+            self.close()
+            raise StopIteration
+        if isinstance(item, _PrefetchError):
             self.close()
             raise RuntimeError(
-                f"Replay worker {item.worker_id} failed.\n{item.traceback_text}"
+                f"Replay worker {item.worker_name} failed.\n{item.traceback_text}"
             )
-        return item
+        return item.batch
 
     def close(self):
-        if getattr(self, "_stop_event", None) is None:
+        if self._closed:
             return
+        self._closed = True
         self._stop_event.set()
         close = getattr(self._replay_iter, "close", None)
         if callable(close):
@@ -459,7 +517,6 @@ class PrefetchReplayBatchIterator(ReplayBatchIterator):
             if thread.is_alive():
                 thread.join(timeout=1.0)
         self._threads = []
-        self._stop_event = None
 
 
 def create_numpy_replay_iterator(
@@ -471,22 +528,6 @@ def create_numpy_replay_iterator(
         replay_buffer,
         num_workers=num_workers,
         start_method=start_method,
-    )
-
-
-def create_torch_replay_iterator(
-    replay_buffer: ReplayBuffer,
-    *,
-    num_workers: int,
-    pin_memory: bool,
-) -> ReplayBatchIterator:
-    return TorchReplayBatchIterator(
-        create_numpy_replay_iterator(
-            replay_buffer,
-            num_workers=num_workers,
-            start_method="fork",
-        ),
-        pin_memory=pin_memory,
     )
 
 
@@ -522,10 +563,8 @@ def create_epoch_replay_iterator(
     )
 
 
-def normalize_replay_num_workers(
-    backend_name: str, requested_num_workers: int
-) -> int:
-    if backend_name in {"torch", "jax"}:
+def normalize_replay_num_workers(backend_name: str, requested_num_workers: int) -> int:
+    if backend_name == "jax":
         return requested_num_workers
     if requested_num_workers > 0:
         logging.warning(

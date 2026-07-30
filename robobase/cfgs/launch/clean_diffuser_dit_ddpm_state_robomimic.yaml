@@ -1,0 +1,73 @@
+# @package _global_
+# Pure-JAX CleanDiffuser DiT architecture with RoboBase DDPM.
+# The published CleanDiffuser RoboMimic DiT recipe uses EDM, so this launch is
+# intentionally labeled DDPM rather than full recipe parity.
+
+defaults:
+  - ../method: diffusion
+  - ../backbone: clean_diffuser_dit
+
+seed: 0
+demos: .inf
+num_pretrain_steps: 1000000
+num_train_frames: 0
+num_train_envs: 1
+eval_every_steps: 100000
+num_eval_episodes: 50
+num_eval_envs: 10
+batch_size: 256
+save_snapshot: true
+snapshot_every_n: ${eval_every_steps}
+snapshot_save_start_step: 0
+is_imitation_learning: true
+
+pixels: false
+frame_stack: 2
+action_sequence: 10
+action_execution_start: 1
+execution_length: 8
+temporal_ensemble: false
+use_standardization: false
+use_min_max_normalization: true
+min_max_margin: 0.0
+norm_obs: true
+obs_norm_type: min_max
+obs_min_max_constant_value: -1.0
+
+update_every_steps: 1
+env:
+  use_live_env: true
+  filter_key: all
+  abs_action: true
+
+log_eval_video: false
+
+replay:
+  nstep: 1
+  action_sequence_start_offset: 1
+  action_padding: edge
+
+method:
+  lr: 1e-4
+  adaptive_lr: true
+  lr_schedule: cosine
+  num_train_steps: ${num_pretrain_steps}
+  actor_grad_clip: null
+  use_ema: true
+  ema_decay: 0.995
+  ema_decay_schedule: constant
+  weight_decay: 1e-2
+  num_diffusion_iters: 50
+  noise_mask_steps: 0
+  repeat_action: false
+  mask_padded_model_input: false
+  objective:
+    type: ddpm
+    num_diffusion_iters: ${method.num_diffusion_iters}
+    sampler: ddpm
+  encoder_model: null
+  view_fusion_model: null
+
+hydra:
+  run:
+    dir: ./exp_local/clean_diffuser_dit_ddpm_${env.task_name}_${now:%Y%m%d%H%M%S}

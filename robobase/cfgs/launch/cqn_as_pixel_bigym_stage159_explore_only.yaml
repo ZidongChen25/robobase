@@ -1,0 +1,15 @@
+# @package _global_
+
+# Stage-159 arm E (cqn-flow.md 39.5): exploration WITHOUT margin decay.
+# Completes the 2x2 factorial with official (neither), stage158 (both),
+# and the decay-only arm.
+defaults:
+  - cqn_as_pixel_bigym_stage158_explore_100k
+  - _self_
+
+method:
+  bc_lambda_schedule: null
+
+hydra:
+  run:
+    dir: ./exp_local/cqn_stage159_factorial/bigym_${env.task_name}_exponly_${now:%Y%m%d%H%M%S}

@@ -1,0 +1,17 @@
+# @package _global_
+
+# Stage-154 (cqn-flow.md 36): TD-off control for coarse-flow.  Identical to
+# the stage152 CCFF platform except critic_lambda=0 -- the coarse critic is
+# trained by the demo margin alone, no Bellman signal.  Adjudicates whether
+# the sealed +10pp of Stage-152 is an RL effect (TD-off drops) or an
+# imitation/architecture effect (TD-off matches).
+defaults:
+  - cqn_as_pixel_bigym_stage152_coarse_flow_gate
+  - _self_
+
+method:
+  critic_lambda: 0.0
+
+hydra:
+  run:
+    dir: ./exp_local/cqn_stage154_ccff_tdoff/bigym_${env.task_name}_tdoff_${now:%Y%m%d%H%M%S}

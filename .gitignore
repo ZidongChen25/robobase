@@ -86,3 +86,11 @@ RoboMimic/smoke/
 /huggingface/
 /datasets/
 /data/
+reports/cron.log
+reports/.digest_state
+nohup.out
+*.launch.log
+*.watcher.log
+roboverse_data/
+third_party/A2A_Flow_Matching_official/
+third_party/Legato_kinetix_official/

@@ -1,0 +1,45 @@
+# @package _global_
+# Complete offline BiGym launch for the CamPose diffusion-policy modules.
+
+defaults:
+  - ../env: null
+  - ../method: diffusion
+  - ../profile: campose_dp
+  - _self_
+
+seed: 0
+demos: !!float .inf
+num_pretrain_steps: 1000000
+num_pretrain_epochs: null
+num_train_frames: 0
+num_train_envs: 0
+num_eval_episodes: 0
+is_imitation_learning: true
+execution_length: ${action_sequence}
+temporal_ensemble: false
+save_csv: true
+
+env:
+  demo_alignment: reset_prepend
+
+replay:
+  nstep: 1
+  num_workers: 0
+  pin_memory: false
+  epoch_style_sampling: true
+  include_tp1: false
+
+lazy_replay:
+  use: auto
+  observation_timing: pre_action
+  include_tp1: false
+
+backend:
+  replay_prefetch_size: 16
+  fused_update_steps: 8
+  update_block_every_steps: 8
+
+wandb:
+  use: false
+  project: campose_jax
+  name: ${env.task_name}_campose_dp

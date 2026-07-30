@@ -1,0 +1,25 @@
+# @package _global_
+
+# Stage-141: control-variate-adjusted causal RCT on the decoupled MC-anchored
+# platform.  Level-0 coherent interventions (cell 0.4, H=4, start prob 0.060,
+# ~19% active) were viability-piloted on 2026-07-25: success 16/32% at
+# 2.5k/5k, 88.3% of starts at full dose.  Arms differ only in
+# method.cv_rct_weight (0.0 control vs 0.1 treatment) on the same graph.
+defaults:
+  - cqn_as_pixel_bigym_coherent_exploration_gate
+  - _self_
+
+save_csv: true
+
+method:
+  structured_exploration_prob: 0.060
+  structured_exploration_level: 0
+  structured_exploration_horizon: 4
+  mc_return_weight: 0.1
+  cv_rct_weight: 0.0
+  cv_rct_level: 0
+  cv_rct_baseline: target_q
+
+hydra:
+  run:
+    dir: ./exp_local/cqn_stage141_cv_rct/bigym_${env.task_name}_cv_rct_${now:%Y%m%d%H%M%S}

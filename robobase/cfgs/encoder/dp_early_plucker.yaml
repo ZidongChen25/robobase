@@ -1,0 +1,10 @@
+# @package method.encoder_model
+# Official CamPose diffusion-policy Plucker encoder preset.
+type: dp_resnet
+model: resnet18
+pretrained: false
+trainable: true
+use_plucker: true
+plucker_fusion_mode: dp_early
+plucker_hidden_channels: 64
+plucker_identity_init: false

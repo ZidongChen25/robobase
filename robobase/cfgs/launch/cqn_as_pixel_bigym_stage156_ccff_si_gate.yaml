@@ -1,0 +1,15 @@
+# @package _global_
+
+# Stage-156 arm S (cqn-flow.md 38): CCFF + self-imitation.  Successful
+# online rollouts flow back into the demo buffer, so the load-bearing
+# imitation channels (margin + flow CFM) finally consume online data --
+# the channel the three-way decomposition showed TD could not provide.
+defaults:
+  - cqn_as_pixel_bigym_stage152_coarse_flow_gate
+  - _self_
+
+use_self_imitation: true
+
+hydra:
+  run:
+    dir: ./exp_local/cqn_stage156_ccff_si/bigym_${env.task_name}_si_${now:%Y%m%d%H%M%S}

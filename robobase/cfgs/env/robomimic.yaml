@@ -10,5 +10,6 @@ env:
   use_live_env: false
   obs_keys: []
   abs_action: false
+  reward_shift: 0.0  # added to every env/demo reward (official ACFQL uses -1.0)
   cameras: []  # infer cameras from the dataset for image observations
   render_gpu_device_id: -1  # robosuite offscreen renderer device id (-1 lets robosuite choose)

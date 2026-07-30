@@ -14,7 +14,12 @@ from omegaconf import DictConfig
 
 from robobase.method.bc_runtime import bc_actor_input_shapes, bc_observation_layout
 from robobase.method.jax_base import JaxMethodBase
-from robobase.models.encoder import JaxCQNEncoder, JaxResNetEncoder
+from robobase.models.encoder import (
+    JaxCQNEncoder,
+    JaxDPEarlyFusionEncoder,
+    JaxResNetEncoder,
+    normalize_plucker_fusion_mode,
+)
 from robobase.models.fully_connected import JaxMLPWithSequenceOutput
 from robobase.models.fusion import JaxFusionMultiCamFeature
 from robobase.replay_buffer.replay_buffer import ReplayBuffer
@@ -44,9 +49,11 @@ class BCEncoderModelSpec:
     model: str
     trainable: bool = False
     pretrained: bool = True
+    pretrained_weights_path: str | None = None
     use_plucker: bool = False
     plucker_hidden_channels: int = 64
     plucker_identity_init: bool = False
+    plucker_fusion_mode: str | None = None
 
 
 @dataclass(frozen=True)
@@ -119,7 +126,9 @@ def bc_model_spec_from_cfg(cfg: DictConfig) -> BCModelSpec:
         ),
         num_rnn_layers=int(actor_model_cfg.get("num_rnn_layers", 1)),
         rnn_hidden_size=int(actor_model_cfg.get("rnn_hidden_size", 128)),
-        keys_to_bottleneck=tuple(str(v) for v in actor_model_cfg.get("keys_to_bottleneck", ())),
+        keys_to_bottleneck=tuple(
+            str(v) for v in actor_model_cfg.get("keys_to_bottleneck", ())
+        ),
         bottleneck_size=int(actor_model_cfg.get("bottleneck_size", 50)),
         norm_after_bottleneck=bool(actor_model_cfg.get("norm_after_bottleneck", True)),
         tanh_after_bottleneck=bool(actor_model_cfg.get("tanh_after_bottleneck", True)),
@@ -150,6 +159,10 @@ def bc_model_spec_from_cfg(cfg: DictConfig) -> BCModelSpec:
             # snapshots retain the frozen batch statistics they were trained
             # with. Random initialization remains available explicitly.
             pretrained=bool(encoder_model_cfg.get("pretrained", True)),
+            pretrained_weights_path=encoder_model_cfg.get(
+                "pretrained_weights_path",
+                None,
+            ),
             use_plucker=bool(encoder_model_cfg.get("use_plucker", False)),
             plucker_hidden_channels=int(
                 encoder_model_cfg.get("plucker_hidden_channels", 64)
@@ -157,6 +170,7 @@ def bc_model_spec_from_cfg(cfg: DictConfig) -> BCModelSpec:
             plucker_identity_init=bool(
                 encoder_model_cfg.get("plucker_identity_init", False)
             ),
+            plucker_fusion_mode=encoder_model_cfg.get("plucker_fusion_mode", None),
         )
 
     view_fusion_model_cfg = method_cfg.get("view_fusion_model", None)
@@ -203,7 +217,7 @@ def bc_spec_from_cfg(cfg: DictConfig) -> BCSpec:
 @dataclass(frozen=True)
 class _BuiltBCModel:
     actor_model: JaxMLPWithSequenceOutput
-    encoder_model: JaxCQNEncoder | JaxResNetEncoder | None
+    encoder_model: JaxResNetEncoder | JaxDPEarlyFusionEncoder | None
     view_fusion_model: JaxFusionMultiCamFeature | None
 
 
@@ -237,7 +251,7 @@ def _build_model(
     if obs_layout.use_pixels:
         if model_spec.encoder_model is None:
             raise ValueError("Pixel BC requires encoder_model in the model spec.")
-        if model_spec.encoder_model.type not in {"resnet", "cqn"}:
+        if model_spec.encoder_model.type not in {"resnet", "dp_resnet", "cqn"}:
             raise NotImplementedError(
                 f"Unsupported BC encoder model type '{model_spec.encoder_model.type}'."
             )
@@ -259,21 +273,59 @@ def _build_model(
                 raise ValueError("encoder type 'cqn' requires pretrained=false.")
             if model_spec.encoder_model.use_plucker:
                 raise ValueError("encoder type 'cqn' does not support Plucker inputs.")
-            encoder_model = JaxCQNEncoder(
-                input_shape=obs_layout.rgb_input_shape,
-                jit=encoder_jit,
-                seed=encoder_seed,
+            encoder_cls = JaxCQNEncoder
+            plucker_fusion_mode = "none"
+        elif model_spec.encoder_model.type == "dp_resnet":
+            if model_spec.encoder_model.pretrained:
+                raise ValueError("encoder type 'dp_resnet' requires pretrained=false.")
+            if not model_spec.encoder_model.trainable:
+                raise ValueError("encoder type 'dp_resnet' requires trainable=true.")
+            encoder_cls = JaxDPEarlyFusionEncoder
+            expected_fusion_mode = (
+                "dp_early" if model_spec.encoder_model.use_plucker else "none"
             )
+            plucker_fusion_mode = normalize_plucker_fusion_mode(
+                model_spec.encoder_model.plucker_fusion_mode,
+                use_plucker=model_spec.encoder_model.use_plucker,
+            )
+            if plucker_fusion_mode != expected_fusion_mode:
+                raise ValueError(
+                    "encoder type 'dp_resnet' supports only plucker_fusion_mode="
+                    f"'{expected_fusion_mode}', got '{plucker_fusion_mode}'."
+                )
         else:
-            encoder_model = JaxResNetEncoder(
-                input_shape=obs_layout.rgb_input_shape,
+            encoder_cls = JaxResNetEncoder
+            plucker_fusion_mode = normalize_plucker_fusion_mode(
+                model_spec.encoder_model.plucker_fusion_mode,
+                use_plucker=model_spec.encoder_model.use_plucker,
+            )
+            if plucker_fusion_mode == "dp_early":
+                raise ValueError(
+                    "plucker_fusion_mode='dp_early' requires encoder type 'dp_resnet'."
+                )
+        encoder_kwargs = dict(
+            input_shape=obs_layout.rgb_input_shape,
+            jit=encoder_jit,
+            seed=encoder_seed,
+        )
+        if encoder_cls is not JaxCQNEncoder:
+            encoder_kwargs.update(
                 model=model_spec.encoder_model.model,
-                jit=encoder_jit,
                 pretrained=model_spec.encoder_model.pretrained,
                 use_plucker=model_spec.encoder_model.use_plucker,
-                plucker_hidden_channels=model_spec.encoder_model.plucker_hidden_channels,
-                plucker_identity_init=model_spec.encoder_model.plucker_identity_init,
+                plucker_fusion_mode=plucker_fusion_mode,
             )
+        if encoder_cls is JaxResNetEncoder:
+            encoder_kwargs.update(
+                pretrained_weights_path=(
+                    model_spec.encoder_model.pretrained_weights_path
+                ),
+                plucker_hidden_channels=(
+                    model_spec.encoder_model.plucker_hidden_channels
+                ),
+                plucker_identity_init=(model_spec.encoder_model.plucker_identity_init),
+            )
+        encoder_model = encoder_cls(**encoder_kwargs)
         if obs_layout.use_multicam_fusion:
             if model_spec.view_fusion_model is None:
                 raise ValueError(
@@ -288,7 +340,11 @@ def _build_model(
                 input_shape=encoder_model.output_shape,
                 mode=model_spec.view_fusion_model.mode,
             )
-    elif model_spec.encoder_model is not None and model_spec.encoder_model.type not in {"resnet", "cqn"}:
+    elif model_spec.encoder_model is not None and model_spec.encoder_model.type not in {
+        "resnet",
+        "dp_resnet",
+        "cqn",
+    }:
         raise NotImplementedError(
             f"Unsupported BC encoder model type '{model_spec.encoder_model.type}'."
         )
@@ -415,7 +471,8 @@ class BC(JaxMethodBase):
         learning_rate = lr
         if adaptive_lr:
             learning_rate = self.optax.cosine_decay_schedule(
-                init_value=lr, decay_steps=self.num_train_steps,
+                init_value=lr,
+                decay_steps=self.num_train_steps,
             )
         transforms = []
         if actor_grad_clip is not None:
@@ -490,7 +547,9 @@ class BC(JaxMethodBase):
         optimizer = self.optimizer
         optax = self.optax
 
-        def update_fn(params, opt_state, obs_inputs, actions, loss_coeff, action_pad_mask):
+        def update_fn(
+            params, opt_state, obs_inputs, actions, loss_coeff, action_pad_mask
+        ):
             def loss_fn(current_params):
                 obs_features = self._features_from_inputs(current_params, obs_inputs)
                 action_pred = self.actor_model.apply(
@@ -502,7 +561,9 @@ class BC(JaxMethodBase):
                 if action_pad_mask is None:
                     mse_loss = per_token_mse.mean(axis=reduce_dims)
                 else:
-                    valid_mask = jnp.logical_not(action_pad_mask).astype(per_token_mse.dtype)
+                    valid_mask = jnp.logical_not(action_pad_mask).astype(
+                        per_token_mse.dtype
+                    )
                     while valid_mask.ndim < per_token_mse.ndim:
                         valid_mask = valid_mask[..., None]
                     valid_mask = jnp.broadcast_to(valid_mask, per_token_mse.shape)
@@ -516,7 +577,12 @@ class BC(JaxMethodBase):
             new_params = optax.apply_updates(params, updates)
             new_pri = jnp.sqrt(mse_loss + 1e-10)
             max_pri = jnp.max(new_pri)
-            return new_params, new_opt_state, loss, new_pri / jnp.where(max_pri > 0, max_pri, 1.0)
+            return (
+                new_params,
+                new_opt_state,
+                loss,
+                new_pri / jnp.where(max_pri > 0, max_pri, 1.0),
+            )
 
         return update_fn
 

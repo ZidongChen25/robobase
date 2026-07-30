@@ -1,4 +1,4 @@
-from robobase.envs.wrappers.concat_dim import ConcatDim
+from robobase.envs.wrappers.concat_dim import AppendKeysToLowDim, ConcatDim
 from robobase.envs.wrappers.frame_stack import FrameStack
 from robobase.envs.wrappers.onehot_time import OnehotTime
 from robobase.envs.wrappers.rescale_from_tanh import (
@@ -19,8 +19,10 @@ from robobase.envs.wrappers.reward_modifiers import (
     ScaleReward,
     ShapeRewards,
 )
+from robobase.envs.wrappers.raw_proprio_dropout import RawProprioDropout
 
 __all__ = [
+    "AppendKeysToLowDim",
     "ConcatDim",
     "FrameStack",
     "OnehotTime",
@@ -36,4 +38,5 @@ __all__ = [
     "ActionSequence",
     "AppendDemoInfo",
     "RecedingHorizonControl",
+    "RawProprioDropout",
 ]

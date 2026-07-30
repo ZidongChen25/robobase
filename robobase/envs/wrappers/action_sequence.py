@@ -10,6 +10,8 @@ from gymnasium.spaces import Box
 class ActionSequence(gym.ActionWrapper, gym.utils.RecordConstructorArgs):
     """Wrapper for allowing action sequences."""
 
+    _FEEDBACK_KEY = "executed_action_feedback"
+
     def __init__(self, env: gym.Env, sequence_length: int):
         gym.utils.RecordConstructorArgs.__init__(self)
         gym.ActionWrapper.__init__(self, env)
@@ -26,16 +28,74 @@ class ActionSequence(gym.ActionWrapper, gym.utils.RecordConstructorArgs):
             np.expand_dims(high, 0).repeat(sequence_length, 0),
             dtype=self.action_space.dtype,
         )
+        self._feedback_sequence_length = sequence_length
+        self._set_feedback_observation_space()
+
+    def _set_feedback_observation_space(self):
+        if not isinstance(self.observation_space, gym.spaces.Dict):
+            return
+        feedback_space = self.observation_space.spaces.get(self._FEEDBACK_KEY)
+        if feedback_space is None:
+            return
+        action_dim = int(feedback_space.shape[-1])
+        obs_spaces = dict(self.observation_space.spaces)
+        obs_spaces[self._FEEDBACK_KEY] = Box(
+            low=-np.inf,
+            high=np.inf,
+            shape=(self._feedback_sequence_length, action_dim),
+            dtype=np.float32,
+        )
+        self.observation_space = gym.spaces.Dict(obs_spaces)
+
+    def _feedback_value(self, observation):
+        if self._FEEDBACK_KEY not in observation:
+            return None
+        value = np.asarray(observation[self._FEEDBACK_KEY], dtype=np.float32)
+        return value[-1] if value.ndim > 1 else value
+
+    def _attach_feedback_sequence(self, observation, values):
+        current = self._feedback_value(observation)
+        if current is None:
+            return observation
+        values = list(values)
+        if not values:
+            values = [current]
+        sequence = np.asarray(values, dtype=np.float32)
+        if sequence.shape[0] < self._feedback_sequence_length:
+            sequence = np.concatenate(
+                [
+                    sequence,
+                    np.repeat(
+                        sequence[-1:],
+                        self._feedback_sequence_length - sequence.shape[0],
+                        axis=0,
+                    ),
+                ],
+                axis=0,
+            )
+        obs = dict(observation)
+        obs[self._FEEDBACK_KEY] = sequence[: self._feedback_sequence_length]
+        return obs
+
+    def reset(self, **kwargs):
+        observation, info = super().reset(**kwargs)
+        return self._attach_feedback_sequence(observation, ()), info
 
     def _step_sequence(self, action):
         total_reward = np.array(0.0)
         action_idx_reached = 0
+        executed_actions = []
+        feedback_values = []
         if self.is_demo_env:
             demo_actions = np.array(action)
         for i, sub_action in enumerate(action):
             observation, reward, termination, truncation, info = self.env.step(
                 sub_action
             )
+            executed_actions.append(np.asarray(sub_action).copy())
+            feedback = self._feedback_value(observation)
+            if feedback is not None:
+                feedback_values.append(feedback)
             if self.is_demo_env:
                 demo_actions[i] = info.pop("demo_action")
             total_reward += reward
@@ -46,8 +106,10 @@ class ActionSequence(gym.ActionWrapper, gym.utils.RecordConstructorArgs):
         info["action_sequence_mask"] = (
             np.arange(self._sequence_length) < action_idx_reached
         ).astype(int)
+        info["executed_action"] = np.asarray(executed_actions)
         if self.is_demo_env:
             info["demo_action"] = np.array(demo_actions)
+        observation = self._attach_feedback_sequence(observation, feedback_values)
         return observation, total_reward, termination, truncation, info
 
     def step(self, action):
@@ -98,6 +160,8 @@ class RecedingHorizonControl(ActionSequence):
             raise ValueError(
                 "execution_start + execution_length must be <= action sequence length."
             )
+        self._feedback_sequence_length = self._execution_length
+        self._set_feedback_observation_space()
         self._init_action_history()
 
     def _init_action_history(self):
@@ -117,6 +181,13 @@ class RecedingHorizonControl(ActionSequence):
             ],
             dtype=self.action_space.dtype,
         )
+        self._action_history_valid = np.zeros(
+            [
+                self._time_limit,
+                self._time_limit + self._sequence_length,
+            ],
+            dtype=np.bool_,
+        )
         self._cur_step = 0
 
     def reset(
@@ -134,10 +205,15 @@ class RecedingHorizonControl(ActionSequence):
         self._action_history[
             self._cur_step, self._cur_step : self._cur_step + self._sequence_length
         ] = action
+        self._action_history_valid[
+            self._cur_step, self._cur_step : self._cur_step + self._sequence_length
+        ] = True
 
         executable_actions = action[
             self._execution_start : self._execution_start + self._execution_length
         ]
+        executed_actions = []
+        feedback_values = []
         for i, sub_action in enumerate(executable_actions):
             if self._temporal_ensemble and self._sequence_length > 1:
                 # Select all predicted actions for self._cur_step. This will cover the
@@ -145,17 +221,25 @@ class RecedingHorizonControl(ActionSequence):
                 # Note that not all actions in this range will be valid as we might have
                 # execution_length > 1, which skips some of the intermediate steps.
                 cur_actions = self._action_history[:, self._cur_step]
-                indices = np.all(cur_actions != 0, axis=1)
-                cur_actions = cur_actions[indices]
+                valid_indices = np.flatnonzero(
+                    self._action_history_valid[:, self._cur_step]
+                )
+                cur_actions = cur_actions[valid_indices]
 
-                # earlier predicted actions will have smaller weights.
-                exp_weights = np.exp(-self._gain * np.arange(len(cur_actions)))
+                # Weight by prediction age: the current plan has age zero and
+                # therefore receives the largest weight.
+                ages = self._cur_step - valid_indices
+                exp_weights = np.exp(-self._gain * ages)
                 exp_weights = (exp_weights / exp_weights.sum())[:, None]
                 sub_action = (cur_actions * exp_weights).sum(axis=0)
 
             observation, reward, termination, truncation, info = self.env.step(
                 sub_action
             )
+            executed_actions.append(np.asarray(sub_action).copy())
+            feedback = self._feedback_value(observation)
+            if feedback is not None:
+                feedback_values.append(feedback)
             self._cur_step += 1
             if self.is_demo_env:
                 demo_actions[i] = info.pop("demo_action")
@@ -175,8 +259,10 @@ class RecedingHorizonControl(ActionSequence):
         info["action_sequence_mask"] = (
             np.arange(self._sequence_length) < action_idx_reached
         ).astype(int)
+        info["executed_action"] = np.asarray(executed_actions)
         if self.is_demo_env:
             info["demo_action"] = np.array(demo_actions)
+        observation = self._attach_feedback_sequence(observation, feedback_values)
         return (
             observation,
             total_reward,

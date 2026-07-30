@@ -1,0 +1,16 @@
+# @package _global_
+
+# Stage-155 (cqn-flow.md 37): no-selection control for coarse-flow.  The
+# flow models the FULL action chunk (no bin conditioning); the critic is
+# trained exactly as in stage152 but never touches rollout actions.
+# (stage152 CCFF - this arm) isolates the coarse selection mechanism.
+defaults:
+  - cqn_as_pixel_bigym_stage152_coarse_flow_gate
+  - _self_
+
+method:
+  coarse_flow_pure: true
+
+hydra:
+  run:
+    dir: ./exp_local/cqn_stage155_pure_flow/bigym_${env.task_name}_pureflow_${now:%Y%m%d%H%M%S}

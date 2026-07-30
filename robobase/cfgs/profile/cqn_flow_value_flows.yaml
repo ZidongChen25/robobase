@@ -1,0 +1,27 @@
+# @package _global_
+# CQN action-bin conditioning with a genuine scalar return-distribution flow.
+# DCFM supplies the distributional Bellman signal and BCFM anchors the field.
+method:
+  critic_target_tau: 0.005
+  value_mode: return_sample
+  atom_ce_lambda: 0.0
+  demo_fosd: false
+  bcfm_lambda: 1.0
+  dcfm_lambda: 1.0
+  num_flow_steps: 10
+  num_flow_samples: 8
+  num_target_flow_samples: 8
+  num_action_flow_samples: 8
+  flow_source_type: gaussian
+  flow_source_std: 1.0
+  antithetic_flow_sources: true
+  fixed_action_flow_sources: true
+  scalar_value_embedding: raw
+  # Official Value Flows concatenates the scalar forward time directly.
+  time_embedding_type: raw
+  time_embed_dim: 64
+  time_scale: 1.0
+  clip_flow_trajectory: true
+  endpoint_q_lambda: 0.0
+  # Return variance is the modeled quantity, so never suppress source variance.
+  source_consistency_lambda: 0.0

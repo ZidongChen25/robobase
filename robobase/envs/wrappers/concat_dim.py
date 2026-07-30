@@ -17,6 +17,7 @@ class ConcatDim(gym.ObservationWrapper, gym.utils.RecordConstructorArgs):
         norm_obs: bool = False,
         obs_stats: dict = None,
         obs_norm_type: str = "standardization",
+        min_max_constant_value: float = 0.0,
         keys_to_ignore: list[str] = None,
     ):
         """Init.
@@ -41,6 +42,7 @@ class ConcatDim(gym.ObservationWrapper, gym.utils.RecordConstructorArgs):
         self._norm_obs = norm_obs
         self._obs_stats = obs_stats
         self._obs_norm_type = str(obs_norm_type).lower()
+        self._min_max_constant_value = float(min_max_constant_value)
         new_obs_dict = {}
         combined = []
         for k, v in self.observation_space.items():
@@ -73,9 +75,14 @@ class ConcatDim(gym.ObservationWrapper, gym.utils.RecordConstructorArgs):
                         obs_min = self._obs_stats["min"][k]
                         obs_max = self._obs_stats["max"][k]
                         obs_range = obs_max - obs_min
-                        mask = (obs_range != 0).astype(v.dtype, copy=False)
+                        mask = obs_range != 0
                         obs_range = np.where(obs_range == 0, 1.0, obs_range)
-                        v = ((v - obs_min) / obs_range * 2.0 - 1.0) * mask
+                        normalized = (v - obs_min) / obs_range * 2.0 - 1.0
+                        v = np.where(
+                            mask,
+                            normalized,
+                            self._min_max_constant_value,
+                        ).astype(v.dtype, copy=False)
                     else:
                         v = (v - self._obs_stats["mean"][k]) / (
                             self._obs_stats["std"][k] + 1e-10
@@ -113,3 +120,78 @@ class ConcatDim(gym.ObservationWrapper, gym.utils.RecordConstructorArgs):
                     info["final_observation"][fidx], final=True
                 )
         return self.observation(observations), *rest, info
+
+
+class AppendKeysToLowDim(gym.ObservationWrapper, gym.utils.RecordConstructorArgs):
+    """Append raw low-dim keys to the tail of the combined low-dim state.
+
+    Placing the appended keys at the end gives them a fixed, known position
+    inside every stacked frame, which training-time low-dim masking relies
+    on (mask everything except the last ``keep`` dims).
+    """
+
+    def __init__(
+        self,
+        env: gym.Env,
+        keys: list[str],
+        low_dim_key: str = "low_dim_state",
+        norm_obs: bool = False,
+        obs_stats: dict = None,
+        obs_norm_type: str = "min_max",
+    ):
+        gym.utils.RecordConstructorArgs.__init__(self)
+        gym.ObservationWrapper.__init__(self, env)
+        self.is_vector_env = getattr(env, "is_vector_env", False)
+        self._keys = list(keys)
+        self._low_dim_key = low_dim_key
+        self._norm_obs = norm_obs
+        self._obs_stats = obs_stats
+        self._obs_norm_type = str(obs_norm_type).lower()
+        spaces_dict = dict(self.observation_space.items())
+        base = spaces_dict[low_dim_key]
+        lows = [base.low] + [spaces_dict[k].low for k in self._keys]
+        highs = [base.high] + [spaces_dict[k].high for k in self._keys]
+        spaces_dict[low_dim_key] = Box(
+            np.concatenate(lows, -1).astype(np.float32),
+            np.concatenate(highs, -1).astype(np.float32),
+            dtype=np.float32,
+        )
+        self.observation_space = Dict(spaces_dict)
+
+    def _normalize(self, key: str, value: np.ndarray) -> np.ndarray:
+        if (
+            not self._norm_obs
+            or self._obs_stats is None
+            or key not in self._obs_stats["mean"]
+        ):
+            return value
+        if self._obs_norm_type in {"min_max", "minmax"}:
+            obs_min = self._obs_stats["min"][key]
+            obs_max = self._obs_stats["max"][key]
+            obs_range = np.where(obs_max - obs_min == 0, 1.0, obs_max - obs_min)
+            return ((value - obs_min) / obs_range * 2.0 - 1.0).astype(
+                np.float32, copy=False
+            )
+        return (
+            (value - self._obs_stats["mean"][key])
+            / (self._obs_stats["std"][key] + 1e-10)
+        ).astype(np.float32, copy=False)
+
+    def observation(self, observation):
+        observation = dict(observation)
+        parts = [np.asarray(observation[self._low_dim_key], dtype=np.float32)]
+        for key in self._keys:
+            parts.append(
+                self._normalize(key, np.asarray(observation[key], np.float32))
+            )
+        observation[self._low_dim_key] = np.concatenate(parts, axis=-1)
+        return observation
+
+    def step(self, action):
+        observation, reward, terminated, truncated, info = self.env.step(action)
+        if "final_observation" in info:
+            for fidx in np.where(info["_final_observation"])[0]:
+                info["final_observation"][fidx] = self.observation(
+                    info["final_observation"][fidx]
+                )
+        return self.observation(observation), reward, terminated, truncated, info

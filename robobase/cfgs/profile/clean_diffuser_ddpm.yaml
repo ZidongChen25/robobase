@@ -1,0 +1,42 @@
+# @package _global_
+# State-only, parameter-matched CleanDiffuser ChiUNet benchmark profile.
+pixels: false
+frame_stack: 2
+action_sequence: 16
+
+method:
+  lr: 1e-4
+  adaptive_lr: false
+  use_ema: true
+  ema_decay: 0.995
+  ema_decay_schedule: constant
+  weight_decay: 1e-6
+  num_diffusion_iters: 100
+  objective:
+    type: ddpm
+    num_diffusion_iters: ${method.num_diffusion_iters}
+    sampler: ddpm
+  backbone:
+    type: unet1d
+    sequence_length: ${action_sequence}
+    diffusion_step_embed_dim: 256
+    down_dims: [256, 512, 1024]
+    kernel_size: 5
+    n_groups: 8
+    conditioning_mode: global
+    cond_predict_scale: true
+    global_condition_embed_dim: 256
+    timestep_embedding_type: clean_diffuser
+    operator_variant: torch
+    compatibility_mode: clean_diffuser
+    hidden_dims: [256, 256]
+    d_model: 256
+    n_heads: 4
+    num_layers: 8
+    n_cond_layers: 0
+    depth: 12
+    dropout: 0.0
+  encoder_model: null
+
+replay:
+  nstep: 1

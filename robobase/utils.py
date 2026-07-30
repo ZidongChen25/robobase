@@ -1,4 +1,3 @@
-import math
 import random
 import re
 import time
@@ -12,29 +11,21 @@ import numpy as np
 from typing import List, Callable
 from scipy.spatial.transform import Rotation as R
 
-try:
-    import torch
-    import torch.nn as nn
-    import torch.nn.functional as F
-    from torch import distributions as pyd
-    from torch.distributions.utils import _standard_normal
-    from torch.autograd import Variable
-    _TORCH_AVAILABLE = True
-except ImportError:
-    torch = None
-    nn = None
-    F = None
-    pyd = None
-    _standard_normal = None
-    Variable = None
-    _TORCH_AVAILABLE = False
-
 from robobase.envs.env import Demo, DemoEnv
 from robobase.replay_buffer.replay_buffer import ReplayBuffer
 
 
-def _is_torch_tensor(value):
-    return _TORCH_AVAILABLE and torch.is_tensor(value)
+def discounted_episode_returns(rewards, gamma: float) -> np.ndarray:
+    """Compute discounted reward-to-go for one completed episode."""
+
+    rewards = np.asarray(rewards, dtype=np.float32).reshape(-1)
+    returns = np.empty_like(rewards)
+    running_return = np.float32(0.0)
+    gamma = np.float32(gamma)
+    for index in range(len(rewards) - 1, -1, -1):
+        running_return = rewards[index] + gamma * running_return
+        returns[index] = running_return
+    return returns
 
 
 class eval_mode:
@@ -69,63 +60,8 @@ def check_for_kill_input(timeout: int = 0.0001):
 
 
 def set_seed_everywhere(seed):
-    if _TORCH_AVAILABLE:
-        torch.manual_seed(seed)
-        if torch.cuda.is_available():
-            torch.cuda.manual_seed_all(seed)
     np.random.seed(seed)
     random.seed(seed)
-
-
-def soft_update_params(net, target_net, tau, update_second_net=True):
-    for param, target_param in zip(net.parameters(), target_net.parameters()):
-        param_to_update = target_param if update_second_net else param
-        param_to_update.data.copy_(tau * param.data + (1 - tau) * target_param.data)
-
-
-def weight_init(m):
-    if isinstance(m, nn.Linear):
-        nn.init.orthogonal_(m.weight.data)
-        if hasattr(m.bias, "data"):
-            m.bias.data.fill_(0.0)
-    elif isinstance(m, nn.Conv2d) or isinstance(m, nn.ConvTranspose2d):
-        gain = nn.init.calculate_gain("relu")
-        nn.init.orthogonal_(m.weight.data, gain)
-        if hasattr(m.bias, "data"):
-            m.bias.data.fill_(0.0)
-    elif isinstance(m, nn.LayerNorm):
-        m.weight.data.fill_(1.0)
-        if hasattr(m.bias, "data"):
-            m.bias.data.fill_(0.0)
-
-
-def uniform_weight_init(given_scale):
-    def f(m):
-        if isinstance(m, nn.Linear):
-            in_num = m.in_features
-            out_num = m.out_features
-            denoms = (in_num + out_num) / 2.0
-            scale = given_scale / denoms
-            limit = np.sqrt(3 * scale)
-            nn.init.uniform_(m.weight.data, a=-limit, b=limit)
-            if hasattr(m.bias, "data"):
-                m.bias.data.fill_(0.0)
-        elif isinstance(m, nn.Conv2d) or isinstance(m, nn.ConvTranspose2d):
-            space = m.kernel_size[0] * m.kernel_size[1]
-            in_num = space * m.in_channels
-            out_num = space * m.out_channels
-            denoms = (in_num + out_num) / 2.0
-            scale = given_scale / denoms
-            limit = np.sqrt(3 * scale)
-            nn.init.uniform_(m.weight.data, a=-limit, b=limit)
-            if hasattr(m.bias, "data"):
-                m.bias.data.fill_(0.0)
-        elif isinstance(m, nn.LayerNorm):
-            m.weight.data.fill_(1.0)
-            if hasattr(m.bias, "data"):
-                m.bias.data.fill_(0.0)
-
-    return f
 
 
 class Until:
@@ -167,142 +103,6 @@ class Timer:
 
     def total_time(self):
         return time.time() - self._start_time
-
-
-if _TORCH_AVAILABLE:
-    class TanhTransform(pyd.transforms.Transform):
-        domain = pyd.constraints.real
-        codomain = pyd.constraints.interval(-1.0, 1.0)
-        bijective = True
-        sign = +1
-
-        def __init__(self, cache_size=1):
-            super().__init__(cache_size=cache_size)
-
-        @staticmethod
-        def atanh(x):
-            return 0.5 * (x.log1p() - (-x).log1p())
-
-        def __eq__(self, other):
-            return isinstance(other, TanhTransform)
-
-        def _call(self, x):
-            return x.tanh()
-
-        def _inverse(self, y):
-            return self.atanh(y)
-
-        def log_abs_det_jacobian(self, x, y):
-            return 2.0 * (math.log(2.0) - x - F.softplus(-2.0 * x))
-
-    class SquashedNormal(pyd.transformed_distribution.TransformedDistribution):
-        def __init__(self, loc, scale, low=-1.0, high=1.0):
-            self.loc = loc
-            self.scale = scale
-            self.low = low
-            self.high = high
-            self.base_dist = pyd.Normal(loc, scale)
-            transforms = [TanhTransform()]
-            super().__init__(self.base_dist, transforms)
-
-        @property
-        def mean(self):
-            mu = self.loc
-            for tr in self.transforms:
-                mu = tr(mu)
-            return mu
-
-        def _clamp(self, x):
-            return torch.clamp(x, self.low, self.high)
-
-        def sample(self, clip=None):
-            return self._clamp(super().sample())
-
-    class TruncatedNormal(pyd.Normal):
-        def __init__(self, loc, scale, low=-1.0, high=1.0, eps=1e-6):
-            super().__init__(loc, scale, validate_args=False)
-            self.low = low
-            self.high = high
-            self.eps = eps
-
-        def _clamp(self, x):
-            clamped_x = torch.clamp(x, self.low + self.eps, self.high - self.eps)
-            x = x - x.detach() + clamped_x.detach()
-            return x
-
-        def sample(self, clip=None, sample_shape=torch.Size()):
-            shape = self._extended_shape(sample_shape)
-            eps = _standard_normal(shape, dtype=self.loc.dtype, device=self.loc.device)
-            eps *= self.scale
-            if clip is not None:
-                eps = torch.clamp(eps, -clip, clip)
-            x = self.loc + eps
-            return self._clamp(x)
-
-    def onehot_from_logits(logits, eps=0.0):
-        argmax_acs = (logits == logits.max(1, keepdim=True)[0]).float()
-        if eps == 0.0:
-            return argmax_acs
-        rand_acs = Variable(
-            torch.eye(logits.shape[1])[
-                [np.random.choice(range(logits.shape[1]), size=logits.shape[0])]
-            ],
-            requires_grad=False,
-        )
-        return torch.stack(
-            [
-                argmax_acs[i] if r > eps else rand_acs[i]
-                for i, r in enumerate(torch.rand(logits.shape[0]))
-            ]
-        )
-
-    def sample_gumbel(logits, eps=1e-20, tens_type=torch.FloatTensor):
-        U = Variable(torch.zeros_like(logits).uniform_(), requires_grad=False)
-        return -torch.log(-torch.log(U + eps) + eps)
-
-    def gumbel_softmax_sample(logits, temperature):
-        y = logits + sample_gumbel(logits, tens_type=type(logits.data))
-        return F.softmax(y / temperature, dim=-1)
-
-    def gumbel_softmax(logits, temperature=1.0, hard=False):
-        y = gumbel_softmax_sample(logits, temperature)
-        if hard:
-            y_hard = onehot_from_logits(y)
-            y = (y_hard - y).detach() + y
-        return y
-
-    class GumbelSoftmax(pyd.Categorical):
-        @property
-        def mean(self):
-            init_shape = self.logits.shape
-            logits_2d = self.logits.reshape(-1, self._num_events)
-            return onehot_from_logits(logits_2d).view(init_shape)
-
-        def log_prob(self, value):
-            return (self.logits * value).max(-1)[0]
-
-        def sample(self, temp=1.0, hard=True):
-            init_shape = self.logits.shape
-            logits_2d = self.logits.reshape(-1, self._num_events)
-            return gumbel_softmax(logits_2d, temp, hard=hard).view(init_shape)
-
-    def torch_linspace(start, end, steps=10):
-        assert start.size() == end.size()
-        view_size = start.size() + (1,)
-        w_size = (1,) * start.dim() + (steps,)
-        out_size = start.size() + (steps,)
-        start_w = torch.linspace(1, 0, steps=steps).to(start)
-        start_w = start_w.view(w_size).expand(out_size)
-        end_w = torch.linspace(0, 1, steps=steps).to(start)
-        end_w = end_w.view(w_size).expand(out_size)
-        start = start.contiguous().view(view_size).expand(out_size)
-        end = end.contiguous().view(view_size).expand(out_size)
-        return start_w * start + end_w * end
-
-    def soft_argmax(onehot_actions, low, high, bins, alpha=10.0):
-        soft_max = torch.softmax(onehot_actions * alpha, dim=-1)
-        indices_kernel = torch_linspace(low, high, bins)
-        return (soft_max * indices_kernel).sum(-1)
 
 
 def schedule(schdl, step):
@@ -545,6 +345,9 @@ def add_demo_to_replay_buffer(wrapped_env: DemoEnv, replay_buffer: ReplayBuffer)
     term, trunc = False, False
     while not (term or trunc):
         next_obs, rew, term, trunc, next_info = wrapped_env.step(fake_action)
+        # Demo steps can be loaded into both the online and protected demo
+        # buffers. Do not consume the shared source dict on the first pass.
+        next_info = dict(next_info)
         action = next_info.pop("demo_action")
         action_space = wrapped_env.action_space
         if np.all(np.isfinite(action_space.low)) and np.all(
@@ -557,8 +360,41 @@ def add_demo_to_replay_buffer(wrapped_env: DemoEnv, replay_buffer: ReplayBuffer)
         info = next_info
     final_obs, _ = obs, info
 
-    for obs, action, rew, term, trunc, info, _ in ep:
-        replay_buffer.add(obs, action, rew, term, trunc, demo=info["demo"])
+    store_mc_return = "mc_return" in replay_buffer.extra_replay_elements.keys()
+    store_structured_explore = (
+        "structured_explore" in replay_buffer.extra_replay_elements.keys()
+    )
+    mc_returns = discounted_episode_returns(
+        [transition[2] for transition in ep],
+        getattr(replay_buffer, "_gamma", 1.0),
+    )
+    for index, (obs, action, rew, term, trunc, info, _) in enumerate(ep):
+        extra = {"demo": info["demo"]}
+        if store_mc_return:
+            extra["mc_return"] = mc_returns[index]
+        if store_structured_explore:
+            extra["structured_explore"] = np.uint8(0)
+            if (
+                "structured_explore_start"
+                in replay_buffer.extra_replay_elements.keys()
+            ):
+                extra["structured_explore_start"] = np.uint8(0)
+            if (
+                "structured_explore_dimension"
+                in replay_buffer.extra_replay_elements.keys()
+            ):
+                extra["structured_explore_dimension"] = np.int16(-1)
+            if (
+                "structured_explore_delta"
+                in replay_buffer.extra_replay_elements.keys()
+            ):
+                extra["structured_explore_delta"] = np.float32(0.0)
+            if (
+                "structured_explore_assignment_prob"
+                in replay_buffer.extra_replay_elements.keys()
+            ):
+                extra["structured_explore_assignment_prob"] = np.float32(1.0)
+        replay_buffer.add(obs, action, rew, term, trunc, **extra)
 
     if not is_sequential:
         replay_buffer.add_final(final_obs)
@@ -578,18 +414,14 @@ class DemoMergedIterator:
         return self
 
     def _check_keys(self, batch, demo_batch):
-        assert set(batch.keys()) == set(
-            demo_batch.keys()
-        ), f"Keys in demo batch are different: {batch.keys()}, {demo_batch.keys()}"
+        assert set(batch.keys()) == set(demo_batch.keys()), (
+            f"Keys in demo batch are different: {batch.keys()}, {demo_batch.keys()}"
+        )
 
     def _ones_like(self, value):
-        if _is_torch_tensor(value):
-            return torch.ones_like(value)
         return np.ones_like(value)
 
     def _cat(self, lhs, rhs):
-        if _is_torch_tensor(lhs):
-            return torch.cat([lhs, rhs], 0)
         return np.concatenate([lhs, rhs], axis=0)
 
     def __next__(self):

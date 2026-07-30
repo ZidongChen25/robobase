@@ -135,6 +135,80 @@ def _make_env(
     )
 
 
+def _camera_params(env, camera_name: str, image_size) -> tuple[np.ndarray, np.ndarray]:
+    physics = env.mojo.physics
+    try:
+        camera_id = int(physics.model.name2id(camera_name, "camera"))
+    except Exception:
+        camera_id = -1
+        for candidate in range(int(physics.model.ncam)):
+            name = physics.model.id2name(candidate, "camera")
+            if name == camera_name or str(name).endswith(f"/{camera_name}"):
+                camera_id = candidate
+                break
+        if camera_id < 0:
+            raise ValueError(f"Camera {camera_name!r} not found in BiGym physics.")
+    height, width = (int(dim) for dim in image_size)
+    fovy = float(physics.model.cam_fovy[camera_id])
+    focal = height / (2.0 * np.tan(np.deg2rad(fovy) / 2.0))
+    intrinsic = np.asarray(
+        [[focal, 0.0, width / 2.0], [0.0, focal, height / 2.0], [0.0, 0.0, 1.0]],
+        dtype=np.float32,
+    )
+    c2w = np.eye(4, dtype=np.float32)
+    c2w[:3, 3] = np.asarray(physics.data.cam_xpos[camera_id], dtype=np.float32)
+    c2w[:3, :3] = np.asarray(
+        physics.data.cam_xmat[camera_id], dtype=np.float32
+    ).reshape(3, 3)
+    return intrinsic, c2w
+
+
+def _with_camera_params(observation: dict, env) -> dict:
+    observation = dict(observation)
+    for camera in env.observation_config.cameras:
+        intrinsic, c2w = _camera_params(env, camera.name, camera.resolution)
+        observation[f"camera_intrinsic_{camera.name}"] = intrinsic
+        observation[f"camera_c2w_{camera.name}"] = c2w
+    return observation
+
+
+def _create_replayed_demo(
+    demo: Demo,
+    env,
+    *,
+    observation_timing: str,
+    include_camera_params: bool,
+) -> Demo:
+    """Replay a lightweight demo without relying on a patched BiGym submodule."""
+
+    observation, _ = env.reset(seed=demo.seed)
+    metadata = Metadata.from_env(env)
+    metadata.uuid = demo.metadata.uuid
+    converted = Demo(metadata)
+    for timestep in demo.timesteps:
+        action = timestep.executed_action
+        if observation_timing == "pre_action":
+            stored_observation = observation
+            if include_camera_params:
+                stored_observation = _with_camera_params(stored_observation, env)
+            next_observation, reward, terminated, truncated, info = env.step(action)
+        else:
+            next_observation, reward, terminated, truncated, info = env.step(action)
+            stored_observation = next_observation
+            if include_camera_params:
+                stored_observation = _with_camera_params(stored_observation, env)
+        converted.add_timestep(
+            stored_observation,
+            reward,
+            terminated,
+            truncated,
+            info,
+            action,
+        )
+        observation = next_observation
+    return converted
+
+
 def _demo_success(demo) -> bool:
     return sum(float(step.reward) for step in demo.timesteps) > 0.25
 
@@ -214,7 +288,14 @@ def _force_recache_to_staging(
                     CONTROL_FREQUENCY_MAX,
                     robot=robot,
                 )
-                demo = DemoConverter.create_demo_in_new_env(demo, replay_env)
+                demo = _create_replayed_demo(
+                    demo,
+                    replay_env,
+                    observation_timing=_normalize_observation_timing(
+                        args.observation_timing
+                    ),
+                    include_camera_params=bool(args.include_camera_params),
+                )
                 saved_paths.append(demo.save(staging_dir / demo.metadata.filename))
         finally:
             replay_env.close()

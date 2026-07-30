@@ -1,0 +1,54 @@
+# @package _global_
+
+# Compute-matched FlowIQN-objective adaptation for CQN-AS. This first mechanism
+# screen intentionally uses fewer solver/action samples and a wider source than
+# the paper defaults; it is not a reproduction of the paper's complete actor.
+defaults:
+  - cqn_flow_pixel_bigym_demo_driven
+  - _self_
+
+num_train_frames: 10500
+batch_size: 8
+demo_batch_size: 8
+use_self_imitation: false
+
+method:
+  critic_grad_clip: 1.0
+  critic_target_tau: 0.005
+  value_mode: return_sample
+  atom_ce_lambda: 0.0
+  demo_fosd: false
+  bcfm_lambda: 1.0
+  dcfm_lambda: 0.0
+  pcbf_loss_coeff: 0.0
+  pcbf_lambda: 0.0
+  flow_iqn_quantile_coupling: true
+  flow_source_type: uniform
+  flow_source_min: 0.0
+  flow_source_max: 1.0
+  antithetic_flow_sources: false
+  fixed_action_flow_sources: true
+  action_flow_quantile_grid: false
+  num_flow_steps: 4
+  num_flow_samples: 8
+  num_target_flow_samples: 8
+  # Keep replay action selection compute-matched to PCBF; the preregistered
+  # held-out evaluator increases this to 16 seeded random sources.
+  num_action_flow_samples: 4
+  return_sample_aggregation: mean
+  return_sample_temperature: 1.0
+  clip_scalar_targets: true
+  clip_flow_trajectory: true
+  scalar_value_embedding: raw
+  time_embedding_type: raw
+  time_embed_dim: 64
+  time_scale: 1.0
+  endpoint_q_lambda: 0.0
+  source_consistency_lambda: 0.0
+  flow_distill_lambda: 0.0
+  flow_distill_action_readout: false
+  critic_architecture: flow_q
+
+hydra:
+  run:
+    dir: ./exp_local/cqn_flow_flowiqn/bigym_${env.task_name}_${now:%Y%m%d%H%M%S}

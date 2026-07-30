@@ -1,0 +1,8 @@
+# @package _global_
+defaults:
+  - flow_extensions_bigym
+  - override /method: legato
+
+method:
+  name: legato
+  policy_label: legato

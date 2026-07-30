@@ -25,16 +25,24 @@ def _memory_mask(action_length: int, memory_length: int) -> jnp.ndarray:
 class _CleanDiffuserPositionalEmbedding(nn.Module):
     dim: int
     max_positions: int = 10000
+    operator_variant: str = "torch"
 
     @nn.compact
     def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
         half_dim = self.dim // 2
         if half_dim == 0:
             return jnp.zeros((x.shape[0], 0), dtype=jnp.float32)
-        freqs = jnp.arange(half_dim, dtype=jnp.float32) / half_dim
+        if self.operator_variant == "legacy":
+            exponent_denominator = half_dim
+        else:
+            exponent_denominator = max(half_dim - 1, 1)
+        freqs = jnp.arange(half_dim, dtype=jnp.float32) / exponent_denominator
         freqs = (1.0 / float(self.max_positions)) ** freqs
         emb = x.astype(jnp.float32)[:, None] * freqs[None, :]
-        emb = jnp.concatenate([jnp.cos(emb), jnp.sin(emb)], axis=-1)
+        if self.operator_variant == "legacy":
+            emb = jnp.concatenate([jnp.cos(emb), jnp.sin(emb)], axis=-1)
+        else:
+            emb = jnp.concatenate([jnp.sin(emb), jnp.cos(emb)], axis=-1)
         if emb.shape[-1] < self.dim:
             emb = jnp.pad(emb, ((0, 0), (0, self.dim - emb.shape[-1])))
         return emb
@@ -43,6 +51,7 @@ class _CleanDiffuserPositionalEmbedding(nn.Module):
 class _TransformerMLP(nn.Module):
     d_model: int
     dropout: float
+    operator_variant: str
 
     @nn.compact
     def __call__(self, x: jnp.ndarray, *, train: bool) -> jnp.ndarray:
@@ -51,7 +60,7 @@ class _TransformerMLP(nn.Module):
             kernel_init=_normal_init(),
             bias_init=nn.initializers.zeros,
         )(x)
-        x = nn.gelu(x)
+        x = nn.gelu(x, approximate=self.operator_variant == "legacy")
         x = nn.Dropout(rate=self.dropout)(x, deterministic=not train)
         x = nn.Dense(
             self.d_model,
@@ -65,10 +74,12 @@ class _EncoderBlock(nn.Module):
     d_model: int
     n_heads: int
     dropout: float
+    operator_variant: str
 
     @nn.compact
     def __call__(self, x: jnp.ndarray, *, train: bool) -> jnp.ndarray:
-        attn_in = nn.LayerNorm()(x)
+        epsilon = 1e-6 if self.operator_variant == "legacy" else 1e-5
+        attn_in = nn.LayerNorm(epsilon=epsilon)(x)
         attn = nn.MultiHeadDotProductAttention(
             num_heads=self.n_heads,
             dropout_rate=self.dropout,
@@ -76,9 +87,18 @@ class _EncoderBlock(nn.Module):
             bias_init=nn.initializers.zeros,
             deterministic=not train,
         )(attn_in, attn_in)
+        if self.operator_variant == "torch":
+            attn = nn.Dropout(
+                rate=self.dropout,
+                name="self_attn_output_dropout",
+            )(attn, deterministic=not train)
         x = x + attn
-        x = x + _TransformerMLP(self.d_model, self.dropout)(
-            nn.LayerNorm()(x),
+        x = x + _TransformerMLP(
+            self.d_model,
+            self.dropout,
+            self.operator_variant,
+        )(
+            nn.LayerNorm(epsilon=epsilon)(x),
             train=train,
         )
         return x
@@ -88,6 +108,7 @@ class _DecoderBlock(nn.Module):
     d_model: int
     n_heads: int
     dropout: float
+    operator_variant: str
 
     @nn.compact
     def __call__(
@@ -99,7 +120,8 @@ class _DecoderBlock(nn.Module):
         memory_mask: jnp.ndarray,
         train: bool,
     ) -> jnp.ndarray:
-        self_attn_in = nn.LayerNorm()(x)
+        epsilon = 1e-6 if self.operator_variant == "legacy" else 1e-5
+        self_attn_in = nn.LayerNorm(epsilon=epsilon)(x)
         self_attn = nn.MultiHeadDotProductAttention(
             num_heads=self.n_heads,
             dropout_rate=self.dropout,
@@ -107,9 +129,14 @@ class _DecoderBlock(nn.Module):
             bias_init=nn.initializers.zeros,
             deterministic=not train,
         )(self_attn_in, self_attn_in, mask=self_mask)
+        if self.operator_variant == "torch":
+            self_attn = nn.Dropout(
+                rate=self.dropout,
+                name="self_attn_output_dropout",
+            )(self_attn, deterministic=not train)
         x = x + self_attn
 
-        cross_q = nn.LayerNorm()(x)
+        cross_q = nn.LayerNorm(epsilon=epsilon)(x)
         cross_attn = nn.MultiHeadDotProductAttention(
             num_heads=self.n_heads,
             dropout_rate=self.dropout,
@@ -117,20 +144,25 @@ class _DecoderBlock(nn.Module):
             bias_init=nn.initializers.zeros,
             deterministic=not train,
         )(cross_q, memory, mask=memory_mask)
+        if self.operator_variant == "torch":
+            cross_attn = nn.Dropout(
+                rate=self.dropout,
+                name="cross_attn_output_dropout",
+            )(cross_attn, deterministic=not train)
         x = x + cross_attn
-        x = x + _TransformerMLP(self.d_model, self.dropout)(
-            nn.LayerNorm()(x),
+        x = x + _TransformerMLP(
+            self.d_model,
+            self.dropout,
+            self.operator_variant,
+        )(
+            nn.LayerNorm(epsilon=epsilon)(x),
             train=train,
         )
         return x
 
 
 class JaxChiTransformerBackbone(nn.Module):
-    """Flax adaptation of CleanDiffuser's ChiTransformer.
-
-    This matches CleanDiffuser's condition layout: the diffusion timestep token
-    followed by ``obs_steps`` observation tokens.
-    """
+    """Flax ChiTransformer with explicit legacy and Torch RoboBase semantics."""
 
     action_dim: int
     sequence_length: int
@@ -139,7 +171,10 @@ class JaxChiTransformerBackbone(nn.Module):
     n_heads: int = 4
     num_layers: int = 8
     n_cond_layers: int = 0
+    full_memory_attention: bool = False
     dropout: float = 0.0
+    embedding_dropout: float | None = None
+    operator_variant: str = "legacy"
 
     @nn.compact
     def __call__(
@@ -151,14 +186,22 @@ class JaxChiTransformerBackbone(nn.Module):
         train: bool = False,
     ) -> jnp.ndarray:
         batch_size = actions.shape[0]
+        if self.operator_variant not in {"legacy", "torch"}:
+            raise ValueError(
+                "Transformer operator_variant must be 'legacy' or 'torch', got "
+                f"'{self.operator_variant}'."
+            )
+        norm_epsilon = 1e-6 if self.operator_variant == "legacy" else 1e-5
+        embedding_dropout = (
+            self.dropout if self.embedding_dropout is None else self.embedding_dropout
+        )
         timesteps = ensure_time_batch(timesteps, batch_size)
 
         time_token = _CleanDiffuserPositionalEmbedding(
             self.d_model,
+            operator_variant=self.operator_variant,
             name="time_embedding",
-        )(
-            timesteps
-        )[:, None, :]
+        )(timesteps)[:, None, :]
         if self.condition_dim > 0:
             if condition is None:
                 condition_tokens = jnp.zeros(
@@ -184,27 +227,32 @@ class JaxChiTransformerBackbone(nn.Module):
             (1, memory.shape[1], self.d_model),
         )
         memory = memory + cond_pos[:, : memory.shape[1], :]
-        memory = nn.Dropout(rate=0.0)(memory, deterministic=not train)
-        memory = nn.Dense(
-            4 * self.d_model,
-            kernel_init=_normal_init(),
-            bias_init=nn.initializers.zeros,
-            name="cond_encoder_dense1",
-        )(memory)
-        memory = mish(memory)
-        memory = nn.Dense(
-            self.d_model,
-            kernel_init=_normal_init(),
-            bias_init=nn.initializers.zeros,
-            name="cond_encoder_dense2",
-        )(memory)
-        for layer in range(self.n_cond_layers):
-            memory = _EncoderBlock(
+        memory = nn.Dropout(
+            rate=0.0 if self.operator_variant == "legacy" else embedding_dropout
+        )(memory, deterministic=not train)
+        if self.operator_variant == "legacy" or self.n_cond_layers == 0:
+            memory = nn.Dense(
+                4 * self.d_model,
+                kernel_init=_normal_init(),
+                bias_init=nn.initializers.zeros,
+                name="cond_encoder_dense1",
+            )(memory)
+            memory = mish(memory)
+            memory = nn.Dense(
                 self.d_model,
-                self.n_heads,
-                self.dropout,
-                name=f"encoder_{layer}",
-            )(memory, train=train)
+                kernel_init=_normal_init(),
+                bias_init=nn.initializers.zeros,
+                name="cond_encoder_dense2",
+            )(memory)
+        if self.n_cond_layers > 0:
+            for layer in range(self.n_cond_layers):
+                memory = _EncoderBlock(
+                    self.d_model,
+                    self.n_heads,
+                    self.dropout,
+                    self.operator_variant,
+                    name=f"encoder_{layer}",
+                )(memory, train=train)
 
         x = nn.Dense(
             self.d_model,
@@ -217,17 +265,23 @@ class JaxChiTransformerBackbone(nn.Module):
             nn.initializers.normal(stddev=0.02),
             (1, self.sequence_length, self.d_model),
         )
-        x = nn.Dropout(rate=0.0)(
+        x = nn.Dropout(
+            rate=0.0 if self.operator_variant == "legacy" else embedding_dropout
+        )(
             x + pos[:, : x.shape[1], :],
             deterministic=not train,
         )
         self_mask = _causal_mask(x.shape[1])
-        memory_attn_mask = _memory_mask(x.shape[1], memory.shape[1])
+        if self.full_memory_attention:
+            memory_attn_mask = jnp.ones((1, 1, x.shape[1], memory.shape[1]), dtype=bool)
+        else:
+            memory_attn_mask = _memory_mask(x.shape[1], memory.shape[1])
         for layer in range(self.num_layers):
             x = _DecoderBlock(
                 self.d_model,
                 self.n_heads,
                 self.dropout,
+                self.operator_variant,
                 name=f"decoder_{layer}",
             )(
                 x,
@@ -237,7 +291,7 @@ class JaxChiTransformerBackbone(nn.Module):
                 train=train,
             )
 
-        x = nn.LayerNorm(name="ln_f")(x)
+        x = nn.LayerNorm(epsilon=norm_epsilon, name="ln_f")(x)
         return nn.Dense(
             self.action_dim,
             kernel_init=_normal_init(),

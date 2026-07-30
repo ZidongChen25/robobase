@@ -1,0 +1,10 @@
+# @package _global_
+
+defaults:
+  - cqn_flow_pixel_bigym_demo_driven
+  - override ../profile: cqn_flow_value_flows
+  - _self_
+
+hydra:
+  run:
+    dir: ./exp_local/pixel_cqn_flow/bigym_${env.task_name}_value_flows_${now:%Y%m%d%H%M%S}

@@ -1,0 +1,14 @@
+# @package _global_
+
+# Matched Stage-I CQN-AS gate with the offline demonstrations converted to the
+# same first-success-terminal MDP used by live BiGym rollouts.
+defaults:
+  - cqn_as_pixel_bigym_stage1_gate
+  - _self_
+
+env:
+  truncate_demo_at_success: true
+
+hydra:
+  run:
+    dir: ./exp_local/cqn_value_fidelity_stage2/bigym_${env.task_name}_first_success_${now:%Y%m%d%H%M%S}

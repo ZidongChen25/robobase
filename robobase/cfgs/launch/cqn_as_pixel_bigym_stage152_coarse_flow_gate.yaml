@@ -1,0 +1,26 @@
+# @package _global_
+
+# Stage-152 (coarse-flow, cqn-flow.md 34): the canonical critic keeps only
+# the coarse level (5 bins/dim), where sibling bins receive online data and
+# TD counterfactuals are identifiable; a bin-conditioned flow head models
+# the continuous within-cell residual (demo-only CFM, EMA rollout weights).
+# Matched to the clean value-fidelity platform in everything else.
+defaults:
+  - cqn_as_pixel_bigym_value_fidelity_gate
+  - _self_
+
+save_csv: true
+
+method:
+  levels: 1
+  # The default structured_exploration_level=1 fails its levels-range
+  # validation at levels=1 even with structured_exploration_prob=0.
+  structured_exploration_level: 0
+  coarse_flow: true
+  flow_policy_steps: 8
+  flow_policy_lambda: 1.0
+  flow_policy_ema: 0.999
+
+hydra:
+  run:
+    dir: ./exp_local/cqn_stage152_coarse_flow/bigym_${env.task_name}_ccff_${now:%Y%m%d%H%M%S}

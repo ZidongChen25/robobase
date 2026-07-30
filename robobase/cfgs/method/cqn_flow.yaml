@@ -1,0 +1,194 @@
+# @package _global_
+
+# CQN-AS with a conditional value-flow critic. Coarse-to-fine levels are
+# sequential, while sequence positions, action dimensions, bins, and source
+# samples are evaluated in parallel inside each level.
+action_sequence: 4
+execution_length: 1
+temporal_ensemble: false
+
+method:
+  name: cqn_flow
+  _target_: robobase.method.cqn_flow.CQNFlowAS
+  is_rl: true
+  num_train_steps: ${num_train_frames}
+  num_explore_steps: ${num_explore_steps}
+  critic_lr: 5e-5
+  weight_decay: 0.1
+  critic_target_tau: 0.02
+  critic_grad_clip: null
+  levels: 3
+  bins: 5
+  atoms: 51
+  v_min: -2.0
+  v_max: 2.0
+  critic_lambda: 0.1
+  centralized_critic: false
+  use_dueling: true
+  always_bootstrap: false
+  stddev_schedule: "0.01"
+  bc_lambda: 1.0
+  bc_margin: 0.1
+  use_target_network_for_rollout: true
+  num_update_steps: 1
+
+  # Value-flow variants:
+  # - categorical + atom_ce_lambda > 0: 51-D Flow-C51 with endpoint CE (V2)
+  # - categorical + atom_ce_lambda = 0: pure 51-D Flow-C51 (V3)
+  # - scalar: expected-value Flow critic (V4; atom CE/FOSD must be disabled)
+  # - return_sample: scalar return-distribution flow (DCFM + BCFM; V5)
+  value_mode: categorical
+  num_flow_steps: 2
+  # Training, Bellman-target, and action-ranking samples can be scaled
+  # independently for expected-value flow. return_sample currently requires
+  # train == target so its BCFM path can share the exact same base noise.
+  num_flow_samples: 2
+  num_target_flow_samples: ${method.num_flow_samples}
+  num_action_flow_samples: ${method.num_flow_samples}
+  flow_source_type: gaussian
+  flow_source_std: 1.0
+  # Null bounds derive to 0.1 * [v_min, v_max] when uniform is selected.
+  flow_source_min: null
+  flow_source_max: null
+  antithetic_flow_sources: false
+  # A fixed source bank removes rollout-time bin flips while preserving common
+  # random numbers across all bins in a level.
+  fixed_action_flow_sources: false
+  # FlowIQN action scalarization uses tau_k=(k-0.5)/K rather than a seeded
+  # random source bank. Training and Bellman-target quantiles remain random.
+  action_flow_quantile_grid: false
+  # FlowIQN sorts K scalar source/target samples independently inside every
+  # state-action condition and explicitly conditions the velocity on the
+  # source quantile. It requires return_sample + uniform source + BCFM only.
+  flow_iqn_quantile_coupling: false
+  # DBC-inspired primary endpoint objective. Unlike FlowIQN's one-to-one
+  # empirical order-statistic coupling, this compares every predicted
+  # quantile with every Bellman target particle using quantile Huber loss.
+  # A positive value requires FlowIQN conditioning; bcfm_lambda then controls
+  # the auxiliary sorted-CFM path loss independently.
+  quantile_endpoint_lambda: 0.0
+  quantile_huber_kappa: 1.0
+  # Return-distribution readout. `entropic` implements EVOR's
+  # eta*log(mean(exp(return/eta))) and is valid only for return_sample.
+  # flow_q_action_readout is an eval/deployment switch: training configs keep
+  # it false so a separate BC tower controls replay collection.
+  return_sample_aggregation: mean
+  return_sample_temperature: 1.0
+  return_sample_truncate_top: 0
+  flow_q_action_readout: false
+  atom_ce_lambda: 1.0
+  # The original flow loss is BCFM. DCFM and PCBF are valid only for
+  # return_sample. PCBF uses its own loss coefficient and a separate lambda
+  # for the successor-field control variate.
+  bcfm_lambda: 1.0
+  dcfm_lambda: 0.0
+  # EVOR Equation 35/36: velocity-space TD against a frozen next-state
+  # return-flow velocity under the independent BC policy. It is a separate
+  # return_sample objective and is mutually exclusive with BCFM/DCFM/PCBF.
+  evor_td_lambda: 0.0
+  # Value Flows' stopped-gradient uncertainty weight. Null is an exact
+  # backward-compatible no-op; a positive temperature is valid only for a
+  # Gaussian return-sample flow.
+  confidence_weight_temp: null
+  pcbf_loss_coeff: 0.0
+  pcbf_lambda: 0.0
+  # Optional endpoint losses directly align expected-Q and suppress unwanted
+  # source dependence in deterministic-target modes.
+  endpoint_q_lambda: 0.0
+  source_consistency_lambda: 0.0
+  # Optional FLOQ-style scalar readout. It regresses to the stopped-gradient
+  # mean endpoint of the online flow and can replace endpoint integration for
+  # C2F bin selection. With a separate BC policy, policy_value_beta may add a
+  # normalized BC log-probability prior at evaluation time.
+  flow_distill_lambda: 0.0
+  flow_distill_action_readout: false
+  demo_fosd: true
+  # Null ranks demonstrations with the full endpoint ODE.  A value of 1 uses
+  # the stable Q_v0 proxy source + v(source, t=0) for demo imitation.
+  demo_flow_steps: null
+  # This width is materialized over [B,R,K,D,N]; keep it below the 512-wide
+  # sequence trunk unless a measured memory budget supports the expansion.
+  query_hidden_dim: 128
+  time_embedding_type: sinusoidal
+  time_embed_dim: 32
+  time_scale: 1000.0
+  clip_scalar_targets: true
+  # Preserve V2-V4 behavior by default. Value Flows enables per-Euler-step
+  # clipping explicitly, matching its official return integrator.
+  clip_flow_trajectory: false
+  # floq uses a 51-boundary HL-Gauss encoding for scalar z_t input; it is not
+  # a categorical value output. sigma is measured in boundary-bin widths.
+  scalar_value_embedding: raw
+  scalar_embed_bins: 51
+  scalar_embed_sigma: 16.0
+
+  # Paper-aligned CQN-AS sequence and rollout settings.
+  gru_layers: 1
+  temporal_ensemble: true
+  temporal_ensemble_replan_interval: 1
+  temporal_ensemble_gain: 0.01
+  tie_break_delta: 1e-4
+
+  # Value-fidelity controls shared with direct CQN-AS. They are disabled by
+  # default so legacy CQN-Flow launches retain their original behavior.
+  structured_exploration_prob: 0.0
+  structured_exploration_level: 1
+  structured_exploration_horizon: 1
+  separate_bc_policy: false
+  bc_policy_stop_gradient: false
+  distinct_policy_encoder: false
+  td_target_action_source: critic
+  # Used only by policy_value target selection. This is independent of the
+  # rollout policy_value_beta, so behavior collection may remain exact BC.
+  td_target_policy_value_beta: null
+  critic_sequence_mode: full
+  mc_return_weight: 0.0
+  mc_return_stop_gradient_encoder: false
+  mc_return_value_only: false
+
+  # Stage-X decomposition. `flow_q` preserves the original candidate-
+  # conditioned flow critic. `flow_v_direct_a` makes Flow-V candidate
+  # independent and adds a direct C51 residual head whose centered expectation
+  # is solely responsible for within-state action-bin ranking.
+  critic_architecture: flow_q
+  advantage_c51_lambda: 1.0
+  advantage_q_lambda: 1.0
+
+  # Optional Stage-XIII counterfactual supervision. The cache contains frozen
+  # value features, five fixed-prefix sibling plans, and exact simulator
+  # continuation returns. A zero weight preserves the legacy update exactly.
+  causal_branch_cache: null
+  causal_branch_weight: 0.0
+  causal_branch_delta_weight: 10.0
+  causal_branch_temperature: 0.05
+  causal_branch_batch_size: 32
+  causal_branch_level: 1
+
+  # Null keeps the independent BC policy as the rollout policy. A finite value
+  # chooses every C2F bin using z-scored direct-A + beta * log pi_BC; Flow-V is
+  # constant across siblings and therefore correctly cancels from the score.
+  policy_value_beta: null
+
+  # Keep both the independent BC head and its distinct visual encoder bitwise
+  # fixed while the value towers continue to train. This requires
+  # separate_bc_policy=true and distinct_policy_encoder=true.
+  freeze_bc_policy: false
+  # `legacy_c51` materializes an atoms=51 dueling policy tower with exactly
+  # the original CQN-AS critic structure. It is used only to import and freeze
+  # a validation-selected legacy behavior checkpoint for value-sidecar study.
+  bc_policy_mode: behavior_logits
+
+  model:
+    hidden_dims: [512, 512]
+    activation: silu
+
+  encoder_model:
+    type: cqn
+    model: cqn_cnn
+    trainable: true
+    pretrained: false
+    use_plucker: false
+
+  view_fusion_model:
+    type: multicam_feature
+    mode: flatten

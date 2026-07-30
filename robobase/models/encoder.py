@@ -6,6 +6,8 @@ import hashlib
 import os
 from functools import lru_cache
 from pathlib import Path
+import tempfile
+import urllib.request
 
 import jax
 import jax.numpy as jnp
@@ -14,13 +16,41 @@ from flax.core import FrozenDict, freeze
 from flax.traverse_util import unflatten_dict
 import flax.linen as nn
 
+from robobase.models.resnet import resnet_feature_model
+
 
 _IMAGENET_MEAN = np.asarray([0.485, 0.456, 0.406], dtype=np.float32)
 _IMAGENET_STD = np.asarray([0.229, 0.224, 0.225], dtype=np.float32)
 _SUPPORTED_RESNETS = {"resnet18": 18, "resnet34": 34}
 _RESNET_FEATURE_SIZES = {"resnet18": 512, "resnet34": 512}
+_PYTORCH_CONV_KERNEL_INIT = nn.initializers.variance_scaling(
+    1.0 / 3.0,
+    "fan_in",
+    "uniform",
+)
+_PYTORCH_RESNET_CONV_KERNEL_INIT = nn.initializers.variance_scaling(
+    2.0,
+    "fan_out",
+    "normal",
+)
 _DEFAULT_RESNET18_JAX_NPZ = (
-    Path.home() / ".cache" / "robobase_jaxflat" / "resnet18_imagenet_timm_jax_resnet.npz"
+    Path.home()
+    / ".cache"
+    / "robobase_jaxflat"
+    / "resnet18_imagenet_timm_jax_resnet.npz"
+)
+_RESNET18_SAFETENSORS_URL = (
+    "https://huggingface.co/timm/resnet18.tv_in1k/resolve/"
+    "a987fd6b60f845221bfff84b6f0191273ba56ead/model.safetensors"
+)
+_RESNET18_SAFETENSORS_SHA256 = (
+    "694f673df6520a3158624e8a89af086f59923ee4cd7436fe5bc3bc71d295ad81"
+)
+_DEFAULT_RESNET18_SAFETENSORS = (
+    Path.home()
+    / ".cache"
+    / "robobase_jaxflat"
+    / "resnet18.tv_in1k.a987fd6.model.safetensors"
 )
 
 
@@ -127,9 +157,23 @@ class JaxCQNEncoder:
         )
 
 
-def _pretrained_resnet_candidates(model_name: str) -> list[Path]:
+def _normalize_pretrained_weights_path(
+    pretrained_weights_path: str | os.PathLike[str] | None,
+) -> Path | None:
+    if pretrained_weights_path is None:
+        return None
+    return Path(pretrained_weights_path).expanduser().resolve()
+
+
+def _pretrained_resnet_candidates(
+    model_name: str,
+    pretrained_weights_path: str | os.PathLike[str] | None = None,
+) -> list[Path]:
     env_name = f"ROBOBASE_{model_name.upper()}_JAX_NPZ"
     candidates = []
+    explicit_path = _normalize_pretrained_weights_path(pretrained_weights_path)
+    if explicit_path is not None:
+        candidates.append(explicit_path)
     env_value = os.environ.get(env_name)
     if env_value:
         candidates.append(Path(env_value).expanduser())
@@ -138,11 +182,31 @@ def _pretrained_resnet_candidates(model_name: str) -> list[Path]:
     return candidates
 
 
-def _resolve_pretrained_resnet_npz(model_name: str) -> Path | None:
+def _resolve_pretrained_resnet_npz(
+    model_name: str,
+    pretrained_weights_path: str | os.PathLike[str] | None = None,
+) -> Path | None:
+    explicit_path = _normalize_pretrained_weights_path(pretrained_weights_path)
+    if explicit_path is not None and not explicit_path.is_file():
+        raise FileNotFoundError(
+            f"Explicit pretrained ResNet weights do not exist: {explicit_path}"
+        )
     return next(
-        (path for path in _pretrained_resnet_candidates(model_name) if path.exists()),
+        (
+            path
+            for path in _pretrained_resnet_candidates(
+                model_name,
+                pretrained_weights_path,
+            )
+            if path.exists()
+        ),
         None,
     )
+
+
+def _downloads_enabled() -> bool:
+    value = os.environ.get("ROBOBASE_DISABLE_PRETRAINED_DOWNLOAD", "")
+    return value.strip().lower() not in {"1", "true", "yes", "on"}
 
 
 @lru_cache(maxsize=16)
@@ -160,30 +224,78 @@ def _file_sha256(
     return digest.hexdigest()
 
 
-def resnet_weight_fingerprint(model_name: str, pretrained: bool) -> str:
-    """Return a stable identity for the exact frozen encoder weights."""
-    if not pretrained:
-        return "jax-resnet-random-init-seed-0"
-    path = _resolve_pretrained_resnet_npz(model_name)
-    if path is None:
-        # Legacy RoboBase pixel checkpoints were trained with timm weights
-        # converted through jax_resnet at model construction time.  Keep a
-        # distinct identity for that compatibility path when no exported NPZ
-        # override is installed.
-        try:
-            import timm
-
-            timm_version = str(timm.__version__)
-        except Exception:
-            timm_version = "unavailable"
-        return f"legacy-timm-jax-resnet:{model_name}:{timm_version}"
+def _sha256(path: Path) -> str:
     stat = path.stat()
-    return "sha256:" + _file_sha256(
+    return _file_sha256(
         str(path.resolve()),
         stat.st_size,
         stat.st_mtime_ns,
         stat.st_ctime_ns,
     )
+
+
+def _ensure_resnet18_safetensors() -> Path:
+    path = _DEFAULT_RESNET18_SAFETENSORS
+    if path.exists() and _sha256(path) == _RESNET18_SAFETENSORS_SHA256:
+        return path
+    if not _downloads_enabled():
+        raise FileNotFoundError(
+            "ResNet18 pretrained weights are not cached and automatic download is "
+            "disabled by ROBOBASE_DISABLE_PRETRAINED_DOWNLOAD."
+        )
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as output:
+            temporary_path = Path(output.name)
+            try:
+                with urllib.request.urlopen(  # noqa: S310 - pinned HTTPS + SHA256
+                    _RESNET18_SAFETENSORS_URL,
+                    timeout=60,
+                ) as response:
+                    for chunk in iter(lambda: response.read(1024 * 1024), b""):
+                        output.write(chunk)
+            except Exception as exc:
+                raise FileNotFoundError(
+                    "Unable to download the pinned ResNet18 ImageNet weights from "
+                    f"{_RESNET18_SAFETENSORS_URL}. Set ROBOBASE_RESNET18_JAX_NPZ "
+                    "to a converted local checkpoint when running offline."
+                ) from exc
+        if _sha256(temporary_path) != _RESNET18_SAFETENSORS_SHA256:
+            raise ValueError(
+                "Downloaded ResNet18 weights failed SHA256 verification; refusing "
+                "to load them."
+            )
+        os.replace(temporary_path, path)
+        temporary_path = None
+        return path
+    finally:
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
+
+
+def resnet_weight_fingerprint(
+    model_name: str,
+    pretrained: bool,
+    pretrained_weights_path: str | os.PathLike[str] | None = None,
+    *,
+    seed: int = 0,
+) -> str:
+    """Return a stable identity for the exact frozen encoder weights."""
+    if not pretrained:
+        return f"flax-resnet-random-init-seed-{int(seed)}"
+    path = _resolve_pretrained_resnet_npz(model_name, pretrained_weights_path)
+    if path is None and model_name == "resnet18":
+        path = _ensure_resnet18_safetensors()
+    if path is None:
+        return f"missing-jax-npz:{model_name}"
+    return "sha256:" + _sha256(path)
 
 
 def _linear(params, x: jnp.ndarray) -> jnp.ndarray:
@@ -268,7 +380,9 @@ def _batch_norm(
     var = stats["var"].reshape((1, 1, 1, -1))
     scale = params["scale"].reshape((1, 1, 1, -1))
     bias = params["bias"].reshape((1, 1, 1, -1))
-    return (x - mean) * jax.lax.rsqrt(var + jnp.asarray(eps, dtype=x.dtype)) * scale + bias
+    return (x - mean) * jax.lax.rsqrt(
+        var + jnp.asarray(eps, dtype=x.dtype)
+    ) * scale + bias
 
 
 def _resnet_conv_block(
@@ -380,9 +494,9 @@ def _apply_resnet18_film(
         block_film = None
         if film_name is not None:
             if film_name not in film_cache:
-                film_cache[film_name] = _linear(film_params[film_name], task_emb).reshape(
-                    (task_emb.shape[0], 2, 2, int(planes))
-                )
+                film_cache[film_name] = _linear(
+                    film_params[film_name], task_emb
+                ).reshape((task_emb.shape[0], 2, 2, int(planes)))
             block_film = film_cache[film_name][:, :, int(block_idx)]
 
         def apply_block(
@@ -429,18 +543,123 @@ class JaxPluckerEncoder(nn.Module):
         for index, (features, kernel_size) in enumerate(
             zip(channels, kernels, strict=True)
         ):
+            pad = int(kernel_size[0]) // 2
             x = nn.Conv(
                 features=int(features),
                 kernel_size=kernel_size,
                 strides=(2, 2),
-                padding="SAME",
+                padding=((pad, pad), (pad, pad)),
                 use_bias=False,
-                kernel_init=nn.initializers.kaiming_normal(),
+                # Match torch.nn.Conv2d.reset_parameters():
+                # kaiming_uniform_(a=sqrt(5), mode="fan_in").
+                kernel_init=_PYTORCH_CONV_KERNEL_INIT,
                 name=f"conv_{index}",
             )(x)
             x = _frozen_batch_norm_identity(x)
             x = nn.relu(x)
         return x
+
+
+def normalize_plucker_fusion_mode(
+    mode,
+    *,
+    use_plucker: bool | None = None,
+) -> str:
+    """Normalize the explicit CamPose integration strategy.
+
+    ``projected_late`` is retained only for checkpoints created before the
+    official ACT/DP paths were separated. New code should select ``act_late``
+    or ``dp_early`` explicitly. A non-``None`` ``use_plucker`` acts as a config
+    enable gate; standalone fusion modules omit it so their explicit mode wins.
+    """
+
+    if use_plucker is False:
+        # ``use_plucker`` is the runtime ablation gate. Keep accepting the
+        # configured family marker so dp_resnet can switch between its 9-channel
+        # official path and the otherwise identical 3-channel RGB control.
+        return "none"
+    if mode is None:
+        return "projected_late" if use_plucker is True else "none"
+    normalized = str(mode).strip().lower().replace("-", "_")
+    aliases = {
+        "off": "none",
+        "false": "none",
+        "rgb": "none",
+        "late": "act_late",
+        "act": "act_late",
+        "early": "dp_early",
+        "dp": "dp_early",
+        "diffusion": "dp_early",
+        "legacy": "projected_late",
+        "legacy_projected_late": "projected_late",
+    }
+    normalized = aliases.get(normalized, normalized)
+    if normalized not in {"none", "act_late", "dp_early", "projected_late"}:
+        raise ValueError(
+            f"plucker_fusion_mode must be one of none/act_late/dp_early; got {mode!r}."
+        )
+    return normalized
+
+
+class JaxPluckerFusion(nn.Module):
+    """Plug-and-play CamPose fusion primitive operating on NHWC tensors.
+
+    ``act_late`` applies the official five-layer ray CNN and returns the
+    unprojected RGB/ray concatenation. The ACT image projection can therefore
+    perform the official single ``1024 -> hidden_dim`` 1x1 projection.
+    ``dp_early`` returns raw ``RGB(3) + Plucker(6)`` channels for the diffusion
+    ResNet. ``none`` is an exact identity and creates no parameters.
+    """
+
+    mode: str
+    plucker_out_channels: int = 512
+    plucker_hidden_channels: int = 64
+
+    @nn.compact
+    def __call__(
+        self,
+        rgb: jnp.ndarray,
+        raymap: jnp.ndarray | None = None,
+    ) -> jnp.ndarray:
+        mode = normalize_plucker_fusion_mode(self.mode)
+        if mode == "none":
+            return rgb
+        if mode == "projected_late":
+            raise ValueError("JaxPluckerFusion does not expose legacy projected_late.")
+        if raymap is None:
+            raise ValueError(f"Plucker fusion mode {mode!r} requires a raymap.")
+        if rgb.ndim != 4 or raymap.ndim != 4:
+            raise ValueError(
+                "Plucker fusion expects NHWC rank-4 tensors; "
+                f"got rgb={rgb.shape}, raymap={raymap.shape}."
+            )
+        if rgb.shape[0] != raymap.shape[0]:
+            raise ValueError("RGB and raymap batch dimensions must match.")
+        if int(raymap.shape[-1]) != 6:
+            raise ValueError(f"Expected six Plucker channels, got {raymap.shape[-1]}.")
+        if mode == "dp_early":
+            if int(rgb.shape[-1]) != 3:
+                raise ValueError(
+                    f"DP early fusion expects RGB(3), got {rgb.shape[-1]}."
+                )
+            if rgb.shape[:3] != raymap.shape[:3]:
+                raise ValueError(
+                    "DP early fusion requires matching RGB/raymap spatial shapes; "
+                    f"got rgb={rgb.shape[:3]}, raymap={raymap.shape[:3]}."
+                )
+            return jnp.concatenate([rgb, raymap], axis=-1)
+
+        plucker = JaxPluckerEncoder(
+            out_channels=int(self.plucker_out_channels),
+            hidden_channels=int(self.plucker_hidden_channels),
+            name="plucker_encoder",
+        )(raymap)
+        if plucker.shape[:3] != rgb.shape[:3]:
+            raise ValueError(
+                "ACT late fusion requires matching RGB/ray feature maps; "
+                f"got rgb={rgb.shape[:3]}, ray={plucker.shape[:3]}."
+            )
+        return jnp.concatenate([rgb, plucker], axis=-1)
 
 
 def _frozen_batch_norm_identity(x: jnp.ndarray, eps: float = 1e-5) -> jnp.ndarray:
@@ -457,19 +676,172 @@ class JaxPluckerLateFusion(nn.Module):
     @nn.compact
     def __call__(self, rgb_feat: jnp.ndarray, plucker_feat: jnp.ndarray) -> jnp.ndarray:
         x = jnp.concatenate([rgb_feat, plucker_feat], axis=-1)
+        fan_in = int(x.shape[-1])
         return nn.Conv(
             features=int(self.out_channels),
             kernel_size=(1, 1),
             strides=(1, 1),
             padding="SAME",
             use_bias=True,
-            kernel_init=nn.initializers.kaiming_normal(),
+            kernel_init=_PYTORCH_CONV_KERNEL_INIT,
+            bias_init=nn.initializers.uniform(1.0 / np.sqrt(float(fan_in))),
             name="input_proj",
         )(x)
 
 
+def _pytorch_default_bias_init(fan_in: int):
+    return nn.initializers.uniform(1.0 / np.sqrt(float(max(1, fan_in))))
+
+
+class _JaxDPResNet18Block(nn.Module):
+    """Torchvision ResNet18 basic block with BatchNorm replaced by GroupNorm."""
+
+    features: int
+    stride: int = 1
+
+    @nn.compact
+    def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
+        residual = x
+        y = nn.Conv(
+            self.features,
+            kernel_size=(3, 3),
+            strides=(self.stride, self.stride),
+            padding=((1, 1), (1, 1)),
+            use_bias=False,
+            kernel_init=_PYTORCH_RESNET_CONV_KERNEL_INIT,
+            name="conv1",
+        )(x)
+        y = nn.GroupNorm(
+            num_groups=max(1, self.features // 16),
+            epsilon=1e-5,
+            name="norm1",
+        )(y)
+        y = nn.relu(y)
+        y = nn.Conv(
+            self.features,
+            kernel_size=(3, 3),
+            strides=(1, 1),
+            padding=((1, 1), (1, 1)),
+            use_bias=False,
+            kernel_init=_PYTORCH_RESNET_CONV_KERNEL_INIT,
+            name="conv2",
+        )(y)
+        y = nn.GroupNorm(
+            num_groups=max(1, self.features // 16),
+            epsilon=1e-5,
+            name="norm2",
+        )(y)
+
+        if self.stride != 1 or int(x.shape[-1]) != self.features:
+            residual = nn.Conv(
+                self.features,
+                kernel_size=(1, 1),
+                strides=(self.stride, self.stride),
+                padding="VALID",
+                use_bias=False,
+                kernel_init=_PYTORCH_RESNET_CONV_KERNEL_INIT,
+                name="downsample_conv",
+            )(residual)
+            residual = nn.GroupNorm(
+                num_groups=max(1, self.features // 16),
+                epsilon=1e-5,
+                name="downsample_norm",
+            )(residual)
+        return nn.relu(y + residual)
+
+
+class JaxDPEarlyConcatResNet18(nn.Module):
+    """Pure-JAX port of CamPoseOpensource DP's ``RgbEncoder``.
+
+    This preserves the official early 9-channel fusion, GroupNorm ResNet18,
+    32-keypoint spatial softmax, and final 64-dimensional projection. It has no
+    ImageNet/pretrained path, matching the official ``weights=None`` model.
+    """
+
+    use_plucker: bool = True
+    num_keypoints: int = 32
+
+    @nn.compact
+    def __call__(
+        self,
+        rgb: jnp.ndarray,
+        raymap: jnp.ndarray | None = None,
+    ) -> jnp.ndarray:
+        mode = "dp_early" if self.use_plucker else "none"
+        x = JaxPluckerFusion(mode=mode, name="input_fusion")(rgb, raymap)
+        expected_channels = 9 if self.use_plucker else 3
+        if int(x.shape[-1]) != expected_channels:
+            raise ValueError(
+                f"DP encoder expected {expected_channels} input channels, got {x.shape[-1]}."
+            )
+
+        first_kernel_init = (
+            _PYTORCH_CONV_KERNEL_INIT
+            if self.use_plucker
+            else _PYTORCH_RESNET_CONV_KERNEL_INIT
+        )
+        x = nn.Conv(
+            64,
+            kernel_size=(7, 7),
+            strides=(2, 2),
+            padding=((3, 3), (3, 3)),
+            use_bias=False,
+            kernel_init=first_kernel_init,
+            name="conv1",
+        )(x)
+        x = nn.GroupNorm(num_groups=4, epsilon=1e-5, name="norm1")(x)
+        x = nn.relu(x)
+        x = nn.max_pool(
+            x,
+            window_shape=(3, 3),
+            strides=(2, 2),
+            padding=((1, 1), (1, 1)),
+        )
+
+        for stage, features in enumerate((64, 128, 256, 512)):
+            for block in range(2):
+                stride = 2 if stage > 0 and block == 0 else 1
+                x = _JaxDPResNet18Block(
+                    features=features,
+                    stride=stride,
+                    name=f"layer{stage + 1}_{block}",
+                )(x)
+
+        batch_size, height, width, channels = x.shape
+        x = nn.Conv(
+            self.num_keypoints,
+            kernel_size=(1, 1),
+            strides=(1, 1),
+            padding="VALID",
+            kernel_init=_PYTORCH_CONV_KERNEL_INIT,
+            bias_init=_pytorch_default_bias_init(int(channels)),
+            name="spatial_softmax_conv",
+        )(x)
+        x = jnp.transpose(x, (0, 3, 1, 2)).reshape(
+            (batch_size * self.num_keypoints, height * width)
+        )
+        attention = jax.nn.softmax(x, axis=-1)
+        pos_y, pos_x = jnp.meshgrid(
+            jnp.linspace(-1.0, 1.0, height, dtype=jnp.float32),
+            jnp.linspace(-1.0, 1.0, width, dtype=jnp.float32),
+            indexing="ij",
+        )
+        pos_grid = jnp.stack([pos_x.reshape(-1), pos_y.reshape(-1)], axis=-1)
+        x = (attention @ pos_grid).reshape((batch_size, self.num_keypoints * 2))
+        feature_dim = self.num_keypoints * 2
+        x = nn.Dense(
+            feature_dim,
+            kernel_init=_PYTORCH_CONV_KERNEL_INIT,
+            bias_init=_pytorch_default_bias_init(feature_dim),
+            name="proj",
+        )(x)
+        return nn.relu(x)
+
+
 def _identity_plucker_late_fusion_variables(num_features: int) -> FrozenDict:
-    kernel = jnp.zeros((1, 1, int(num_features) * 2, int(num_features)), dtype=jnp.float32)
+    kernel = jnp.zeros(
+        (1, 1, int(num_features) * 2, int(num_features)), dtype=jnp.float32
+    )
     kernel = kernel.at[0, 0, : int(num_features), :].set(
         jnp.eye(int(num_features), dtype=jnp.float32)
     )
@@ -483,7 +855,7 @@ def _plucker_raymap_from_camera_params_jax(
     height: int,
     width: int,
 ) -> jnp.ndarray:
-    """Build direction+moment Plucker maps on the JAX device."""
+    """Build CamPose policy-compatible moment+direction maps on device."""
 
     intrinsics = intrinsics.astype(jnp.float32)
     c2ws = c2ws.astype(jnp.float32)
@@ -494,38 +866,119 @@ def _plucker_raymap_from_camera_params_jax(
     )
     u = u.reshape((1, -1))
     v = v.reshape((1, -1))
-    x = (u - intrinsics[:, 0, 2:3]) / intrinsics[:, 0, 0:1]
-    y = -(v - intrinsics[:, 1, 2:3]) / intrinsics[:, 1, 1:2]
+    # CamPoseOpensource's policy embedder applies this second +0.5 after its
+    # pixel-center grid has already been shifted by +0.5.
+    x = (u - intrinsics[:, 0, 2:3] + 0.5) / intrinsics[:, 0, 0:1]
+    y = -(v - intrinsics[:, 1, 2:3] + 0.5) / intrinsics[:, 1, 1:2]
     camera_dirs = jnp.stack([x, y, -jnp.ones_like(x)], axis=-1)
-    camera_dirs = camera_dirs / jnp.maximum(
-        jnp.linalg.norm(camera_dirs, axis=-1, keepdims=True),
-        jnp.asarray(1e-9, dtype=jnp.float32),
-    )
     directions = jnp.einsum("npc,nkc->npk", camera_dirs, c2ws[:, :3, :3])
     origins = jnp.broadcast_to(c2ws[:, None, :3, 3], directions.shape)
-    viewdirs = directions / jnp.maximum(
-        jnp.linalg.norm(directions, axis=-1, keepdims=True),
-        jnp.asarray(1e-9, dtype=jnp.float32),
+    viewdirs = directions / (
+        jnp.linalg.norm(directions, axis=-1, keepdims=True)
+        + jnp.asarray(1e-8, dtype=jnp.float32)
     )
     moments = jnp.cross(origins, viewdirs, axis=-1)
-    return jnp.concatenate([viewdirs, moments], axis=-1).reshape(
+    return jnp.concatenate([moments, viewdirs], axis=-1).reshape(
         (intrinsics.shape[0], height, width, 6)
     )
 
 
-def _load_pretrained_resnet_npz(model_name: str) -> FrozenDict:
+def _resnet18_safetensors_to_variables(tensors: dict[str, np.ndarray]) -> FrozenDict:
+    """Convert torchvision/timm ResNet18 tensors without importing Torch."""
+
+    flat_variables: dict[tuple[str, ...], jnp.ndarray] = {}
+
+    def add_conv(source: str, target: tuple[str, ...]) -> None:
+        kernel = np.asarray(tensors[source], dtype=np.float32)
+        flat_variables[("params", *target, "kernel")] = jnp.asarray(
+            kernel.transpose(2, 3, 1, 0)
+        )
+
+    def add_batch_norm(source: str, target: tuple[str, ...]) -> None:
+        for source_name, collection, target_name in (
+            ("weight", "params", "scale"),
+            ("bias", "params", "bias"),
+            ("running_mean", "batch_stats", "mean"),
+            ("running_var", "batch_stats", "var"),
+        ):
+            flat_variables[(collection, *target, target_name)] = jnp.asarray(
+                tensors[f"{source}.{source_name}"], dtype=jnp.float32
+            )
+
+    stem = ("layers_0", "ConvBlock_0")
+    add_conv("conv1.weight", (*stem, "Conv_0"))
+    add_batch_norm("bn1", (*stem, "BatchNorm_0"))
+
+    for stage in range(1, 5):
+        for block in range(2):
+            layer = f"layers_{2 + (stage - 1) * 2 + block}"
+            source = f"layer{stage}.{block}"
+            for conv_index in (1, 2):
+                block_name = f"ConvBlock_{conv_index - 1}"
+                add_conv(
+                    f"{source}.conv{conv_index}.weight",
+                    (layer, block_name, "Conv_0"),
+                )
+                add_batch_norm(
+                    f"{source}.bn{conv_index}",
+                    (layer, block_name, "BatchNorm_0"),
+                )
+            if stage > 1 and block == 0:
+                skip = (layer, "ResNetSkipConnection_0", "ConvBlock_0")
+                add_conv(f"{source}.downsample.0.weight", (*skip, "Conv_0"))
+                add_batch_norm(f"{source}.downsample.1", (*skip, "BatchNorm_0"))
+
+    if len(flat_variables) != 100:
+        raise ValueError(
+            "Pinned ResNet18 checkpoint conversion produced an incomplete Flax tree: "
+            f"expected 100 leaves, got {len(flat_variables)}."
+        )
+    return freeze(unflatten_dict(flat_variables))
+
+
+def _load_pretrained_resnet_npz(
+    model_name: str,
+    pretrained_weights_path: str | os.PathLike[str] | None = None,
+) -> FrozenDict:
     env_name = f"ROBOBASE_{model_name.upper()}_JAX_NPZ"
-    candidates = _pretrained_resnet_candidates(model_name)
-    path = _resolve_pretrained_resnet_npz(model_name)
+    candidates = _pretrained_resnet_candidates(model_name, pretrained_weights_path)
+    path = _resolve_pretrained_resnet_npz(model_name, pretrained_weights_path)
     if path is not None:
+        if path.suffix == ".safetensors":
+            if model_name != "resnet18":
+                raise ValueError(
+                    "Direct safetensors conversion currently supports resnet18 only."
+                )
+            try:
+                from safetensors.numpy import load_file
+            except ImportError as exc:
+                raise ImportError(
+                    "Loading ResNet safetensors requires the safetensors package."
+                ) from exc
+            return _resnet18_safetensors_to_variables(load_file(path))
+        if path.suffix != ".npz":
+            raise ValueError(
+                "Pretrained ResNet weights must be a JAX .npz or a supported "
+                f".safetensors file, got: {path}"
+            )
         with np.load(path, allow_pickle=False) as arrays:
             flat_variables = {
-                tuple(str(key).split("/")): jnp.asarray(
-                    arrays[key], dtype=jnp.float32
-                )
+                tuple(str(key).split("/")): jnp.asarray(arrays[key], dtype=jnp.float32)
                 for key in arrays.files
             }
         return freeze(unflatten_dict(flat_variables))
+
+    if model_name == "resnet18":
+        try:
+            from safetensors.numpy import load_file
+        except ImportError as exc:
+            raise ImportError(
+                "Loading the pinned ResNet18 checkpoint requires safetensors. "
+                "Install RoboBase with the 'jax' or 'jax-cuda12' extra."
+            ) from exc
+        return _resnet18_safetensors_to_variables(
+            load_file(_ensure_resnet18_safetensors())
+        )
 
     searched = ", ".join(str(path) for path in candidates) or f"${env_name} (unset)"
     raise FileNotFoundError(
@@ -534,46 +987,24 @@ def _load_pretrained_resnet_npz(model_name: str) -> FrozenDict:
     )
 
 
-@lru_cache(maxsize=4)
-def _load_legacy_timm_pretrained_resnet_variables(model_name: str) -> FrozenDict:
-    """Load the exact ImageNet variables used by legacy pixel baselines.
-
-    Before the pure-JAX encoder rewrite, ``pretrained`` was implicit and the
-    encoder always converted timm's ResNet weights with ``jax_resnet``.  Old
-    snapshots store trainable parameters but not frozen batch statistics, so
-    substituting a different ImageNet checkpoint (or random batch statistics)
-    makes otherwise valid policies produce saturated actions.
-    """
-
-    if model_name not in _SUPPORTED_RESNETS:
-        raise NotImplementedError(
-            f"JAX encoder supports only {sorted(_SUPPORTED_RESNETS)}. Got '{model_name}'."
-        )
-    try:
-        import jax_resnet
-        import timm
-        from jax_resnet.common import slice_variables
-    except ImportError as exc:
-        raise ImportError(
-            "Legacy pretrained ResNet compatibility requires `jax-resnet` and `timm`."
-        ) from exc
-
-    state_dict = timm.create_model(model_name, pretrained=True).state_dict()
-    _, variables = jax_resnet.pretrained_resnet(
-        _SUPPORTED_RESNETS[model_name],
-        state_dict=state_dict,
+def _load_resnet_feature_model(
+    model_name: str,
+    pretrained: bool = False,
+    seed: int = 0,
+    pretrained_weights_path: str | os.PathLike[str] | None = None,
+):
+    explicit_path = _normalize_pretrained_weights_path(pretrained_weights_path)
+    weight_fingerprint = resnet_weight_fingerprint(
+        model_name,
+        pretrained,
+        explicit_path,
     )
-    # Exclude only the classifier. The average-pool layer has no variables, so
-    # the same tree can drive both pooled and spatial feature-model variants.
-    return freeze(slice_variables(variables, end=-1))
-
-
-def _load_resnet_feature_model(model_name: str, pretrained: bool = False):
-    weight_fingerprint = resnet_weight_fingerprint(model_name, pretrained)
     return _load_resnet_feature_model_cached(
         model_name,
         pretrained,
         weight_fingerprint,
+        int(seed),
+        None if explicit_path is None else str(explicit_path),
     )
 
 
@@ -582,28 +1013,23 @@ def _load_resnet_feature_model_cached(
     model_name: str,
     pretrained: bool,
     weight_fingerprint: str,
+    seed: int = 0,
+    pretrained_weights_path: str | None = None,
 ):
     del weight_fingerprint
     if model_name not in _SUPPORTED_RESNETS:
         raise NotImplementedError(
             f"JAX encoder supports only {sorted(_SUPPORTED_RESNETS)}. Got '{model_name}'."
         )
-    try:
-        from jax_resnet import resnet
-    except ImportError as exc:
-        raise ImportError("JAX ResNet encoder requires `flax` and `jax-resnet`.") from exc
-
-    model = getattr(resnet, f"ResNet{_SUPPORTED_RESNETS[model_name]}")(n_classes=1000)
-    feature_model = nn.Sequential(model.layers[:-2])
+    feature_model = resnet_feature_model(_SUPPORTED_RESNETS[model_name])
     if pretrained:
-        feature_variables = (
-            _load_pretrained_resnet_npz(model_name)
-            if _resolve_pretrained_resnet_npz(model_name) is not None
-            else _load_legacy_timm_pretrained_resnet_variables(model_name)
+        feature_variables = _load_pretrained_resnet_npz(
+            model_name,
+            pretrained_weights_path,
         )
     else:
         feature_variables = feature_model.init(
-            jax.random.PRNGKey(0),
+            jax.random.PRNGKey(seed),
             jnp.zeros((1, 224, 224, 3), dtype=jnp.float32),
         )
     return feature_model, feature_variables, _RESNET_FEATURE_SIZES[model_name]
@@ -625,11 +1051,14 @@ class JaxResNetEncoder:
         pretrained: bool = False,
         resize_to_224: bool = True,
         use_plucker: bool = False,
+        plucker_fusion_mode: str | None = None,
         plucker_hidden_channels: int = 64,
         plucker_identity_init: bool = False,
         use_film: bool = False,
         film_task_input_dim: int = 512,
         film_task_hidden_dim: int = 256,
+        seed: int = 0,
+        pretrained_weights_path: str | os.PathLike[str] | None = None,
     ):
         if input_shape[1] % 3 != 0:
             raise ValueError(
@@ -637,20 +1066,60 @@ class JaxResNetEncoder:
                 f"got input_shape={input_shape}."
             )
 
-        feature_model, feature_variables, num_features = (
-            _load_resnet_feature_model(model, bool(pretrained))
-        )
+        seed = int(seed)
+
+        def init_key(legacy_index: int):
+            if seed == 0:
+                return jax.random.PRNGKey(legacy_index)
+            return jax.random.fold_in(jax.random.PRNGKey(seed), legacy_index)
+
+        if pretrained_weights_path is not None and not pretrained:
+            raise ValueError(
+                "pretrained_weights_path requires pretrained=true."
+            )
+        if pretrained_weights_path is not None:
+            feature_model, feature_variables, num_features = (
+                _load_resnet_feature_model(
+                    model,
+                    bool(pretrained),
+                    seed=seed,
+                    pretrained_weights_path=pretrained_weights_path,
+                )
+            )
+        elif seed == 0:
+            feature_model, feature_variables, num_features = _load_resnet_feature_model(
+                model,
+                bool(pretrained),
+            )
+        else:
+            feature_model, feature_variables, num_features = _load_resnet_feature_model(
+                model,
+                bool(pretrained),
+                seed=seed,
+            )
         self._feature_model = feature_model
         self._feature_variables = jax.tree.map(
-            lambda x: jnp.asarray(x, dtype=jnp.float32), feature_variables,
+            lambda x: jnp.asarray(x, dtype=jnp.float32),
+            feature_variables,
         )
         self._num_features = int(num_features)
         self._input_shape = input_shape
         self._resize_to_224 = bool(resize_to_224)
-        self._use_plucker = bool(use_plucker)
+        self._plucker_fusion_mode = normalize_plucker_fusion_mode(
+            plucker_fusion_mode,
+            use_plucker=bool(use_plucker),
+        )
+        if self._plucker_fusion_mode == "dp_early":
+            raise ValueError(
+                "Use JaxDPEarlyFusionEncoder for plucker_fusion_mode='dp_early'; "
+                "JaxResNetEncoder implements RGB and ACT spatial backbones."
+            )
+        self._use_plucker = self._plucker_fusion_mode != "none"
         self._use_film = bool(use_film)
         if self._use_film and model != "resnet18":
-            raise NotImplementedError("ACT FiLM conditioning currently supports resnet18 only.")
+            raise NotImplementedError(
+                "ACT FiLM conditioning currently supports resnet18 only."
+            )
         self._plucker_model = None
         self._plucker_feature_variables = None
         self._plucker_fusion_model = None
@@ -661,7 +1130,7 @@ class JaxResNetEncoder:
 
         if self._use_film:
             self._film_variables = _init_resnet18_film_variables(
-                jax.random.PRNGKey(2),
+                init_key(2),
                 task_input_dim=int(film_task_input_dim),
                 task_hidden_dim=int(film_task_hidden_dim),
             )
@@ -676,30 +1145,39 @@ class JaxResNetEncoder:
                 dtype=jnp.float32,
             )
             self._plucker_feature_variables = self._plucker_model.init(
-                jax.random.PRNGKey(0), dummy_raymap,
+                init_key(0),
+                dummy_raymap,
             )
-            self._plucker_fusion_model = JaxPluckerLateFusion(
-                out_channels=self._num_features,
-            )
-            if bool(plucker_identity_init):
-                self._plucker_fusion_variables = _identity_plucker_late_fusion_variables(
-                    self._num_features
+            if self._plucker_fusion_mode == "projected_late":
+                self._plucker_fusion_model = JaxPluckerLateFusion(
+                    out_channels=self._num_features,
                 )
-            else:
-                dummy_feat = jnp.zeros(
-                    (1, 1, 1, self._num_features),
-                    dtype=jnp.float32,
-                )
-                self._plucker_fusion_variables = self._plucker_fusion_model.init(
-                    jax.random.PRNGKey(1), dummy_feat, dummy_feat,
-                )
+                if bool(plucker_identity_init):
+                    self._plucker_fusion_variables = (
+                        _identity_plucker_late_fusion_variables(self._num_features)
+                    )
+                else:
+                    dummy_feat = jnp.zeros(
+                        (1, 1, 1, self._num_features),
+                        dtype=jnp.float32,
+                    )
+                    self._plucker_fusion_variables = self._plucker_fusion_model.init(
+                        init_key(1),
+                        dummy_feat,
+                        dummy_feat,
+                    )
 
         self._jit = bool(jit)
         self._refresh_encode_fn()
 
     @property
     def output_shape(self) -> tuple[int, int]:
-        return (self._input_shape[0], self._num_features)
+        feature_size = (
+            self._num_features * 2
+            if self._plucker_fusion_mode == "act_late"
+            else self._num_features
+        )
+        return (self._input_shape[0], feature_size)
 
     @property
     def trainable_params(self):
@@ -713,7 +1191,8 @@ class JaxResNetEncoder:
             params["film"] = self._film_variables.get("params", {})
         if self._use_plucker:
             params["plucker"] = self._plucker_feature_variables.get("params", {})
-            params["fusion"] = self._plucker_fusion_variables.get("params", {})
+            if self._plucker_fusion_variables is not None:
+                params["fusion"] = self._plucker_fusion_variables.get("params", {})
         return params
 
     @property
@@ -776,7 +1255,8 @@ class JaxResNetEncoder:
                 variables["film"] = {"params": params["film"]}
             if self._use_plucker:
                 variables["plucker"] = {"params": params["plucker"]}
-                variables["fusion"] = {"params": params["fusion"]}
+                if "fusion" in params:
+                    variables["fusion"] = {"params": params["fusion"]}
         else:
             variables = {"params": params}
         if self.batch_stats is not None:
@@ -807,7 +1287,8 @@ class JaxResNetEncoder:
                 variables["film"] = {"params": params["film"]}
             if self._use_plucker:
                 variables["plucker"] = {"params": params["plucker"]}
-                variables["fusion"] = {"params": params["fusion"]}
+                if "fusion" in params:
+                    variables["fusion"] = {"params": params["fusion"]}
         else:
             variables = {"params": params}
         if self.batch_stats is not None:
@@ -842,7 +1323,9 @@ class JaxResNetEncoder:
             resize = self._resize_to_224 and not self._use_plucker
         if resize:
             x = jax.image.resize(
-                x, shape=(x.shape[0], 224, 224, x.shape[-1]), method="bilinear",
+                x,
+                shape=(x.shape[0], 224, 224, x.shape[-1]),
+                method="bilinear",
             )
         x = x / 255.0
         x = (x - self._mean) / self._std
@@ -864,12 +1347,16 @@ class JaxResNetEncoder:
             )
         channels = int(raymap.shape[2])
         if channels % 6 != 0:
-            raise ValueError(f"Expected raymap channels divisible by 6, got {channels}.")
+            raise ValueError(
+                f"Expected raymap channels divisible by 6, got {channels}."
+            )
         frame_stack = channels // 6
         height, width = int(raymap.shape[-2]), int(raymap.shape[-1])
         raymap = raymap.reshape((batch_size, num_views, frame_stack, 6, height, width))
         raymap = jnp.transpose(raymap, (0, 1, 2, 4, 5, 3))
-        raymap = raymap.reshape((batch_size * num_views * frame_stack, height, width, 6))
+        raymap = raymap.reshape(
+            (batch_size * num_views * frame_stack, height, width, 6)
+        )
         return raymap, frame_stack
 
     def _preprocess_camera_params(
@@ -978,11 +1465,15 @@ class JaxResNetEncoder:
             if task_emb is None:
                 raise ValueError("ACT FiLM ResNet conditioning requires task_emb.")
             film_params = self._get_film_params(variables)
-            encoded_task_emb = _linear(film_params["text_proj"], task_emb.astype(jnp.float32))
+            encoded_task_emb = _linear(
+                film_params["text_proj"], task_emb.astype(jnp.float32)
+            )
             expanded_task = jnp.broadcast_to(
                 encoded_task_emb[:, None, None, :],
                 (batch_size, num_views, frame_stack, encoded_task_emb.shape[-1]),
-            ).reshape((batch_size * num_views * frame_stack, encoded_task_emb.shape[-1]))
+            ).reshape(
+                (batch_size * num_views * frame_stack, encoded_task_emb.shape[-1])
+            )
             x = _apply_resnet18_film(
                 x,
                 self._resnet_variables(variables),
@@ -1017,7 +1508,9 @@ class JaxResNetEncoder:
                 )
             if raymap_obs is not None:
                 raymap, raymap_frame_stack = self._preprocess_raymap(
-                    raymap_obs, batch_size, num_views,
+                    raymap_obs,
+                    batch_size,
+                    num_views,
                 )
             else:
                 raymap, raymap_frame_stack = self._preprocess_camera_params(
@@ -1042,11 +1535,15 @@ class JaxResNetEncoder:
                     "Plucker feature spatial shape does not match RGB feature shape: "
                     f"{tuple(plucker.shape[-3:-1])} vs {tuple(x.shape[-3:-1])}."
                 )
-            x = self._plucker_fusion_model.apply(
-                self._get_plucker_fusion_variables(variables),
-                x,
-                plucker,
-            )
+            if self._plucker_fusion_mode == "act_late":
+                x = jnp.concatenate([x, plucker], axis=-1)
+            else:
+                x = self._plucker_fusion_model.apply(
+                    self._get_plucker_fusion_variables(variables),
+                    x,
+                    plucker,
+                )
+            feature_size = int(x.shape[-1])
             x = x.reshape(
                 (
                     batch_size,
@@ -1054,7 +1551,7 @@ class JaxResNetEncoder:
                     frame_stack,
                     x.shape[1],
                     x.shape[2],
-                    self._num_features,
+                    feature_size,
                 )
             )
             x = x.mean(axis=2)
@@ -1085,3 +1582,257 @@ class JaxResNetEncoder:
             x = x.reshape((batch_size, num_views, frame_stack, self._num_features))
             x = x.mean(axis=2)
         return finish(x)
+
+
+class JaxDPEarlyFusionEncoder:
+    """Runtime wrapper for the official CamPose diffusion image encoder.
+
+    Its public training surface mirrors ``JaxResNetEncoder`` so Diffusion and
+    Flow Matching can select it in their encoder factory without special
+    forward/update logic. The model is intentionally trainable and random-init,
+    matching CamPoseOpensource's ``torchvision.resnet18(weights=None)``.
+    """
+
+    def __init__(
+        self,
+        input_shape: tuple[int, int, int, int],
+        model: str = "resnet18",
+        jit: bool = True,
+        pretrained: bool = False,
+        use_plucker: bool = True,
+        plucker_fusion_mode: str | None = "dp_early",
+        num_keypoints: int = 32,
+        seed: int = 0,
+        **unused_kwargs,
+    ):
+        del unused_kwargs
+        if model != "resnet18":
+            raise NotImplementedError(
+                "CamPose DP early fusion is defined only for ResNet18."
+            )
+        if pretrained:
+            raise ValueError(
+                "CamPose DP early fusion uses random ResNet18 weights; "
+                "pretrained=true would not match the official policy."
+            )
+        mode = normalize_plucker_fusion_mode(
+            plucker_fusion_mode,
+            use_plucker=bool(use_plucker),
+        )
+        if mode not in {"none", "dp_early"}:
+            raise ValueError(
+                f"JaxDPEarlyFusionEncoder supports only none/dp_early, got {mode!r}."
+            )
+        if int(input_shape[1]) % 3 != 0:
+            raise ValueError(
+                "DP RGB input channels must be a multiple of 3; "
+                f"got input_shape={input_shape}."
+            )
+
+        self._input_shape = tuple(int(value) for value in input_shape)
+        self._mode = mode
+        self._use_plucker = mode == "dp_early"
+        self._num_keypoints = int(num_keypoints)
+        self._feature_size = self._num_keypoints * 2
+        self._model = JaxDPEarlyConcatResNet18(
+            use_plucker=self._use_plucker,
+            num_keypoints=self._num_keypoints,
+        )
+        height, width = self._input_shape[2:]
+        dummy_rgb = jnp.zeros((1, height, width, 3), dtype=jnp.float32)
+        dummy_raymap = (
+            jnp.zeros((1, height, width, 6), dtype=jnp.float32)
+            if self._use_plucker
+            else None
+        )
+        self._variables = self._model.init(
+            jax.random.PRNGKey(int(seed)),
+            dummy_rgb,
+            dummy_raymap,
+        )
+        self._jit = bool(jit)
+
+        def encode_impl(params, rgb, raymap, intrinsics, c2ws):
+            return self._encode_impl(
+                params,
+                rgb,
+                raymap,
+                intrinsics,
+                c2ws,
+                True,
+            )
+
+        self._encode = jax.jit(encode_impl) if self._jit else encode_impl
+
+    @property
+    def output_shape(self) -> tuple[int, int]:
+        return (self._input_shape[0], self._feature_size)
+
+    @property
+    def trainable_params(self):
+        return self._variables["params"]
+
+    @property
+    def batch_stats(self):
+        return None
+
+    def frozen_state_dict(self) -> dict:
+        return {}
+
+    def load_frozen_state_dict(self, state_dict: dict | None) -> None:
+        del state_dict
+
+    def encode(
+        self,
+        rgb_obs,
+        raymap_obs=None,
+        camera_intrinsic_obs=None,
+        camera_c2w_obs=None,
+    ) -> jnp.ndarray:
+        return self._encode(
+            self.trainable_params,
+            _as_jax_input(rgb_obs),
+            _as_jax_input(raymap_obs),
+            _as_jax_input(camera_intrinsic_obs),
+            _as_jax_input(camera_c2w_obs),
+        )
+
+    def apply_trainable(
+        self,
+        params,
+        rgb_obs: jnp.ndarray,
+        raymap_obs: jnp.ndarray | None = None,
+        camera_intrinsic_obs: jnp.ndarray | None = None,
+        camera_c2w_obs: jnp.ndarray | None = None,
+        task_emb: jnp.ndarray | None = None,
+    ) -> jnp.ndarray:
+        del task_emb
+        return self._encode_impl(
+            params,
+            rgb_obs,
+            raymap_obs,
+            camera_intrinsic_obs,
+            camera_c2w_obs,
+            False,
+        )
+
+    def _preprocess_rgb(
+        self,
+        rgb_obs: jnp.ndarray,
+    ) -> tuple[jnp.ndarray, int, int, int, int, int]:
+        if rgb_obs.ndim != 5:
+            raise ValueError(
+                "Expected RGB shape (batch, views, channels, height, width), "
+                f"got {rgb_obs.shape}."
+            )
+        x = rgb_obs.astype(jnp.float32)
+        batch_size, num_views, channels, height, width = x.shape
+        if channels % 3 != 0:
+            raise ValueError(f"Expected RGB channels divisible by 3, got {channels}.")
+        frame_stack = channels // 3
+        x = x.reshape((batch_size, num_views, frame_stack, 3, height, width))
+        x = jnp.transpose(x, (0, 1, 2, 4, 5, 3)).reshape(
+            (batch_size * num_views * frame_stack, height, width, 3)
+        )
+        # Official DP receives ToTensor RGB in [0, 1] and does not apply
+        # ImageNet normalization because its ResNet is random-initialized.
+        return x / 255.0, batch_size, num_views, frame_stack, height, width
+
+    @staticmethod
+    def _preprocess_raymap(
+        raymap_obs: jnp.ndarray,
+        batch_size: int,
+        num_views: int,
+    ) -> tuple[jnp.ndarray, int]:
+        if raymap_obs.ndim != 5:
+            raise ValueError(
+                "Expected raymap shape (batch, views, channels, height, width), "
+                f"got {raymap_obs.shape}."
+            )
+        if raymap_obs.shape[:2] != (batch_size, num_views):
+            raise ValueError("Raymap batch/view dimensions must match RGB.")
+        channels = int(raymap_obs.shape[2])
+        if channels % 6 != 0:
+            raise ValueError(
+                f"Expected raymap channels divisible by 6, got {channels}."
+            )
+        frame_stack = channels // 6
+        height, width = raymap_obs.shape[-2:]
+        raymap = raymap_obs.astype(jnp.float32).reshape(
+            (batch_size, num_views, frame_stack, 6, height, width)
+        )
+        raymap = jnp.transpose(raymap, (0, 1, 2, 4, 5, 3)).reshape(
+            (batch_size * num_views * frame_stack, height, width, 6)
+        )
+        return raymap, frame_stack
+
+    @staticmethod
+    def _preprocess_camera_params(
+        intrinsic_obs: jnp.ndarray,
+        c2w_obs: jnp.ndarray,
+        batch_size: int,
+        num_views: int,
+        height: int,
+        width: int,
+    ) -> tuple[jnp.ndarray, int]:
+        if intrinsic_obs.ndim != 5 or c2w_obs.ndim != 5:
+            raise ValueError("Expected camera params shaped (B,V,T,3,3)/(B,V,T,4,4).")
+        if intrinsic_obs.shape[:2] != (batch_size, num_views):
+            raise ValueError("Camera intrinsic batch/view dimensions must match RGB.")
+        if c2w_obs.shape[:2] != (batch_size, num_views):
+            raise ValueError("Camera c2w batch/view dimensions must match RGB.")
+        if intrinsic_obs.shape[2] != c2w_obs.shape[2]:
+            raise ValueError("Camera intrinsic/c2w frame stacks must match.")
+        if intrinsic_obs.shape[-2:] != (3, 3) or c2w_obs.shape[-2:] != (4, 4):
+            raise ValueError("Camera params must end in (3,3)/(4,4).")
+        frame_stack = int(intrinsic_obs.shape[2])
+        raymap = _plucker_raymap_from_camera_params_jax(
+            intrinsic_obs.astype(jnp.float32).reshape((-1, 3, 3)),
+            c2w_obs.astype(jnp.float32).reshape((-1, 4, 4)),
+            height,
+            width,
+        )
+        return raymap, frame_stack
+
+    def _encode_impl(
+        self,
+        params,
+        rgb_obs: jnp.ndarray,
+        raymap_obs: jnp.ndarray | None,
+        camera_intrinsic_obs: jnp.ndarray | None,
+        camera_c2w_obs: jnp.ndarray | None,
+        stop_gradient: bool,
+    ) -> jnp.ndarray:
+        rgb, batch_size, num_views, frame_stack, height, width = self._preprocess_rgb(
+            rgb_obs
+        )
+        raymap = None
+        if self._use_plucker:
+            if raymap_obs is not None:
+                raymap, ray_frames = self._preprocess_raymap(
+                    raymap_obs,
+                    batch_size,
+                    num_views,
+                )
+            elif camera_intrinsic_obs is not None and camera_c2w_obs is not None:
+                raymap, ray_frames = self._preprocess_camera_params(
+                    camera_intrinsic_obs,
+                    camera_c2w_obs,
+                    batch_size,
+                    num_views,
+                    height,
+                    width,
+                )
+            else:
+                raise ValueError(
+                    "DP early fusion requires raymap_obs or intrinsic/c2w observations."
+                )
+            if ray_frames != frame_stack:
+                raise ValueError(
+                    f"Ray/RGB frame stacks must match, got {ray_frames}/{frame_stack}."
+                )
+        features = self._model.apply({"params": params}, rgb, raymap)
+        features = features.reshape(
+            (batch_size, num_views, frame_stack, self._feature_size)
+        ).mean(axis=2)
+        return jax.lax.stop_gradient(features) if stop_gradient else features

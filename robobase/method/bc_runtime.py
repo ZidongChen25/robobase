@@ -36,7 +36,7 @@ def raymap_key_for_rgb_key(rgb_key: str, available_keys) -> str | None:
     rgb_key = str(rgb_key)
     candidates = []
     if rgb_key.startswith("rgb_"):
-        candidates.append(f"raymap_{rgb_key[len('rgb_'):]}")
+        candidates.append(f"raymap_{rgb_key[len('rgb_') :]}")
     if rgb_key.endswith("_rgb"):
         candidates.append(f"{rgb_key[: -len('_rgb')]}_raymap")
     candidates.extend((f"{rgb_key}_raymap", f"raymap_{rgb_key}"))
@@ -70,8 +70,6 @@ def camera_param_keys_for_rgb_key(
             f"camera_c2w_{camera_name}",
             f"{camera_name}_camera_c2w",
             f"c2w_{camera_name}",
-            f"camera_extrinsic_{camera_name}",
-            f"{camera_name}_camera_extrinsic",
         )
         for intrinsic_key in intrinsic_candidates:
             if intrinsic_key not in key_set:
@@ -79,6 +77,16 @@ def camera_param_keys_for_rgb_key(
             for c2w_key in c2w_candidates:
                 if c2w_key in key_set:
                     return intrinsic_key, c2w_key
+            ambiguous_extrinsics = (
+                f"camera_extrinsic_{camera_name}",
+                f"{camera_name}_camera_extrinsic",
+            )
+            if any(key in key_set for key in ambiguous_extrinsics):
+                raise ValueError(
+                    "Camera keys named 'extrinsic' are ambiguous between w2c and c2w. "
+                    "Expose an explicit camera_c2w_* observation, inverting w2c "
+                    "matrices in the environment adapter when necessary."
+                )
     return None
 
 
@@ -98,6 +106,11 @@ def bc_observation_layout(observation_space: spaces.Dict) -> BCObservationLayout
     rgb_input_shape = None
     if rgb_spaces:
         rgb_shapes = [space.shape for space in rgb_spaces.values()]
+        if not np.all([len(shape) == 4 for shape in rgb_shapes]):
+            raise ValueError(
+                "RGB observations must have shape (time, channels, height, width); "
+                "add an explicit time axis for single-frame environments."
+            )
         if not np.all([shape == rgb_shapes[0] for shape in rgb_shapes]):
             raise ValueError("Expected all RGB observations to have the same shape.")
         obs_shape = (int(np.prod(rgb_shapes[0][:2])), *rgb_shapes[0][2:])
@@ -123,8 +136,14 @@ def bc_observation_layout(observation_space: spaces.Dict) -> BCObservationLayout
             raymap_shapes = [
                 observation_space.spaces[raymap_key].shape for raymap_key in raymap_keys
             ]
+            if not np.all([len(shape) == 4 for shape in raymap_shapes]):
+                raise ValueError(
+                    "Raymap observations must have shape (time, 6, height, width)."
+                )
             if not np.all([shape == raymap_shapes[0] for shape in raymap_shapes]):
-                raise ValueError("Expected all raymap observations to have the same shape.")
+                raise ValueError(
+                    "Expected all raymap observations to have the same shape."
+                )
             raymap_obs_shape = (
                 int(np.prod(raymap_shapes[0][:2])),
                 *raymap_shapes[0][2:],
@@ -151,8 +170,7 @@ def bc_observation_layout(observation_space: spaces.Dict) -> BCObservationLayout
                         f"c2w_keys={tuple(camera_c2w_keys)}."
                     )
                 intrinsic_shapes = [
-                    observation_space.spaces[key].shape
-                    for key in camera_intrinsic_keys
+                    observation_space.spaces[key].shape for key in camera_intrinsic_keys
                 ]
                 c2w_shapes = [
                     observation_space.spaces[key].shape for key in camera_c2w_keys
@@ -162,9 +180,25 @@ def bc_observation_layout(observation_space: spaces.Dict) -> BCObservationLayout
                         "Expected camera intrinsic observations to end with shape "
                         "(3, 3)."
                     )
+                if not np.all([len(shape) == 3 for shape in intrinsic_shapes]):
+                    raise ValueError(
+                        "Camera intrinsic observations must have shape (time, 3, 3)."
+                    )
                 if not np.all([shape[-2:] == (4, 4) for shape in c2w_shapes]):
                     raise ValueError(
                         "Expected camera c2w observations to end with shape (4, 4)."
+                    )
+                if not np.all([len(shape) == 3 for shape in c2w_shapes]):
+                    raise ValueError(
+                        "Camera c2w observations must have shape (time, 4, 4)."
+                    )
+                rgb_time = rgb_shapes[0][0]
+                if not np.all(
+                    [shape[0] == rgb_time for shape in intrinsic_shapes + c2w_shapes]
+                ):
+                    raise ValueError(
+                        "Camera parameter and RGB observations must share the same "
+                        "time dimension."
                     )
 
     return BCObservationLayout(

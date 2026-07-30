@@ -17,6 +17,7 @@ from robobase.envs.wrappers import (
     FrameStack,
     RescaleFromTanh,
     ActionSequence,
+    RecedingHorizonControl,
 )
 
 import os
@@ -178,7 +179,18 @@ class DMCEnvFactory(EnvFactory):
             env = OnehotTime(
                 env, cfg.env.episode_length // cfg.action_repeat
             )  # Time limits are handles by DMC
-        env = ActionSequence(env, cfg.action_sequence)
+        if int(cfg.execution_length) == int(cfg.action_sequence):
+            env = ActionSequence(env, cfg.action_sequence)
+        else:
+            env = RecedingHorizonControl(
+                env,
+                cfg.action_sequence,
+                max(1, cfg.env.episode_length // cfg.action_repeat),
+                cfg.execution_length,
+                temporal_ensemble=cfg.temporal_ensemble,
+                gain=cfg.temporal_ensemble_gain,
+                execution_start=cfg.get("action_execution_start", 0),
+            )
         env = FrameStack(env, cfg.frame_stack)
         return env
 

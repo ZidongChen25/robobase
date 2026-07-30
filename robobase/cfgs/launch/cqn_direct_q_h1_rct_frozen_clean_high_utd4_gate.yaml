@@ -1,0 +1,21 @@
+# @package _global_
+
+# Route-A identification arm with an exact validation-selected clean CQN-AS
+# behavior policy. The caller must provide method.frozen_policy_snapshot for
+# the matching training seed. Its 51-atom target critic and visual encoder are
+# imported as the legacy-C51 policy tower and then protected bitwise; only the
+# direct scalar value tower/value encoder learn from TD, completed returns, and
+# the randomized H=1 action-centered moment.
+defaults:
+  - cqn_direct_q_h1_rct_two_tower_high_utd4_gate
+  - _self_
+
+method:
+  freeze_bc_policy: true
+  bc_policy_mode: legacy_c51
+  frozen_policy_snapshot: null
+  policy_value_beta: null
+
+hydra:
+  run:
+    dir: ./exp_local/cqn_flow_high_utd/bigym_${env.task_name}_direct_q_h1_rct_frozen_clean_utd4_${now:%Y%m%d%H%M%S}

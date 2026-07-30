@@ -1,0 +1,15 @@
+# @package _global_
+
+# Track A: preserve the validation-selected BC policy exactly and train only
+# the value-side encoder, Flow-V baseline, and direct causal advantage.
+defaults:
+  - cqn_flow_causal_a_policy_value_gate
+  - _self_
+
+method:
+  freeze_bc_policy: true
+  policy_value_beta: null
+
+hydra:
+  run:
+    dir: ./exp_local/cqn_value_fidelity_stage15/bigym_${env.task_name}_frozen_bc_value_${now:%Y%m%d%H%M%S}

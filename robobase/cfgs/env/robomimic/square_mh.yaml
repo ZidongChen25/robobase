@@ -1,0 +1,22 @@
+# @package _global_
+
+# Official Q-chunking (ACFQL) robomimic square setup: square-mh low_dim demos,
+# sparse {-1, 0} reward, 400-step online horizon, state observations restricted
+# to the official four low-dim keys.
+
+defaults:
+  - robomimic
+  - _self_
+
+env:
+  task_name: square_mh
+  dataset_path: third_party_datasets/robomimic/square/mh/low_dim_v141.hdf5
+  episode_length: 400
+  filter_key: all
+  use_live_env: true
+  reward_shift: -1.0
+  obs_keys:
+    - robot0_eef_pos
+    - robot0_eef_quat
+    - robot0_gripper_qpos
+    - object

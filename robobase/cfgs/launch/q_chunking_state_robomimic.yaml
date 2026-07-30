@@ -1,0 +1,70 @@
+# @package _global_
+
+# Official ACFQL best-of-N (Q-chunking) robomimic protocol from
+# github.com/ColinQiyangLi/qc main.py: 1M offline gradient steps on the demo
+# dataset, then 1M online environment steps with UTD 1 from a single mixed
+# buffer. Use together with env=robomimic/square_mh.
+
+defaults:
+  - ../env: null
+  - ../method: q_chunking
+  - _self_
+
+seed: 1
+demos: !!float .inf
+num_pretrain_steps: 1000000
+num_explore_steps: 0
+# Workspace counts offline updates in global_env_steps. A 2M upper bound gives
+# the official 1M offline updates followed by 1M online environment steps.
+num_train_frames: 2000000
+# Official main.py collects 5k online transitions before resuming updates while
+# still acting with the learned policy.
+online_update_after_steps: 5000
+# Evaluation happens through scripts/async_eval_watcher.py on a separate GPU
+# (50 episodes per snapshot); in-loop evaluation stays disabled.
+num_eval_episodes: 0
+eval_every_steps: 100000000
+batch_size: 256
+demo_batch_size: null
+replay_size_before_train: 500
+save_snapshot: true
+snapshot_every_n: 5000
+save_csv: true
+
+pixels: false
+frame_stack: 1
+action_repeat: 1
+action_sequence: 5
+execution_length: 1
+temporal_ensemble: false
+
+is_imitation_learning: false
+use_min_max_normalization: false
+use_standardization: false
+norm_obs: false
+use_self_imitation: false
+update_every_steps: 1
+
+wandb:
+  use: false
+log_eval_video: false
+
+replay:
+  nstep: ${action_sequence}
+  size: 2000000
+  demo_size: null
+  num_workers: 0
+  action_padding: zero
+  action_sequence_start_offset: 0
+  include_tp1: true
+  # State episodes are tiny; keep them all cached in RAM.
+  max_cached_episodes: 8192
+  # Official ACFQL samples uniformly over flat buffer transitions.
+  transition_uniform_sampling: true
+
+lazy_replay:
+  use: false
+
+hydra:
+  run:
+    dir: ./exp_local/q_chunking/robomimic_${env.task_name}_${now:%Y%m%d%H%M%S}

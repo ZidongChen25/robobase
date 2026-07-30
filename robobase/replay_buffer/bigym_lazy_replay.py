@@ -18,11 +18,15 @@ from gymnasium import spaces
 from omegaconf import DictConfig
 from safetensors import safe_open
 
-from robobase.envs.utils.bigym_utils import TASK_MAP
+from robobase.envs.camera_conditioning import camera_conditioning_enabled
+from robobase.envs.utils.bigym_utils import (
+    TASK_MAP,
+    build_actuated_qpos_state,
+    build_actuated_qpos_stats,
+)
 from robobase.envs.wrappers import RescaleFromStandardization, RescaleFromTanhWithMinMax
 from robobase.language import (
-    clip_text_feature_array,
-    clip_tokenize_text,
+    load_precomputed_language_features,
     tokenize_text,
     tokens_to_feature_array,
 )
@@ -79,8 +83,7 @@ def lazy_replay_enabled(cfg: DictConfig) -> bool:
         return True
     if mode != "auto":
         raise ValueError(
-            "lazy_replay.use must be one of true, false, or auto; "
-            f"got {setting!r}."
+            f"lazy_replay.use must be one of true, false, or auto; got {setting!r}."
         )
 
     demos = cfg.get("demos", 0)
@@ -165,9 +168,7 @@ def _metadata_dirs(cfg: DictConfig) -> tuple[Path, Path]:
     state_root = cache_root("state_dataset_root", dataset_root)
     pixel_store = DemoStore(cache_root=pixel_root)
     state_store = (
-        pixel_store
-        if state_root == pixel_root
-        else DemoStore(cache_root=state_root)
+        pixel_store if state_root == pixel_root else DemoStore(cache_root=state_root)
     )
     pixel_metadata = copy.deepcopy(metadata)
     pixel_metadata.observation_mode = ObservationMode.Pixel
@@ -230,6 +231,7 @@ def _state_rgb_key(camera_name: str) -> str:
 
 def _supported_observation_keys(cameras: tuple[str, ...]) -> set[str]:
     keys = {
+        "executed_action_feedback",
         "low_dim_state",
         "proprioception_floating_base",
         "proprioception_floating_base_actions",
@@ -258,7 +260,9 @@ def _load_non_rgb_episode(path: Path) -> dict[str, np.ndarray]:
     return arrays
 
 
-def _load_camera_params_episode(path: Path, cameras: tuple[str, ...]) -> dict[str, np.ndarray]:
+def _load_camera_params_episode(
+    path: Path, cameras: tuple[str, ...]
+) -> dict[str, np.ndarray]:
     arrays = {}
     required_keys = []
     for camera in cameras:
@@ -275,6 +279,27 @@ def _load_camera_params_episode(path: Path, cameras: tuple[str, ...]) -> dict[st
             )
         for key in required_keys:
             arrays[key] = np.asarray(handle.get_tensor(key), dtype=np.float32)
+    for camera in cameras:
+        intrinsic_key = _camera_intrinsic_key(camera)
+        c2w_key = _camera_c2w_key(camera)
+        intrinsics = arrays[intrinsic_key]
+        c2ws = arrays[c2w_key]
+        if intrinsics.ndim != 3 or intrinsics.shape[1:] != (3, 3):
+            raise ValueError(
+                f"Expected {intrinsic_key} shape (T, 3, 3) in {path}, "
+                f"got {intrinsics.shape}."
+            )
+        if c2ws.ndim != 3 or c2ws.shape[1:] != (4, 4):
+            raise ValueError(
+                f"Expected {c2w_key} shape (T, 4, 4) in {path}, got {c2ws.shape}."
+            )
+        if intrinsics.shape[0] != c2ws.shape[0]:
+            raise ValueError(
+                f"Camera parameter time dimensions differ in {path}: "
+                f"{intrinsic_key}={intrinsics.shape[0]}, {c2w_key}={c2ws.shape[0]}."
+            )
+        if not np.all(np.isfinite(intrinsics)) or not np.all(np.isfinite(c2ws)):
+            raise ValueError(f"Camera parameters in {path} must be finite.")
     return arrays
 
 
@@ -328,8 +353,7 @@ def _obs_stats(cfg: DictConfig, obs_arrays: dict[str, list[np.ndarray]]):
     }
     obs_mean = {key: np.mean(value, 0) for key, value in stacked.items()}
     obs_std = {
-        key: np.clip(np.std(value, 0), 1e-10, np.inf)
-        for key, value in stacked.items()
+        key: np.clip(np.std(value, 0), 1e-10, np.inf) for key, value in stacked.items()
     }
     obs_min = {key: np.min(value, 0) for key, value in stacked.items()}
     obs_max = {key: np.max(value, 0) for key, value in stacked.items()}
@@ -368,7 +392,9 @@ def build_bigym_lazy_manifest(cfg: DictConfig, num_demos=None) -> LazyBiGymManif
             "Run scripts/cache_bigym_pixel_demos.py first."
         )
     pixel_files = sorted(pixel_dir.glob("*.safetensors"))
-    max_demos = _normalize_demos_count(num_demos if num_demos is not None else cfg.demos)
+    max_demos = _normalize_demos_count(
+        num_demos if num_demos is not None else cfg.demos
+    )
     if max_demos is not None:
         pixel_files = pixel_files[:max_demos]
     if not pixel_files:
@@ -378,6 +404,10 @@ def build_bigym_lazy_manifest(cfg: DictConfig, num_demos=None) -> LazyBiGymManif
     raw_actions = []
     obs_arrays = defaultdict(list)
     global_start = 0
+    validate_camera_params = camera_conditioning_enabled(
+        cfg.env.get("camera_conditioning", "none")
+    )
+    cameras = tuple(str(camera) for camera in cfg.env.cameras)
     for pixel_path in pixel_files:
         state_path = state_dir / pixel_path.name
         metadata_path = state_path if state_path.exists() else pixel_path
@@ -385,6 +415,15 @@ def build_bigym_lazy_manifest(cfg: DictConfig, num_demos=None) -> LazyBiGymManif
         successful = _successful_episode(metadata_path)
         if bool(cfg.env.get("filter_successful_demos", True)) and not successful:
             continue
+        if validate_camera_params:
+            camera_params = _load_camera_params_episode(pixel_path, cameras)
+            for camera in cameras:
+                camera_frames = camera_params[_camera_intrinsic_key(camera)].shape[0]
+                if camera_frames != num_obs:
+                    raise ValueError(
+                        f"Camera parameters in {pixel_path} contain {camera_frames} "
+                        f"frames but RGB contains {num_obs}."
+                    )
 
         episode = _load_non_rgb_episode(metadata_path)
         num_actions = int(episode["info_demo_action"].shape[0])
@@ -443,6 +482,23 @@ class LazyBiGymReplayBuffer(ReplayBuffer):
         extra_replay_elements: spaces.Dict | None = None,
     ):
         self.cfg = cfg
+        method_cfg = cfg.get("method", {})
+        proprio_dropout_stage = str(
+            method_cfg.get("proprio_dropout_stage", "model")
+        ).lower()
+        self._raw_proprio_dropout_prob = (
+            float(method_cfg.get("proprio_dropout_prob", 0.0))
+            if proprio_dropout_stage == "raw"
+            else 0.0
+        )
+        if self._raw_proprio_dropout_prob not in {0.0, 1.0}:
+            raise ValueError(
+                "BiGym lazy replay raw proprio dropout supports probabilities 0 or 1."
+            )
+        self._raw_proprio_dropout_keys = frozenset(
+            str(key)
+            for key in method_cfg.get("proprio_dropout_keys", ["proprioception"])
+        )
         self.observation_elements = observation_space.spaces
         self._camera_param_cameras = tuple(
             str(camera)
@@ -497,7 +553,9 @@ class LazyBiGymReplayBuffer(ReplayBuffer):
             )
         unsupported_observation_keys = sorted(
             set(self.observation_elements)
-            - _supported_observation_keys(tuple(str(camera) for camera in cfg.env.cameras))
+            - _supported_observation_keys(
+                tuple(str(camera) for camera in cfg.env.cameras)
+            )
         )
         if unsupported_observation_keys:
             raise ValueError(
@@ -517,11 +575,57 @@ class LazyBiGymReplayBuffer(ReplayBuffer):
             0, int(cfg.replay.get("action_sequence_start_offset", 0))
         )
         self._observation_timing = _lazy_observation_timing(cfg)
-        self._action_index_offset = 1 if self._observation_timing == "post_action" else 0
+        self._action_index_offset = (
+            1 if self._observation_timing == "post_action" else 0
+        )
         self._drop_reset_frame = bool(cfg.lazy_replay.get("drop_reset_frame", False))
         self._action_padding = str(cfg.replay.get("action_padding", "zero")).lower()
-        if self._action_padding not in {"zero", "edge", "repeat"}:
-            raise ValueError("action_padding must be one of zero, edge, repeat.")
+        if self._action_padding not in {"zero", "raw_zero", "edge", "repeat"}:
+            raise ValueError(
+                "action_padding must be one of zero, raw_zero, edge, repeat."
+            )
+        source_cfg = method_cfg.get("flow_source", {})
+        method_name = method_cfg.get("name", None)
+        if method_name is None:
+            method_target = str(method_cfg.get("_target_", "")).strip()
+            method_name = method_target.rsplit(".", maxsplit=1)[-1]
+        method_name = str(method_name).lower()
+        default_source_type = (
+            method_name if method_name in {"a2a", "legato"} else "gaussian"
+        )
+        self._flow_source_type = str(
+            source_cfg.get("type", default_source_type)
+        ).lower()
+        self._action_history_len = (
+            int(source_cfg.get("history_horizon", self._action_seq_len))
+            if self._flow_source_type in {"a2a", "a2a_noise"}
+            else 0
+        )
+        if self._action_history_len < 0:
+            raise ValueError("flow_source.history_horizon must be non-negative.")
+        self._action_history_padding = str(
+            source_cfg.get("history_padding", "zero")
+        ).lower()
+        self._action_history_source = str(
+            source_cfg.get("history_source", "commanded_action")
+        ).lower()
+        if self._action_history_source not in {
+            "commanded_action",
+            "executed_action_feedback",
+        }:
+            raise ValueError(
+                "flow_source.history_source must be commanded_action or "
+                "executed_action_feedback."
+            )
+        if self._action_history_padding not in {
+            "edge",
+            "repeat",
+            "zero",
+            "raw_zero",
+        }:
+            raise ValueError(
+                "flow_source.history_padding must be edge, repeat, zero, or raw_zero."
+            )
 
         self._manifest = build_bigym_lazy_manifest(cfg, cfg.demos)
         self._episodes = self._manifest.episodes
@@ -601,31 +705,30 @@ class LazyBiGymReplayBuffer(ReplayBuffer):
 
     def _lang_feature_source(self) -> str:
         method_cfg = self.cfg.get("method", {})
-        # Missing means a legacy config. Those runs used CLIP features; using
-        # the new hashed-token path here would also make replay conditioning
-        # disagree with the live evaluation environment.
-        return str(method_cfg.get("lang_feature_source", "clip")).lower()
-
-    def _lang_feature_device(self) -> str:
-        method_cfg = self.cfg.get("method", {})
-        return str(method_cfg.get("lang_feature_device", "cpu"))
+        source = str(method_cfg.get("lang_feature_source", "tokens")).lower()
+        if source not in {"tokens", "jax", "hash", "precomputed"}:
+            raise ValueError(
+                "The JAX-only runtime supports lang_feature_source='tokens' "
+                "(aliases: 'jax', 'hash') or 'precomputed'; "
+                f"got {source!r}."
+            )
+        return source
 
     def _build_lang_tokens(self) -> np.ndarray:
         if "lang_tokens" not in self.observation_elements:
             return np.zeros((1, 77), dtype=np.int32)
         description = self._task_description()
-        if self._lang_feature_source() in {"clip", "clip_text"}:
-            return clip_tokenize_text(description)
+        self._lang_feature_source()
         return tokenize_text(description).astype(np.int32, copy=False)
 
     def _build_lang_features(self) -> np.ndarray:
         if "lang_features" not in self.observation_elements:
             return np.zeros((1, 512), dtype=np.float32)
-        description = self._task_description()
-        if self._lang_feature_source() in {"clip", "clip_text"}:
-            return clip_text_feature_array(
-                description,
-                device=self._lang_feature_device(),
+        if self._lang_feature_source() == "precomputed":
+            feature_dim = int(self.observation_elements["lang_features"].shape[-1])
+            return load_precomputed_language_features(
+                self.cfg.method.get("lang_feature_path", None),
+                feature_dim=feature_dim,
             )
         return tokens_to_feature_array(self._lang_tokens)
 
@@ -688,6 +791,24 @@ class LazyBiGymReplayBuffer(ReplayBuffer):
             float(self.cfg.min_max_margin),
         )
 
+    def _normalize_feedback(self, feedback: np.ndarray) -> np.ndarray:
+        feedback = np.asarray(feedback, dtype=np.float32)
+        if not bool(self.cfg.norm_obs):
+            return feedback
+        stats = build_actuated_qpos_stats(self._manifest.obs_stats)
+        if str(self.cfg.obs_norm_type).lower() in {"min_max", "minmax"}:
+            value_range = stats["max"] - stats["min"]
+            nonconstant = value_range != 0
+            value_range = np.where(nonconstant, value_range, 1.0)
+            return np.where(
+                nonconstant,
+                (feedback - stats["min"]) / value_range * 2.0 - 1.0,
+                0.0,
+            ).astype(np.float32, copy=False)
+        return ((feedback - stats["mean"]) / (stats["std"] + 1e-10)).astype(
+            np.float32, copy=False
+        )
+
     def _time_observations(self, observation_indices: np.ndarray) -> np.ndarray:
         time_space = self.observation_elements["time"]
         if len(time_space.shape) != 2 or time_space.shape[0] != self._frame_stacks:
@@ -705,8 +826,7 @@ class LazyBiGymReplayBuffer(ReplayBuffer):
 
     def episode_index_metadata(self) -> list[tuple[int, int]]:
         return [
-            (episode.global_start, episode.transition_len)
-            for episode in self._episodes
+            (episode.global_start, episode.transition_len) for episode in self._episodes
         ]
 
     def load_all_episodes(self):
@@ -722,6 +842,7 @@ class LazyBiGymReplayBuffer(ReplayBuffer):
         indices = np.asarray(indices, dtype=np.int64)
         batch_size = int(indices.shape[0])
         episode_idxs, local_idxs = self._locate_indices(indices)
+        action_history_len = int(getattr(self, "_action_history_len", 0))
         batch = {
             ACTION: np.empty(
                 (batch_size, self._action_seq_len, *self._action_shape),
@@ -738,6 +859,15 @@ class LazyBiGymReplayBuffer(ReplayBuffer):
             INDICES: indices.copy(),
             "demo": np.ones((batch_size,), dtype=np.uint8),
         }
+        if action_history_len:
+            batch["action_history"] = np.empty(
+                (batch_size, action_history_len, *self._action_shape),
+                dtype=np.float32,
+            )
+            batch["action_history_pad_mask"] = np.zeros(
+                (batch_size, action_history_len),
+                dtype=np.bool_,
+            )
 
         for key, space in self.observation_elements.items():
             batch[key] = np.empty((batch_size, *space.shape), dtype=space.dtype)
@@ -800,28 +930,67 @@ class LazyBiGymReplayBuffer(ReplayBuffer):
                             _camera_c2w_key(camera)
                         ][next_idxs]
 
+            feedback_state = None
+            if (
+                "executed_action_feedback" in batch
+                or getattr(self, "_action_history_source", "commanded_action")
+                == "executed_action_feedback"
+            ):
+                feedback_state = build_actuated_qpos_state(
+                    episode[_state_key("proprioception")],
+                    episode[_state_key("proprioception_floating_base")],
+                    episode[_state_key("proprioception_grippers")],
+                )
+            if "executed_action_feedback" in batch:
+                batch["executed_action_feedback"][out_idxs] = self._normalize_feedback(
+                    feedback_state[obs_idxs]
+                )
+                if self._include_tp1:
+                    batch["executed_action_feedback_tp1"][out_idxs] = (
+                        self._normalize_feedback(feedback_state[next_idxs])
+                    )
+
             low_dim_parts = []
             for obs_key in ("proprioception", "proprioception_grippers"):
                 tensor_key = _state_key(obs_key)
                 if tensor_key not in episode:
                     continue
-                values = self._normalize_obs(obs_key, episode[tensor_key][obs_idxs])
+                raw_values = episode[tensor_key][obs_idxs]
+                if getattr(
+                    self, "_raw_proprio_dropout_prob", 0.0
+                ) >= 1.0 and obs_key in getattr(
+                    self, "_raw_proprio_dropout_keys", frozenset()
+                ):
+                    raw_values = np.zeros_like(raw_values)
+                values = self._normalize_obs(obs_key, raw_values)
                 low_dim_parts.append(values)
             if low_dim_parts and "low_dim_state" in batch:
-                batch["low_dim_state"][out_idxs] = np.concatenate(low_dim_parts, axis=-1)
+                batch["low_dim_state"][out_idxs] = np.concatenate(
+                    low_dim_parts, axis=-1
+                )
                 if self._include_tp1:
+                    next_low_dim_parts = []
+                    for obs_key in (
+                        "proprioception",
+                        "proprioception_grippers",
+                    ):
+                        tensor_key = _state_key(obs_key)
+                        if tensor_key not in episode:
+                            continue
+                        raw_values = episode[tensor_key][next_idxs]
+                        if getattr(
+                            self, "_raw_proprio_dropout_prob", 0.0
+                        ) >= 1.0 and obs_key in getattr(
+                            self,
+                            "_raw_proprio_dropout_keys",
+                            frozenset(),
+                        ):
+                            raw_values = np.zeros_like(raw_values)
+                        next_low_dim_parts.append(
+                            self._normalize_obs(obs_key, raw_values)
+                        )
                     batch["low_dim_state_tp1"][out_idxs] = np.concatenate(
-                        [
-                            self._normalize_obs(
-                                obs_key,
-                                episode[_state_key(obs_key)][next_idxs],
-                            )
-                            for obs_key in (
-                                "proprioception",
-                                "proprioception_grippers",
-                            )
-                            if _state_key(obs_key) in episode
-                        ],
+                        next_low_dim_parts,
                         axis=-1,
                     )
             elif "low_dim_state" in batch:
@@ -858,9 +1027,9 @@ class LazyBiGymReplayBuffer(ReplayBuffer):
             if "lang_features" in batch:
                 batch["lang_features"][out_idxs] = self._lang_features[None, :, :]
                 if self._include_tp1:
-                    batch["lang_features_tp1"][out_idxs] = (
-                        self._lang_features[None, :, :]
-                    )
+                    batch["lang_features_tp1"][out_idxs] = self._lang_features[
+                        None, :, :
+                    ]
             if "time" in batch:
                 batch["time"][out_idxs] = self._time_observations(obs_idxs)
                 if self._include_tp1:
@@ -874,12 +1043,61 @@ class LazyBiGymReplayBuffer(ReplayBuffer):
             invalid_action_idxs = (action_idxs < 0) | (action_idxs >= num_actions)
             clipped_action_idxs = np.clip(action_idxs, 0, max(num_actions - 1, 0))
             actions = episode["info_demo_action"][clipped_action_idxs]
+            if self._action_padding == "raw_zero":
+                actions = actions.copy()
+                actions[invalid_action_idxs] = 0
             actions = self._transform_actions(actions)
             if self._action_padding == "zero":
                 actions = actions.copy()
                 actions[invalid_action_idxs] = 0
+            if self._action_padding in {"zero", "raw_zero"}:
                 batch[ACTION_PAD_MASK][out_idxs] = invalid_action_idxs
             batch[ACTION][out_idxs] = actions
+
+            if action_history_len:
+                history_source = getattr(
+                    self, "_action_history_source", "commanded_action"
+                )
+                if history_source == "executed_action_feedback":
+                    history_offsets = np.arange(
+                        -action_history_len + 1, 1, dtype=np.int64
+                    )
+                    history_idxs = idxs[:, None] + obs_shift + history_offsets[None, :]
+                    invalid_history_idxs = (history_idxs < 0) | (
+                        history_idxs >= feedback_state.shape[0]
+                    )
+                    clipped_history_idxs = np.clip(
+                        history_idxs, 0, max(feedback_state.shape[0] - 1, 0)
+                    )
+                    history_actions = feedback_state[clipped_history_idxs]
+                else:
+                    history_offsets = np.arange(
+                        -action_history_len, 0, dtype=np.int64
+                    )
+                    history_idxs = action_start_idxs[:, None] + history_offsets[None, :]
+                    invalid_history_idxs = (history_idxs < 0) | (
+                        history_idxs >= num_actions
+                    )
+                    clipped_history_idxs = np.clip(
+                        history_idxs, 0, max(num_actions - 1, 0)
+                    )
+                    history_actions = episode["info_demo_action"][clipped_history_idxs]
+                if self._action_history_padding == "raw_zero":
+                    history_actions = history_actions.copy()
+                    history_actions[invalid_history_idxs] = 0
+                if history_source == "executed_action_feedback":
+                    history_actions = self._normalize_feedback(history_actions)
+                else:
+                    history_actions = self._transform_actions(history_actions)
+                if self._action_history_padding == "zero":
+                    history_actions = history_actions.copy()
+                    history_actions[invalid_history_idxs] = 0
+                batch["action_history"][out_idxs] = history_actions
+                if history_source == "executed_action_feedback" and (
+                    self._action_history_padding in {"edge", "repeat"}
+                ):
+                    invalid_history_idxs = np.zeros_like(invalid_history_idxs)
+                batch["action_history_pad_mask"][out_idxs] = invalid_history_idxs
 
             reward_idxs = np.clip(idxs + self._nstep, 0, ep_len)
             batch[REWARD][out_idxs] = episode.get("reward", np.zeros(ep_len + 1))[

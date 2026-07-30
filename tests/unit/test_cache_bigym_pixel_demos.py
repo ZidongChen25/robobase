@@ -4,10 +4,10 @@ from types import SimpleNamespace
 import numpy as np
 
 import pytest
-from demonstrations.demo_converter import DemoConverter
 
 from scripts.cache_bigym_pixel_demos import (
     _demo_conversion_environment,
+    _create_replayed_demo,
     _parse_resolution,
     _validate_amount,
 )
@@ -52,7 +52,7 @@ def test_pre_action_conversion_stores_reset_observation_as_frame_zero(monkeypatc
     )
     converted_metadata = SimpleNamespace(uuid=None)
     monkeypatch.setattr(
-        "demonstrations.demo_converter.Metadata.from_env",
+        "scripts.cache_bigym_pixel_demos.Metadata.from_env",
         lambda env: converted_metadata,
     )
 
@@ -60,7 +60,12 @@ def test_pre_action_conversion_stores_reset_observation_as_frame_zero(monkeypatc
         observation_timing="pre_action",
         include_camera_params=False,
     ):
-        converted = DemoConverter.create_demo_in_new_env(source_demo, FakeEnv())
+        converted = _create_replayed_demo(
+            source_demo,
+            FakeEnv(),
+            observation_timing="pre_action",
+            include_camera_params=False,
+        )
 
     np.testing.assert_array_equal(
         converted.timesteps[0].observation["rgb_head"],

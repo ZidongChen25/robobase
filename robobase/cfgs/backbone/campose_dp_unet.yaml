@@ -1,0 +1,21 @@
+# @package method.backbone
+# CamPose DP architecture. Strict paper/code parity also uses action_sequence=32
+# and a single observation frame.
+type: unet1d
+sequence_length: ${action_sequence}
+diffusion_step_embed_dim: 128
+down_dims: [512, 1024, 2048]
+kernel_size: 5
+n_groups: 8
+conditioning_mode: local
+cond_predict_scale: true
+global_condition_embed_dim: 0
+timestep_embedding_type: campose
+operator_variant: torch
+hidden_dims: [256, 256]
+d_model: 256
+n_heads: 4
+num_layers: 8
+n_cond_layers: 0
+depth: 12
+dropout: 0.0

@@ -1,0 +1,66 @@
+# @package _global_
+
+defaults:
+  - ../env: null
+  - ../method: q_chunking
+  - _self_
+
+seed: 1
+demos: !!float .inf
+num_pretrain_steps: 1000000
+num_explore_steps: 0
+# Workspace counts offline updates in global_env_steps. A 2M upper bound gives
+# the official 1M offline updates followed by 1M online environment steps.
+num_train_frames: 2000000
+# Official main.py collects 5k online transitions before resuming updates while
+# still acting with the learned policy.
+online_update_after_steps: 5000
+num_eval_episodes: 50
+eval_every_steps: 25000
+batch_size: 256
+demo_batch_size: null
+replay_size_before_train: 500
+save_snapshot: true
+snapshot_every_n: 25000
+save_csv: true
+
+pixels: true
+visual_observation_shape: [84, 84]
+frame_stack: 4
+action_sequence: 5
+execution_length: 1
+temporal_ensemble: false
+
+is_imitation_learning: false
+use_min_max_normalization: true
+use_standardization: false
+min_max_margin: 0.0
+norm_obs: true
+use_self_imitation: false
+update_every_steps: 1
+
+replay:
+  nstep: ${action_sequence}
+  size: 1000000
+  demo_size: null
+  num_workers: 0
+  action_padding: zero
+  action_sequence_start_offset: 0
+  include_tp1: true
+
+lazy_replay:
+  use: false
+
+method:
+  # Match the local CQN-AS visual baseline and avoid expanding
+  # batch*views*frame_stack images to ResNet's 224x224 input.
+  encoder_model:
+    type: cqn
+    model: cqn_cnn
+    trainable: true
+    pretrained: false
+    use_plucker: false
+
+hydra:
+  run:
+    dir: ./exp_local/q_chunking/bigym_${env.task_name}_${now:%Y%m%d%H%M%S}

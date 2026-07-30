@@ -1,0 +1,18 @@
+# @package _global_
+
+# Official-compute FLOQ ablation for the causal value gate.  It changes only
+# the integration/source-bank count from the matched 4/4 run to FLOQ's default
+# 8/8; the independent BC policy, MC anchor, and H=4 interventions are fixed.
+defaults:
+  - cqn_flow_floq_coherent_value_gate
+  - _self_
+
+method:
+  num_flow_steps: 8
+  num_flow_samples: 8
+  num_target_flow_samples: 8
+  num_action_flow_samples: 8
+
+hydra:
+  run:
+    dir: ./exp_local/cqn_value_fidelity_flow/bigym_${env.task_name}_floq_compute8_coherent_${now:%Y%m%d%H%M%S}

@@ -1,0 +1,79 @@
+# @package _global_
+action_sequence: 8
+
+method:
+  name: legato
+  policy_label: legato
+  is_rl: false
+  lr: 1e-4
+  num_train_steps: ${num_pretrain_steps}
+  num_flow_steps: 4
+  adaptive_lr: false
+  actor_grad_clip: null
+  use_ema: false
+  ema_decay: 0.9999
+  ema_decay_schedule: diffusers
+  weight_decay: 1.0e-6
+  noise_mask_steps: 0
+  repeat_action: false
+  image_augmentation_type: none
+  horizon_dropout_lengths: null
+  horizon_dropout_probs: null
+  horizon_loss_weights: null
+
+  objective:
+    type: rectified_flow
+    num_flow_steps: ${method.num_flow_steps}
+    sampler: euler
+    train_time_schedule: uniform
+    sample_schedule: uniform
+    time_scale: 1000.0
+
+  flow_source:
+    type: legato
+    delay_min_steps: 1
+    delay_max_steps: 2
+    ramp_min_steps: 1
+    ramp_max_steps: 2
+    schedule_profiles: [hard, linear, cosine]
+    strength_min: 0.5
+    strength_max: 1.0
+    # Include bootstrap/no-continuation cases seen at the first policy call.
+    no_guidance_probability: 0.1
+    eval_delay_steps: 1
+    eval_ramp_steps: 2
+    eval_schedule_profile: linear
+    eval_strength: 1.0
+    # The public Kinetix repository uses a plus sign here; v2 paper algebra is minus.
+    target_mode: paper_minus
+    reference_padding: last
+
+  backbone:
+    type: transformer
+    sequence_length: ${action_sequence}
+    diffusion_step_embed_dim: 256
+    down_dims: [256, 512, 1024]
+    kernel_size: 5
+    n_groups: 8
+    hidden_dims: [256, 256]
+    d_model: 256
+    n_heads: 4
+    num_layers: 8
+    n_cond_layers: 0
+    depth: 12
+    dropout: 0.0
+    operator_variant: legacy
+
+  encoder_model:
+    type: resnet
+    model: resnet18
+    pretrained: true
+    trainable: false
+    use_plucker: false
+    plucker_fusion_mode: null
+    plucker_hidden_channels: 64
+    plucker_identity_init: false
+
+  view_fusion_model:
+    type: multicam_feature
+    mode: flatten

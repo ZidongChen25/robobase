@@ -1,0 +1,29 @@
+# @package _global_
+
+# Stage-163c: "QC-ized" OFFICIAL CQN-AS -- exactly the paper recipe (no
+# epsilon-bin exploration, no margin decay, no mask) with two changes
+# taken from Q-chunking (arXiv 2507.07969): (1) within-chunk 8-step TD
+# backup (replay.nstep=8), (2) receding-horizon replan-8 execution for
+# BOTH training and evaluation, which is what makes the 8-step reward
+# sums (near-)unbiased. Async-eval protocol.
+defaults:
+  - cqn_as_pixel_bigym_demo_driven
+  - _self_
+
+save_csv: true
+eval_every_steps: 1000000
+num_eval_episodes: 0
+num_eval_envs: 0
+save_snapshot: true
+snapshot_every_n: 5000
+log_eval_video: false
+
+replay:
+  nstep: 8
+
+method:
+  temporal_ensemble_replan_interval: 8
+
+hydra:
+  run:
+    dir: ./exp_local/cqn_stage163_replan8/bigym_${env.task_name}_offqc8_${now:%Y%m%d%H%M%S}

@@ -1,0 +1,17 @@
+# @package _global_
+
+# Stage-156 arm SE (cqn-flow.md 38): CCFF + self-imitation + coarse-level
+# epsilon-bin exploration.  Exploration diversifies which cells get
+# visited; self-imitation is the consuming channel that turns successful
+# explored episodes into behavior.  At levels=1 the per-level list has a
+# single entry; dose matches the stage153 total activation rate.
+defaults:
+  - cqn_as_pixel_bigym_stage156_ccff_si_gate
+  - _self_
+
+method:
+  bin_explore_probs: [0.014]
+
+hydra:
+  run:
+    dir: ./exp_local/cqn_stage156_ccff_si/bigym_${env.task_name}_siexp_${now:%Y%m%d%H%M%S}

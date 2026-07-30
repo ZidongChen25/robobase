@@ -1,0 +1,13 @@
+# @package _global_
+
+# Stage-159 arm D (cqn-flow.md 39.5): margin decay WITHOUT exploration.
+defaults:
+  - cqn_as_pixel_bigym_stage158_explore_100k
+  - _self_
+
+method:
+  bin_explore_probs: null
+
+hydra:
+  run:
+    dir: ./exp_local/cqn_stage159_factorial/bigym_${env.task_name}_decayonly_${now:%Y%m%d%H%M%S}

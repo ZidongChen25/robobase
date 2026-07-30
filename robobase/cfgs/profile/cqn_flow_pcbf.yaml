@@ -1,0 +1,32 @@
+# @package _global_
+# Source-consistent Path-Coupled Bellman Flows return critic. This replaces
+# BCFM/DCFM with the PCBF objective; lambda controls the successor-field
+# control variate (lambda=0 is unbiased but has higher target variance).
+method:
+  # The official PCBF optimizer clips the full gradient tree at 1.0.  Without
+  # this, the pixel CQN critic stays finite initially but collapses to NaN
+  # before the first 1k-step checkpoint.
+  critic_grad_clip: 1.0
+  critic_target_tau: 0.005
+  value_mode: return_sample
+  atom_ce_lambda: 0.0
+  demo_fosd: false
+  bcfm_lambda: 0.0
+  dcfm_lambda: 0.0
+  pcbf_loss_coeff: 1.0
+  pcbf_lambda: 0.4
+  num_flow_steps: 10
+  num_flow_samples: 8
+  num_target_flow_samples: 8
+  num_action_flow_samples: 8
+  flow_source_type: gaussian
+  flow_source_std: 1.0
+  antithetic_flow_sources: true
+  fixed_action_flow_sources: true
+  scalar_value_embedding: raw
+  time_embedding_type: raw
+  time_embed_dim: 64
+  time_scale: 1.0
+  clip_flow_trajectory: true
+  endpoint_q_lambda: 0.0
+  source_consistency_lambda: 0.0

@@ -1,0 +1,19 @@
+# @package _global_
+
+# Stage-153 (cqn-flow.md 35): hierarchical epsilon-bin exploration on the
+# vanilla closed-loop-ensemble platform, full demo set.  Per-plan
+# activation probability grows with depth (user spec: coarsest smallest,
+# all small); a fired flip persists across K fresh plans so the temporal
+# ensemble average actually reaches the sibling cell.
+defaults:
+  - cqn_as_pixel_bigym_value_fidelity_gate
+  - _self_
+
+save_csv: true
+
+method:
+  bin_explore_probs: [0.002, 0.004, 0.008]
+
+hydra:
+  run:
+    dir: ./exp_local/cqn_stage153_bin_explore/bigym_${env.task_name}_binexp_${now:%Y%m%d%H%M%S}

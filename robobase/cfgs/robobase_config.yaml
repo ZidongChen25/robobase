@@ -3,6 +3,9 @@ defaults:
   - backend: jax
   - env: null
   - method: null
+  - optional backbone: null
+  - optional encoder: null
+  - optional profile: null
   - intrinsic_reward_module: null
   - launch: null
   - override hydra/launcher: joblib
@@ -12,6 +15,9 @@ create_train_env: true
 num_train_envs: 1
 num_eval_envs: 1
 replay_size_before_train: 2000
+# Optional online-only collection delay after offline pretraining. The policy
+# still acts during this period; only gradient updates are deferred.
+online_update_after_steps: 0
 num_pretrain_steps: 0
 num_pretrain_epochs: null
 eval_every_epochs: null
@@ -81,6 +87,10 @@ replay:
   transition_seq_len: 1  # The length of transition sequence returned from sample() call. Only applicable if sequential is True
   action_sequence_start_offset: 0
   action_padding: zero
+  # Sample transitions uniformly across the whole buffer (episodes weighted by
+  # length) instead of uniformly per episode. Matches flat-buffer replay
+  # semantics such as the official ACFQL implementation.
+  transition_uniform_sampling: false
 
 lazy_replay:
   use: auto

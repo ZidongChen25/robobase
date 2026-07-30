@@ -1,0 +1,15 @@
+# @package _global_
+
+# Treatment arm: action-centered A-learning moment on top of the matched H=1
+# randomized direct-Q control. Known intervention propensity cancels arbitrary
+# state-only return difficulty; TD, MC, BC, towers, and collection stay fixed.
+defaults:
+  - cqn_direct_q_h1_rct_control_two_tower_high_utd4_gate
+  - _self_
+
+method:
+  causal_rct_weight: 0.1
+
+hydra:
+  run:
+    dir: ./exp_local/cqn_flow_high_utd/bigym_${env.task_name}_direct_q_h1_rct_w0p1_utd4_${now:%Y%m%d%H%M%S}

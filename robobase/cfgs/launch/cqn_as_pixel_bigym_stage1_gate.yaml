@@ -1,0 +1,21 @@
+# @package _global_
+
+# Ten-thousand-update, frozen-demo categorical baseline for the CQN-Flow gate.
+# 500 replay seed frames + 10,000 one-update environment steps = 10,500 frames.
+defaults:
+  - cqn_as_pixel_bigym_demo_driven
+  - _self_
+
+num_train_frames: 10500
+batch_size: 16
+demo_batch_size: 16
+use_self_imitation: false
+
+method:
+  # Match the flow profiles' Bellman EMA and expected-Q imitation objective.
+  critic_target_tau: 0.005
+  demo_fosd: false
+
+hydra:
+  run:
+    dir: ./exp_local/pixel_cqn_flow_stage1/bigym_${env.task_name}_direct_c51_${now:%Y%m%d%H%M%S}

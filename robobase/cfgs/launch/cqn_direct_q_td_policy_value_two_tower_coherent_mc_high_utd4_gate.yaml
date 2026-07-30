@@ -1,0 +1,18 @@
+# @package _global_
+
+# Monolithic mechanism control for the non-stationary FLOQ TD arm. It changes
+# the same single target-action variable relative to the replay-next direct-Q
+# launch while rollout remains exact BC. This isolates the flow objective from
+# any benefit caused solely by online-critic Bellman targets.
+defaults:
+  - cqn_direct_q_two_tower_coherent_mc_high_utd4_gate
+  - _self_
+
+method:
+  td_target_action_source: policy_value
+  td_target_policy_value_beta: 1.0
+  policy_value_beta: null
+
+hydra:
+  run:
+    dir: ./exp_local/cqn_flow_high_utd/bigym_${env.task_name}_direct_q_td_policy_value_two_tower_utd4_${now:%Y%m%d%H%M%S}

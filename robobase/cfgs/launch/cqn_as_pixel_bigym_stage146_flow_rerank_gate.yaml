@@ -1,0 +1,22 @@
+# @package _global_
+
+# Stage-146 (flow+CQN line): behavior-side flow proposals + calibrated-Q
+# best-of-N rerank on the decoupled MC-anchored platform, no structured
+# exploration.  Arms differ only in method.flow_policy_candidates
+# (1 = flow-BC-alone control, 8 = rerank treatment).
+defaults:
+  - cqn_as_pixel_bigym_decoupled_value_gate
+  - _self_
+
+save_csv: true
+
+method:
+  mc_return_weight: 0.1
+  flow_policy: true
+  flow_policy_candidates: 8
+  flow_policy_steps: 8
+  flow_policy_lambda: 1.0
+
+hydra:
+  run:
+    dir: ./exp_local/cqn_stage146_flow_rerank/bigym_${env.task_name}_flowrr_${now:%Y%m%d%H%M%S}

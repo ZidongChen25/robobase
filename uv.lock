@@ -1049,16 +1049,6 @@ with-cuda = [
 ]
 
 [[package]]
-name = "jax-resnet"
-version = "0.0.4"
-source = { git = "https://github.com/n2cholas/jax-resnet.git?rev=5b00735aa0a68ec239af4a728ad4a596c1b551f6#5b00735aa0a68ec239af4a728ad4a596c1b551f6" }
-dependencies = [
-    { name = "flax" },
-    { name = "jax" },
-    { name = "jaxlib" },
-]
-
-[[package]]
 name = "jaxlib"
 version = "0.6.2"
 source = { registry = "https://pypi.org/simple" }
@@ -2665,17 +2655,17 @@ dmc = [
 jax = [
     { name = "flax" },
     { name = "jax" },
-    { name = "jax-resnet" },
     { name = "jaxlib" },
     { name = "optax" },
     { name = "orbax-checkpoint" },
+    { name = "safetensors" },
 ]
 jax-cuda12 = [
     { name = "flax" },
     { name = "jax", extra = ["cuda12"] },
-    { name = "jax-resnet" },
     { name = "optax" },
     { name = "orbax-checkpoint" },
+    { name = "safetensors" },
 ]
 pusht = [
     { name = "gym-pusht" },
@@ -2721,8 +2711,6 @@ requires-dist = [
     { name = "imageio-ffmpeg", specifier = "==0.6.0" },
     { name = "jax", marker = "extra == 'jax'", specifier = "==0.6.2" },
     { name = "jax", extras = ["cuda12"], marker = "extra == 'jax-cuda12'", specifier = "==0.6.2" },
-    { name = "jax-resnet", marker = "extra == 'jax'", git = "https://github.com/n2cholas/jax-resnet.git?rev=5b00735aa0a68ec239af4a728ad4a596c1b551f6" },
-    { name = "jax-resnet", marker = "extra == 'jax-cuda12'", git = "https://github.com/n2cholas/jax-resnet.git?rev=5b00735aa0a68ec239af4a728ad4a596c1b551f6" },
     { name = "jaxlib", marker = "extra == 'jax'", specifier = "==0.6.2" },
     { name = "minari", extras = ["gcs", "hf"], marker = "extra == 'd4rl'", specifier = "==0.5.3" },
     { name = "moviepy", specifier = "==2.2.1" },
@@ -2742,6 +2730,8 @@ requires-dist = [
     { name = "rlbench", marker = "extra == 'rlbench'", git = "https://github.com/stepjam/RLBench.git?rev=b80e51feb3694d9959cb8c0408cd385001b01382" },
     { name = "robosuite", marker = "extra == 'robomimic'", specifier = "==1.4.1" },
     { name = "safetensors", marker = "extra == 'bigym'", specifier = "==0.6.2" },
+    { name = "safetensors", marker = "extra == 'jax'", specifier = "==0.6.2" },
+    { name = "safetensors", marker = "extra == 'jax-cuda12'", specifier = "==0.6.2" },
     { name = "scipy", specifier = "==1.15.3" },
     { name = "tensorboard", marker = "extra == 'tensorboard'" },
     { name = "tensorboardx", marker = "extra == 'tensorboard'", specifier = "==2.6.4" },

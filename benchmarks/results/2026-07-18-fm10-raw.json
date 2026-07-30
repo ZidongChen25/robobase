@@ -1,0 +1,430 @@
+{
+  "benchmark": "RoboBase JAX vs CleanDiffuser matched state-only global UNet",
+  "comparisons": [
+    {
+      "comparable": true,
+      "ema": true,
+      "jax_sample_cv_percent": 0.24514266781996702,
+      "jax_sample_mean_speedup_percent": 153.6503166473202,
+      "jax_sample_median_speedup_percent": 146.99583575312712,
+      "jax_update_cv_percent": 0.7075857267657398,
+      "jax_update_mean_speedup_percent": 43.80269273586785,
+      "jax_update_median_speedup_percent": 43.871675283488074,
+      "mismatches": [],
+      "objective": "flow_matching",
+      "primary_gate_metric": "median_ms",
+      "repeat": 0,
+      "sample_meets_30_percent": true,
+      "torch_mode": "eager",
+      "torch_sample_cv_percent": 4.806481599256497,
+      "torch_update_cv_percent": 0.11705827286550478,
+      "update_meets_30_percent": true
+    },
+    {
+      "comparable": true,
+      "ema": true,
+      "jax_sample_cv_percent": 1.8025377123660504,
+      "jax_sample_mean_speedup_percent": 234.30672846876942,
+      "jax_sample_median_speedup_percent": 235.339815338879,
+      "jax_update_cv_percent": 0.6769525683185307,
+      "jax_update_mean_speedup_percent": 83.74752120903328,
+      "jax_update_median_speedup_percent": 83.75018458372443,
+      "mismatches": [],
+      "objective": "flow_matching",
+      "primary_gate_metric": "median_ms",
+      "repeat": 0,
+      "sample_meets_30_percent": true,
+      "torch_mode": "default",
+      "torch_sample_cv_percent": 3.574879986836003,
+      "torch_update_cv_percent": 2.2618584975146723,
+      "update_meets_30_percent": true
+    }
+  ],
+  "gpu_after": {
+    "compute_processes": [
+      "3684212, /home/jz5725/Projects/CQN-AS-G1/.venv/bin/python3, 729",
+      "3684148, /home/jz5725/Projects/CQN-AS-G1/.venv/bin/python3, 729"
+    ],
+    "index": 3,
+    "memory_total_mib": 32607.0,
+    "memory_used_mib": 1494.0,
+    "name": "NVIDIA GeForce RTX 5090",
+    "temperature_c": 33.0,
+    "utilization_percent": 0.0,
+    "uuid": "GPU-03f1431f-36c0-b258-6ca1-05007175e3eb"
+  },
+  "gpu_before": {
+    "compute_processes": [
+      "3684212, /home/jz5725/Projects/CQN-AS-G1/.venv/bin/python3, 729",
+      "3684148, /home/jz5725/Projects/CQN-AS-G1/.venv/bin/python3, 729"
+    ],
+    "index": 3,
+    "memory_total_mib": 32607.0,
+    "memory_used_mib": 1494.0,
+    "name": "NVIDIA GeForce RTX 5090",
+    "temperature_c": 31.0,
+    "utilization_percent": 0.0,
+    "uuid": "GPU-03f1431f-36c0-b258-6ca1-05007175e3eb"
+  },
+  "gpu_nonexclusive_warning": "GPU state is sampled only before and after each process. Other jobs may affect results; inspect CV and repeat on an exclusive GPU before release claims.",
+  "repos": {
+    "clean_diffuser": {
+      "commit": "05f17fc9dbeae7c19a5e264632c9ae9aaac5994e",
+      "path": "/tmp/CleanDiffuser-baseline-05f17fc9",
+      "status_short": []
+    },
+    "jax": {
+      "commit": "3a45dcdcfb8f981779de39ec4a97eaf0d117c133",
+      "path": "/home/zc1525/robobase_jaxflat",
+      "status_short": [
+        "M README.md",
+        " M pyproject.toml",
+        " M robobase/cfgs/method/act.yaml",
+        " M robobase/cfgs/method/bc.yaml",
+        " M robobase/cfgs/method/diffusion.yaml",
+        " M robobase/cfgs/method/edp.yaml",
+        " M robobase/cfgs/method/flow_matching.yaml",
+        " M robobase/envs/bigym.py",
+        " M robobase/envs/camera_conditioning.py",
+        " M robobase/factory.py",
+        " M robobase/language.py",
+        " M robobase/method/act.py",
+        " M robobase/method/bc.py",
+        " M robobase/method/diffusion.py",
+        " M robobase/method/flow_matching.py",
+        " M robobase/models/act.py",
+        " M robobase/models/backbone.py",
+        " M robobase/models/backbones/common.py",
+        " M robobase/models/backbones/unet1d.py",
+        " M robobase/models/encoder.py",
+        " M robobase/replay_buffer/bigym_lazy_replay.py",
+        " M robobase/replay_buffer/iterator.py",
+        " M robobase/utils.py",
+        " M scripts/analyze_dynamics_predictability.py",
+        " M test_comparison.md",
+        " M tests/unit/envs/test_bigym.py",
+        " M tests/unit/envs/test_camera_conditioning.py",
+        " M tests/unit/replay_buffer/test_bigym_lazy_replay.py",
+        " M tests/unit/test_act.py",
+        " M tests/unit/test_bc.py",
+        " M tests/unit/test_diffusion.py",
+        " M tests/unit/test_flow_matching.py",
+        " M tests/unit/utils/test_demo_merge_iterator.py",
+        " m third_party/bigym",
+        " M uv.lock",
+        "?? benchmarks/",
+        "?? pen_action_chunk_horizon_dropout.md",
+        "?? plucker_benchmark_table.tex",
+        "?? robobase/cfgs/backbone/",
+        "?? robobase/cfgs/encoder/",
+        "?? robobase/models/resnet.py",
+        "?? tests/unit/test_factory.py",
+        "?? tests/unit/test_jax_only_runtime.py"
+      ]
+    }
+  },
+  "runs": [
+    {
+      "action_dim": 10,
+      "backbone": "unet1d",
+      "backend": "jax",
+      "batch_size": 256,
+      "compile_mode": "jax.jit",
+      "cond_predict_scale": true,
+      "condition_dim": 46,
+      "conditioning_mode": "global",
+      "device": "cuda:0",
+      "down_dims": [
+        256,
+        512,
+        1024
+      ],
+      "dtype": "float32",
+      "ema": true,
+      "embed_dim": 256,
+      "encoder": "none",
+      "eval_batch_size": 10,
+      "framework_version": "0.6.2",
+      "fusion": "none",
+      "gpu_snapshot_after": {
+        "compute_processes": [
+          "3684212, /home/jz5725/Projects/CQN-AS-G1/.venv/bin/python3, 729",
+          "3684148, /home/jz5725/Projects/CQN-AS-G1/.venv/bin/python3, 729"
+        ],
+        "index": 3,
+        "memory_total_mib": 32607.0,
+        "memory_used_mib": 1494.0,
+        "name": "NVIDIA GeForce RTX 5090",
+        "temperature_c": 34.0,
+        "utilization_percent": 0.0,
+        "uuid": "GPU-03f1431f-36c0-b258-6ca1-05007175e3eb"
+      },
+      "horizon": 16,
+      "implementation": "RoboBase JAX",
+      "kernel_size": 5,
+      "n_groups": 8,
+      "objective": "flow_matching",
+      "obs_shape": [
+        2,
+        23
+      ],
+      "parameter_count": 68906250,
+      "repeat": 0,
+      "sample": {
+        "cv_percent": 0.24514266781996702,
+        "max_ms": 15.184808056801558,
+        "mean_ms": 15.055621170904487,
+        "median_ms": 15.05269343033433,
+        "min_ms": 15.002511907368898,
+        "p95_ms": 15.09307031519711
+      },
+      "sample_actions_per_second": 664.2037473236473,
+      "sample_first_call_seconds": 4.685406839009374,
+      "sample_steps": 10,
+      "stderr_tail": "",
+      "timestep_embedding_type": "clean_diffuser",
+      "update": {
+        "cv_percent": 0.7075857267657398,
+        "max_ms": 12.885969132184982,
+        "mean_ms": 12.754172924906015,
+        "median_ms": 12.746258056722581,
+        "min_ms": 12.56939978338778,
+        "p95_ms": 12.873715034220368
+      },
+      "update_first_call_seconds": 18.770759790204465,
+      "update_samples_per_second": 20071.862088375005,
+      "worker_wall_seconds": 40.77198091894388
+    },
+    {
+      "action_dim": 10,
+      "backbone": "unet1d",
+      "backend": "torch",
+      "batch_size": 256,
+      "compile_mode": "eager",
+      "compiler_counter_totals": {},
+      "cond_predict_scale": true,
+      "condition_dim": 46,
+      "conditioning_mode": "global",
+      "cuda_version": "13.0",
+      "device": "NVIDIA GeForce RTX 5090",
+      "down_dims": [
+        256,
+        512,
+        1024
+      ],
+      "dtype": "float32",
+      "ema": true,
+      "embed_dim": 256,
+      "encoder": "none",
+      "eval_batch_size": 10,
+      "framework_version": "2.11.0+cu130",
+      "fusion": "none",
+      "gpu_snapshot_after": {
+        "compute_processes": [
+          "3684212, /home/jz5725/Projects/CQN-AS-G1/.venv/bin/python3, 729",
+          "3684148, /home/jz5725/Projects/CQN-AS-G1/.venv/bin/python3, 729"
+        ],
+        "index": 3,
+        "memory_total_mib": 32607.0,
+        "memory_used_mib": 1494.0,
+        "name": "NVIDIA GeForce RTX 5090",
+        "temperature_c": 34.0,
+        "utilization_percent": 0.0,
+        "uuid": "GPU-03f1431f-36c0-b258-6ca1-05007175e3eb"
+      },
+      "graph_breaks": 0,
+      "horizon": 16,
+      "implementation": "CleanDiffuser",
+      "implementation_source": "/tmp/CleanDiffuser-baseline-05f17fc9/cleandiffuser",
+      "kernel_size": 5,
+      "n_groups": 8,
+      "objective": "flow_matching",
+      "obs_shape": [
+        2,
+        23
+      ],
+      "parameter_count": 68906250,
+      "repeat": 0,
+      "sample": {
+        "cv_percent": 4.806481599256497,
+        "max_ms": 41.52810084633529,
+        "mean_ms": 38.18863077322021,
+        "median_ms": 37.179525941610336,
+        "min_ms": 36.858886014670134,
+        "p95_ms": 41.35718470206484
+      },
+      "sample_actions_per_second": 261.85803988061554,
+      "sample_first_call_seconds": 0.5093927921261638,
+      "sample_steps": 10,
+      "stderr_tail": "",
+      "timestep_embedding_type": "clean_diffuser",
+      "unique_graphs": 0,
+      "update": {
+        "cv_percent": 0.11705827286550478,
+        "max_ms": 18.397970125079155,
+        "mean_ms": 18.340844102203846,
+        "median_ms": 18.33825500216335,
+        "min_ms": 18.2987111620605,
+        "p95_ms": 18.382824200671166
+      },
+      "update_first_call_seconds": 1.2665344709530473,
+      "update_samples_per_second": 13957.918107446261,
+      "worker_wall_seconds": 9.518606168916449
+    },
+    {
+      "action_dim": 10,
+      "backbone": "unet1d",
+      "backend": "jax",
+      "batch_size": 256,
+      "compile_mode": "jax.jit",
+      "cond_predict_scale": true,
+      "condition_dim": 46,
+      "conditioning_mode": "global",
+      "device": "cuda:0",
+      "down_dims": [
+        256,
+        512,
+        1024
+      ],
+      "dtype": "float32",
+      "ema": true,
+      "embed_dim": 256,
+      "encoder": "none",
+      "eval_batch_size": 10,
+      "framework_version": "0.6.2",
+      "fusion": "none",
+      "gpu_snapshot_after": {
+        "compute_processes": [
+          "3684212, /home/jz5725/Projects/CQN-AS-G1/.venv/bin/python3, 729",
+          "3684148, /home/jz5725/Projects/CQN-AS-G1/.venv/bin/python3, 729"
+        ],
+        "index": 3,
+        "memory_total_mib": 32607.0,
+        "memory_used_mib": 1494.0,
+        "name": "NVIDIA GeForce RTX 5090",
+        "temperature_c": 34.0,
+        "utilization_percent": 1.0,
+        "uuid": "GPU-03f1431f-36c0-b258-6ca1-05007175e3eb"
+      },
+      "horizon": 16,
+      "implementation": "RoboBase JAX",
+      "kernel_size": 5,
+      "n_groups": 8,
+      "objective": "flow_matching",
+      "obs_shape": [
+        2,
+        23
+      ],
+      "parameter_count": 68906250,
+      "repeat": 0,
+      "sample": {
+        "cv_percent": 1.8025377123660504,
+        "max_ms": 16.173764830455184,
+        "mean_ms": 15.396624361164868,
+        "median_ms": 15.2827815618366,
+        "min_ms": 15.120530966669321,
+        "p95_ms": 16.10287217190489
+      },
+      "sample_actions_per_second": 649.4930164837396,
+      "sample_first_call_seconds": 5.971995908068493,
+      "sample_steps": 10,
+      "stderr_tail": "",
+      "timestep_embedding_type": "clean_diffuser",
+      "update": {
+        "cv_percent": 0.6769525683185307,
+        "max_ms": 12.82288390211761,
+        "mean_ms": 12.617885577492416,
+        "median_ms": 12.597267399542034,
+        "min_ms": 12.478312943130732,
+        "p95_ms": 12.752629595343024
+      },
+      "update_first_call_seconds": 19.752250252990052,
+      "update_samples_per_second": 20288.66076077348,
+      "worker_wall_seconds": 43.78597497893497
+    },
+    {
+      "action_dim": 10,
+      "backbone": "unet1d",
+      "backend": "torch",
+      "batch_size": 256,
+      "compile_mode": "default",
+      "compiler_counter_totals": {
+        "aot_autograd": 65,
+        "frames": 36,
+        "graph_break": 0,
+        "inductor": 375,
+        "stats": 720,
+        "unimplemented": 4
+      },
+      "cond_predict_scale": true,
+      "condition_dim": 46,
+      "conditioning_mode": "global",
+      "cuda_version": "13.0",
+      "device": "NVIDIA GeForce RTX 5090",
+      "down_dims": [
+        256,
+        512,
+        1024
+      ],
+      "dtype": "float32",
+      "ema": true,
+      "embed_dim": 256,
+      "encoder": "none",
+      "eval_batch_size": 10,
+      "framework_version": "2.11.0+cu130",
+      "fusion": "none",
+      "gpu_snapshot_after": {
+        "compute_processes": [
+          "3684212, /home/jz5725/Projects/CQN-AS-G1/.venv/bin/python3, 729",
+          "3684148, /home/jz5725/Projects/CQN-AS-G1/.venv/bin/python3, 729"
+        ],
+        "index": 3,
+        "memory_total_mib": 32607.0,
+        "memory_used_mib": 1494.0,
+        "name": "NVIDIA GeForce RTX 5090",
+        "temperature_c": 33.0,
+        "utilization_percent": 4.0,
+        "uuid": "GPU-03f1431f-36c0-b258-6ca1-05007175e3eb"
+      },
+      "graph_breaks": 0,
+      "horizon": 16,
+      "implementation": "CleanDiffuser",
+      "implementation_source": "/tmp/CleanDiffuser-baseline-05f17fc9/cleandiffuser",
+      "kernel_size": 5,
+      "n_groups": 8,
+      "objective": "flow_matching",
+      "obs_shape": [
+        2,
+        23
+      ],
+      "parameter_count": 68906250,
+      "repeat": 0,
+      "sample": {
+        "cv_percent": 3.574879986836003,
+        "max_ms": 58.79878485575318,
+        "mean_ms": 51.47195119643584,
+        "median_ms": 51.249251468107104,
+        "min_ms": 49.659826094284654,
+        "p95_ms": 52.54689386347309
+      },
+      "sample_actions_per_second": 194.28056966086893,
+      "sample_first_call_seconds": 1.8754299590364099,
+      "sample_steps": 10,
+      "stderr_tail": "me-ov-file#tlparse-parse-structured-pt2-logs). Adding a graph break.\nW0718 08:56:04.190000 3704826 torch/_dynamo/exc.py:623] [2/0_1]   Hint: Report an issue to the backend compiler repo.\nW0718 08:56:04.190000 3704826 torch/_dynamo/exc.py:623] [2/0_1] \nW0718 08:56:04.190000 3704826 torch/_dynamo/exc.py:623] [2/0_1]   Developer debug context: Backend: inductor\nW0718 08:56:04.190000 3704826 torch/_dynamo/exc.py:623] [2/0_1]     Exception:aten._local_scalar_dense.default\nW0718 08:56:04.190000 3704826 torch/_dynamo/exc.py:623] [2/0_1] \nW0718 08:56:04.190000 3704826 torch/_dynamo/exc.py:623] [2/0_1]     While executing %embed : [num_users=2] = call_method[target=reshape](args = (%input_5, 256, 2, %l_self_out_dim, 1), kwargs = {})\nW0718 08:56:04.190000 3704826 torch/_dynamo/exc.py:623] [2/0_1]     Original traceback:\nW0718 08:56:04.190000 3704826 torch/_dynamo/exc.py:623] [2/0_1]       File \"/tmp/CleanDiffuser-baseline-05f17fc9/cleandiffuser/nn_diffusion/chiunet.py\", line 36, in forward\nW0718 08:56:04.190000 3704826 torch/_dynamo/exc.py:623] [2/0_1]         embed = embed.reshape(\nW0718 08:56:04.190000 3704826 torch/_dynamo/exc.py:623] [2/0_1] \nW0718 08:56:04.190000 3704826 torch/_dynamo/exc.py:623] [2/0_1]     Use tlparse to see full graph. (https://github.com/pytorch/tlparse?tab=readme-ov-file#tlparse-parse-structured-pt2-logs)\nW0718 08:56:04.190000 3704826 torch/_dynamo/exc.py:623] [2/0_1]     Traceback:\nW0718 08:56:04.190000 3704826 torch/_dynamo/exc.py:623] [2/0_1]       File \"/tmp/CleanDiffuser-baseline-05f17fc9/cleandiffuser/nn_diffusion/chiunet.py\", line 45, in forward\nW0718 08:56:04.190000 3704826 torch/_dynamo/exc.py:623] [2/0_1]         return out\nW0718 08:56:04.190000 3704826 torch/_dynamo/exc.py:623] [2/0_1] \nW0718 08:56:04.190000 3704826 torch/_dynamo/exc.py:623] [2/0_1] \nW0718 08:56:04.190000 3704826 torch/_dynamo/exc.py:623] [2/0_1]  For more details about this graph break, please visit: https://meta-pytorch.github.io/compile-graph-break-site/gb/gb0219.html\n",
+      "timestep_embedding_type": "clean_diffuser",
+      "unique_graphs": 17,
+      "update": {
+        "cv_percent": 2.2618584975146723,
+        "max_ms": 24.26347602158785,
+        "mean_ms": 23.18505197763443,
+        "median_ms": 23.14750209916383,
+        "min_ms": 22.580649005249143,
+        "p95_ms": 24.26110664382577
+      },
+      "update_first_call_seconds": 4.956123351817951,
+      "update_samples_per_second": 11041.596984425638,
+      "worker_wall_seconds": 13.916080305818468
+    }
+  ],
+  "timestamp_unix": 1784361262.8730867
+}

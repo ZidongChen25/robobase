@@ -26,10 +26,45 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--backbone-sequence-length", type=int, default=None)
     parser.add_argument("--execution-length", type=int, default=None)
     parser.add_argument("--flow-schedule", type=str, default=None)
+    parser.add_argument("--lang-feature-path", type=Path, default=None)
+    parser.add_argument("--encoder-weights-path", type=Path, default=None)
+    parser.add_argument(
+        "--xla-fusion-cache-dir",
+        type=Path,
+        default=None,
+        help=(
+            "Persist XLA GPU fusion autotuning decisions in this directory and "
+            "enable deterministic GPU operations. Reuse the populated directory "
+            "for repeatable checkpoint evaluations on identical hardware."
+        ),
+    )
     return parser.parse_args()
 
 
-def _configure_process(gpu_id: int | None) -> None:
+def _append_xla_flag(flag: str) -> None:
+    """Append one XLA flag while rejecting a conflicting caller override."""
+    flag_name = flag.split("=", 1)[0]
+    current = os.environ.get("XLA_FLAGS", "").split()
+    existing = [
+        value
+        for value in current
+        if value == flag_name or value.startswith(f"{flag_name}=")
+    ]
+    if existing:
+        if existing != [flag]:
+            raise ValueError(
+                f"Conflicting {flag_name} values in XLA_FLAGS: "
+                f"{existing!r} versus requested {flag!r}."
+            )
+        return
+    current.append(flag)
+    os.environ["XLA_FLAGS"] = " ".join(current)
+
+
+def _configure_process(
+    gpu_id: int | None,
+    xla_fusion_cache_dir: Path | None = None,
+) -> None:
     os.environ.setdefault("MUJOCO_GL", "egl")
     os.environ.setdefault("PYOPENGL_PLATFORM", "egl")
     os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
@@ -37,7 +72,20 @@ def _configure_process(gpu_id: int | None) -> None:
     os.environ.setdefault("ABSL_MIN_LOG_LEVEL", "3")
     os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
     os.environ.setdefault("XLA_PYTHON_CLIENT_MEM_FRACTION", "0.25")
-    os.environ.setdefault("XLA_FLAGS", "--xla_gpu_enable_command_buffer=")
+    _append_xla_flag("--xla_gpu_enable_command_buffer=")
+    if xla_fusion_cache_dir is not None:
+        cache_dir = xla_fusion_cache_dir.expanduser().resolve()
+        if any(character.isspace() for character in str(cache_dir)):
+            raise ValueError(
+                "--xla-fusion-cache-dir cannot contain whitespace because XLA_FLAGS "
+                f"is whitespace-delimited; got {cache_dir}."
+            )
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        _append_xla_flag(
+            f"--xla_gpu_per_fusion_autotune_cache_dir={cache_dir}"
+        )
+        _append_xla_flag("--xla_gpu_deterministic_ops=true")
+        _append_xla_flag("--xla_gpu_exclude_nondeterministic_ops=true")
     if gpu_id is not None and gpu_id >= 0:
         gpu = str(gpu_id)
         os.environ["CUDA_VISIBLE_DEVICES"] = gpu
@@ -109,6 +157,24 @@ def _run_eval(args: argparse.Namespace) -> dict:
         cfg.method.sample_schedule = str(args.flow_schedule)
         if "objective" in cfg.method and cfg.method.objective is not None:
             cfg.method.objective.sample_schedule = str(args.flow_schedule)
+    if args.lang_feature_path is not None:
+        lang_feature_path = args.lang_feature_path.expanduser().resolve()
+        cfg.method.lang_feature_source = "precomputed"
+        cfg.method.lang_feature_path = str(lang_feature_path)
+    if args.encoder_weights_path is not None:
+        encoder_weights_path = args.encoder_weights_path.expanduser().resolve()
+        if not encoder_weights_path.is_file():
+            raise FileNotFoundError(
+                f"missing encoder weights: {encoder_weights_path}"
+            )
+        if cfg.method.get("encoder_model", None) is None:
+            raise ValueError(
+                "--encoder-weights-path requires method.encoder_model in the run config."
+            )
+        cfg.method.encoder_model.pretrained = True
+        cfg.method.encoder_model.pretrained_weights_path = str(
+            encoder_weights_path
+        )
 
     OmegaConf.resolve(cfg)
 
@@ -138,6 +204,20 @@ def _run_eval(args: argparse.Namespace) -> dict:
                 cfg.method.get("train_time_schedule", "uniform"),
             )
         ),
+        "lang_feature_source": str(cfg.method.get("lang_feature_source", "tokens")),
+        "lang_feature_path": cfg.method.get("lang_feature_path", None),
+        "encoder_weights_path": (
+            cfg.method.get("encoder_model", {}).get(
+                "pretrained_weights_path",
+                None,
+            )
+        ),
+        "xla_flags": os.environ.get("XLA_FLAGS", ""),
+        "xla_fusion_cache_dir": (
+            str(args.xla_fusion_cache_dir.expanduser().resolve())
+            if getattr(args, "xla_fusion_cache_dir", None) is not None
+            else None
+        ),
         "gpu_id": args.gpu_id,
         "metrics": {
             key: float(value)
@@ -149,10 +229,10 @@ def _run_eval(args: argparse.Namespace) -> dict:
 
 def main() -> int:
     args = _parse_args()
-    _configure_process(args.gpu_id)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     started = time.time()
     try:
+        _configure_process(args.gpu_id, args.xla_fusion_cache_dir)
         payload = _run_eval(args)
         payload["elapsed_seconds"] = time.time() - started
         args.output.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
@@ -167,6 +247,22 @@ def main() -> int:
             "snapshot": str(args.snapshot),
             "flow_steps": int(args.flow_steps),
             "flow_schedule": args.flow_schedule,
+            "lang_feature_path": (
+                str(args.lang_feature_path)
+                if args.lang_feature_path is not None
+                else None
+            ),
+            "encoder_weights_path": (
+                str(args.encoder_weights_path)
+                if args.encoder_weights_path is not None
+                else None
+            ),
+            "xla_flags": os.environ.get("XLA_FLAGS", ""),
+            "xla_fusion_cache_dir": (
+                str(args.xla_fusion_cache_dir.expanduser().resolve())
+                if args.xla_fusion_cache_dir is not None
+                else None
+            ),
             "gpu_id": args.gpu_id,
             "elapsed_seconds": time.time() - started,
         }

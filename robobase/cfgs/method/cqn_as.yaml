@@ -26,9 +26,135 @@ method:
   centralized_critic: false
   use_dueling: true
   always_bootstrap: false
+  # After temporal ensembling, optionally perturb one actually executed action
+  # coordinate by one C2F cell width. This creates local online action support
+  # without replacing the full BC plan. Zero preserves legacy rollout RNG.
+  structured_exploration_prob: 0.0
+  structured_exploration_level: 1
+  # Number of consecutive environment decisions that share one sampled
+  # coordinate/direction. Probability is the start probability while inactive.
+  structured_exploration_horizon: 1
+  # Arm-B open-loop bin-space exploration (cqn-flow.md 32.2): per plan
+  # refresh, with this probability move one dimension's level-l bin to a
+  # random sibling cell for the whole chunk (inherit-refine, alias-free).
+  # Requires method.temporal_ensemble=false. Level null = random per flip.
+  bin_flip_prob: 0.0
+  bin_flip_level: null
+  # Stage-153 hierarchical epsilon-bin exploration (cqn-flow.md 35): one
+  # probability per level (coarsest first, intended increasing with depth);
+  # a fired flip persists across the next K fresh plans so the temporal
+  # ensemble actually reaches the sibling cell. Works WITH the closed-loop
+  # ensemble (unlike bin_flip_prob). null = legacy.
+  bin_explore_probs: null
+  # Stage-162: optional multiplier schedule on every level's activation
+  # probability, e.g. linear(1.0,0.0,100000) anneals exploration to zero.
+  bin_explore_schedule: null
+  # Plans a fired flip persists across (null = action_sequence; with a
+  # sparser replan interval j, set to window_steps / j).
+  bin_explore_persist_plans: null
+  # Stage-160 random low-dim observation mask: during updates (never at
+  # act()), zero each low-dim frame except its last keep_last dims with
+  # this per-sample probability, forcing visual reliance. Pair with
+  # env.append_floating_base_to_low_dim=true so the kept tail is the
+  # floating-base state. 0.0 = legacy.
+  low_dim_mask_prob: 0.0
+  low_dim_mask_keep_last: 0
   stddev_schedule: "0.01"
   bc_lambda: 1.0
+  # Optional schedule string (e.g. "linear(1.0,0.2,10000)") replacing the
+  # constant bc_lambda for the canonical demo FOSD/margin terms (arm-B
+  # assumption-retirement, cqn-flow.md 32.2). Null keeps legacy constant.
+  bc_lambda_schedule: null
   bc_margin: 0.1
+  # Canonical CQN-AS uses both FOSD and expected-Q large-margin imitation.
+  # Disable only for a margin-matched comparison against scalar flow critics.
+  demo_fosd: true
+  # Diagnostic mode: train a categorical BC policy head and a TD-only critic.
+  # The legacy CQN-AS path remains the default for checkpoint compatibility.
+  separate_bc_policy: false
+  bc_policy_stop_gradient: false
+  # Direct-Q research arms may import a validation-selected clean CQN-AS
+  # target critic as their exact behavior policy. `legacy_c51` preserves all
+  # 51 atoms and ranks bins by expected return; freezing also protects the
+  # dedicated policy encoder from optimizer decay.
+  freeze_bc_policy: false
+  bc_policy_mode: behavior_logits
+  frozen_policy_snapshot: null
+  # Give the BC behavior policy its own trainable visual tower. This is the
+  # strict value/imitation isolation switch; stop-gradient alone is only an
+  # encoder-freezing ablation.
+  distinct_policy_encoder: false
+  # critic: Double-CQN argmax; replay_next: SARSA target from the next actually
+  # executed action in replay; bc_policy: current BC policy target;
+  # policy_value: online critic regularized by the current BC support prior.
+  td_target_action_source: critic
+  # Used only by policy_value target selection. This is independent of the
+  # rollout policy_value_beta, so behavior collection may remain exact BC.
+  td_target_policy_value_beta: null
+  # effective_k0 restricts TD to the first actually executed action token.
+  critic_sequence_mode: full
+  # Auxiliary C51 cross-entropy to the completed-episode discounted return of
+  # the executed action. Zero preserves the legacy replay/update contract.
+  mc_return_weight: 0.0
+  # Let the MC loss train the critic head while protecting the policy-trained
+  # visual representation. TD and BC retain their existing encoder gradients.
+  mc_return_stop_gradient_encoder: false
+  # Calibrate Q through the dueling value stream while stop-gradient preserving
+  # the current action's advantage logits. This removes the direct MC gradient
+  # to advantage parameters; atom-softmax and encoder coupling can still change
+  # expected-Q ranking and must be measured by the causal probe.
+  mc_return_value_only: false
+  # Optional replay-only action-centered causal advantage moment. It uses the
+  # known propensity of one-step structured interventions and completed return
+  # to orthogonalize state-only outcome difficulty. Direct scalar-Q only.
+  causal_rct_weight: 0.0
+  causal_rct_level: null
+  # Stage-141 control-variate-adjusted causal RCT for the decoupled C51 path.
+  # Null disables the block entirely (legacy graph). 0.0 runs the identical
+  # graph with a zero-weighted loss, giving an exactly matched control arm.
+  # The outcome is adjusted by the target-critic Q of the pre-treatment
+  # action, which cuts outcome variance 10-15x (cqn-flow.md section 22).
+  cv_rct_weight: null
+  cv_rct_level: null
+  cv_rct_baseline: target_q
+  # Route-(c) support-only improvement (cqn-flow.md 26.2): IQL-style
+  # expectile state value + advantage-weighted BC over demo AND online
+  # transitions. Null disables both (legacy graph and params unchanged).
+  # No counterfactual action is ever queried.
+  awr_beta: null
+  awr_weight_max: 10.0
+  awr_expectile_tau: 0.7
+  # flow+CQN line (cqn-flow.md 29): behavior-side conditional flow proposes
+  # demonstration-style chunks; the calibrated critic reranks M candidates
+  # at rollout. False keeps legacy params/graph untouched.
+  flow_policy: false
+  flow_policy_candidates: 8
+  flow_policy_steps: 8
+  flow_policy_lambda: 1.0
+  # EMA weights for rollout sampling (null = use online weights).
+  flow_policy_ema: null
+  # Capacity overrides for the flow head only (null = inherit model/gru).
+  flow_policy_hidden_dims: null
+  flow_policy_gru_layers: null
+  # Stage-152 coarse-flow (cqn-flow.md 34): canonical critic keeps the bin
+  # decision at the coarse resolution where sibling bins have data support
+  # (TD counterfactuals identifiable); a bin-conditioned flow head models
+  # the continuous within-cell residual. Intended with levels: 1. Reuses
+  # flow_policy_steps/lambda/ema/hidden_dims/gru_layers. False = legacy.
+  coarse_flow: false
+  # Stage-155 no-selection control: flow models the full action chunk with
+  # no bin conditioning and the critic never touches rollout actions.
+  # (CCFF - pure) isolates the coarse selection mechanism.
+  coarse_flow_pure: false
+  # Optional weighted self-distillation of high-return online chunks into
+  # the flow (requires mc_return_weight > 0 so mc_returns are real; inert
+  # otherwise because mc_returns default to zeros < threshold).
+  coarse_flow_selfdistill_weight: null
+  coarse_flow_selfdistill_threshold: 0.5
+  # Null keeps the independent BC policy as rollout behavior. A finite beta
+  # evaluates normalized direct-C51 Q + beta * BC log-probability on the same
+  # checkpoint, enabling a paired action-facing control for CQN-Flow.
+  policy_value_beta: null
   use_target_network_for_rollout: true
   num_update_steps: 1
 

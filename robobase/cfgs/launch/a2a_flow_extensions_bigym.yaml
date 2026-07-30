@@ -1,0 +1,13 @@
+# @package _global_
+defaults:
+  - flow_extensions_bigym
+  - override /method: a2a
+
+method:
+  name: a2a
+  policy_label: a2a
+  flow_source:
+    history_source: executed_action_feedback
+    history_padding: edge
+  backbone:
+    sequence_length: 1

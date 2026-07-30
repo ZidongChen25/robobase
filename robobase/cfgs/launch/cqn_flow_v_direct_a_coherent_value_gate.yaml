@@ -1,0 +1,18 @@
+# @package _global_
+
+# Stage-X: a candidate-independent scalar Flow-V baseline plus a direct C51
+# residual head for action-bin ranking. BC retains its own visual tower so
+# imitation gradients cannot enter the value representation.
+defaults:
+  - cqn_flow_floq_compute8_coherent_value_gate
+  - _self_
+
+method:
+  critic_architecture: flow_v_direct_a
+  advantage_c51_lambda: 1.0
+  advantage_q_lambda: 1.0
+  distinct_policy_encoder: true
+
+hydra:
+  run:
+    dir: ./exp_local/cqn_value_fidelity_flow/bigym_${env.task_name}_flow_v_direct_a_two_tower_${now:%Y%m%d%H%M%S}

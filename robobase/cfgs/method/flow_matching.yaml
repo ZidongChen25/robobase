@@ -3,17 +3,22 @@ action_sequence: 20
 
 method:
   name: flow_matching
+  policy_label: flow_matching
   is_rl: false
   lr: 1e-4
   num_train_steps: ${num_pretrain_steps}
   num_flow_steps: 5
-  adaptive_lr: true
+  # A constant LR is safe when this method group is composed without a launch.
+  # Complete launches can opt into a schedule after setting num_train_steps.
+  adaptive_lr: false
   actor_grad_clip: null
   use_ema: false
   ema_decay: 0.9999
+  ema_decay_schedule: diffusers
   weight_decay: 1.0e-6
   noise_mask_steps: 0
   repeat_action: false
+  image_augmentation_type: none
   horizon_dropout_lengths: null
   horizon_dropout_probs: null
   horizon_loss_weights: null
@@ -23,6 +28,7 @@ method:
     num_flow_steps: ${method.num_flow_steps}
     sampler: euler
     train_time_schedule: uniform
+    time_scale: 1000.0
 
   backbone:
     type: fully_connected
@@ -38,12 +44,15 @@ method:
     n_cond_layers: 0
     depth: 12
     dropout: 0.0
+    operator_variant: legacy
 
   encoder_model:
     type: resnet
     model: resnet18
     pretrained: true
+    trainable: false
     use_plucker: false
+    plucker_fusion_mode: null
     plucker_hidden_channels: 64
     plucker_identity_init: false
 
