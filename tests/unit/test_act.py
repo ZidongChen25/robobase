@@ -1017,6 +1017,40 @@ def test_act_update_uses_action_padding_mask_and_changes_params():
     assert any(not np.allclose(a, b) for a, b in zip(before, after))
 
 
+def test_act_supports_single_action_chunk_for_delayed_policy():
+    # The pure delayed policy (obs_delay=h, action_sequence=1) runs ACT with a
+    # single decoder query, so the chunk axis degenerates to length 1.
+    observation_space = spaces.Dict(
+        {"low_dim_state": spaces.Box(-1.0, 1.0, shape=(1, 4), dtype=np.float32)}
+    )
+    action_space = spaces.Box(-1.0, 1.0, shape=(1, 2), dtype=np.float32)
+    agent = _make_act(
+        observation_space=observation_space,
+        action_space=action_space,
+        jit=False,
+    )
+    agent.logging = True
+    batch = {
+        "low_dim_state": np.zeros((2, 1, 4), dtype=np.float32),
+        "action": np.zeros((2, 1, 2), dtype=np.float32),
+        "action_pad_mask": np.zeros((2, 1), dtype=np.bool_),
+    }
+
+    before = _params_leaves(agent.state_dict())
+    metrics = agent.update(iter([batch]), step=0)
+    after = _params_leaves(agent.state_dict())
+
+    assert np.isfinite(metrics["actor_loss"])
+    assert any(not np.allclose(a, b) for a, b in zip(before, after))
+
+    action = agent.act(
+        {"low_dim_state": np.zeros((1, 1, 4), dtype=np.float32)},
+        step=0,
+        eval_mode=True,
+    )
+    assert np.asarray(action).shape == (1, 1, 2)
+
+
 def test_act_treats_all_action_dims_as_continuous_by_default():
     observation_space = spaces.Dict(
         {

@@ -2,9 +2,13 @@ import signal
 import time
 import random
 import gc
+import json
+import math
+from collections import deque
 from typing import Callable, Any
 from functools import partial
 import logging
+import os
 
 from gymnasium import spaces
 from omegaconf import DictConfig
@@ -22,6 +26,10 @@ from robobase.replay_buffer.iterator import (
 from robobase.replay_buffer.prioritized_replay_buffer import PrioritizedReplayBuffer
 from robobase.replay_buffer.replay_buffer import ReplayBuffer
 from robobase.replay_buffer.uniform_replay_buffer import UniformReplayBuffer
+from robobase.replay_buffer.shared_demo_cache import (
+    SharedDemoReplayCache,
+    demo_cache_key,
+)
 from robobase.replay_buffer.bigym_lazy_replay import (
     LazyBiGymReplayBuffer,
     lazy_replay_enabled,
@@ -102,6 +110,73 @@ class _DemoMergedIterator:
         return {
             k: np.concatenate([batch[k], demo_batch[k]], axis=0) for k in batch.keys()
         }
+
+    def close(self):
+        for iterator in (self.replay_iter, self.demo_replay_iter):
+            close = getattr(iterator, "close", None)
+            if callable(close):
+                close()
+
+
+class _NonFiniteForensicTap:
+    """Pass-through replay iterator that retains the last few batch slices.
+
+    A non-finite update poisons every parameter in one step, so by the time the
+    guard fires the triggering inputs are gone -- which is why three NaN events
+    (offqc8_s2 @8k, stage-173 @31k, QC+truncation @1k/4k) were all closed as
+    "rare numerical event" without a root cause. This tap keeps the inputs
+    alive so the guard can dump them.
+
+    By default only non-uint8 keys are retained. Diagnostic runs can retain
+    uint8 images too, which is necessary for exact forward/update replay.
+    Nothing is copied to host and no statistic is computed per step, so the
+    numerical path is unchanged.
+    """
+
+    def __init__(self, iterator, keep: int = 3, include_uint8: bool = False):
+        self._iterator = iterator
+        self.recent = deque(maxlen=max(1, int(keep)))
+        self.include_uint8 = bool(include_uint8)
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        batch = next(self._iterator)
+        try:
+            if isinstance(batch, dict):
+                self.recent.append(
+                    {
+                        k: v
+                        for k, v in batch.items()
+                        if getattr(v, "dtype", None) is not None
+                        and (self.include_uint8 or v.dtype != np.uint8)
+                    }
+                )
+        except Exception:  # never let forensics break training
+            pass
+        return batch
+
+    def close(self):
+        close = getattr(self._iterator, "close", None)
+        if callable(close):
+            close()
+
+
+class _DemoOnlyIterator:
+    """Route updates exclusively from the dedicated demonstration replay."""
+
+    def __init__(self, replay_iter, demo_replay_iter):
+        self.replay_iter = replay_iter
+        self.demo_replay_iter = demo_replay_iter
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        demo_batch = next(self.demo_replay_iter)
+        demo_batch["demo"] = np.ones_like(demo_batch["demo"])
+        return demo_batch
 
     def close(self):
         for iterator in (self.replay_iter, self.demo_replay_iter):
@@ -225,6 +300,8 @@ def _mc_return_anchor_enabled(cfg: DictConfig) -> bool:
         method_name in {"cqn_as", "cqn_flow"}
         and (
             float(cfg.method.get("mc_return_weight", 0.0)) > 0.0
+            or bool(cfg.method.get("mc_lower_bound_target", False))
+            or bool(cfg.method.get("episodic_success_q_target", False))
             or (
                 method_name == "cqn_flow"
                 and float(cfg.method.get("evor_td_lambda", 0.0)) > 0.0
@@ -255,7 +332,7 @@ def _create_default_replay_buffer(
     if lazy_replay_enabled(cfg):
         if use_mc_return_anchor:
             raise NotImplementedError(
-                "CQN-AS MC return anchoring requires episode-backed replay; "
+                "CQN-AS MC-return targets require episode-backed replay; "
                 "set lazy_replay.use=false."
             )
         if demo_replay:
@@ -265,6 +342,12 @@ def _create_default_replay_buffer(
         extra_replay_elements = spaces.Dict({})
         if cfg.demos != 0:
             extra_replay_elements["demo"] = spaces.Box(0, 1, shape=(), dtype=np.uint8)
+        if cfg.replay.get("nstep_explore_truncate", False):
+            # Per-step flag: executed action came from a bin-explore-shifted
+            # registered plan. Consumed by explore-aware n-step truncation.
+            extra_replay_elements["explored"] = spaces.Box(
+                0, 1, shape=(), dtype=np.uint8
+            )
         if use_structured_exploration:
             extra_replay_elements["structured_explore"] = spaces.Box(
                 0,
@@ -329,6 +412,12 @@ def _create_default_replay_buffer(
     extra_replay_elements = spaces.Dict({})
     if cfg.demos != 0:
         extra_replay_elements["demo"] = spaces.Box(0, 1, shape=(), dtype=np.uint8)
+    if cfg.replay.get("nstep_explore_truncate", False):
+        # Per-step flag: executed action came from a bin-explore-shifted
+        # registered plan. Consumed by explore-aware n-step truncation.
+        extra_replay_elements["explored"] = spaces.Box(
+            0, 1, shape=(), dtype=np.uint8
+        )
     if use_mc_return_anchor:
         extra_replay_elements["mc_return"] = spaces.Box(
             -np.inf,
@@ -372,6 +461,7 @@ def _create_default_replay_buffer(
         save_dir=save_dir if save_dir is not None else cfg.replay.save_dir,
         purge_replay_on_shutdown=purge_replay_on_shutdown,
         save_snapshot=save_snapshot,
+        episode_compression=str(cfg.replay.get("compression", "none")),
         reuse_saved=reuse_saved,
         batch_size=cfg.batch_size if not demo_replay else cfg.demo_batch_size,
         replay_capacity=cfg.replay.size if not demo_replay else cfg.replay.demo_size,
@@ -395,6 +485,11 @@ def _create_default_replay_buffer(
         max_cached_episodes=cfg.replay.get("max_cached_episodes", None),
         max_cached_episode_bytes=cfg.replay.get("max_cached_episode_bytes", None),
         include_tp1=bool(cfg.replay.get("include_tp1", True)),
+        include_next_action=bool(
+            cfg.replay.get("include_next_action", False)
+        ),
+        auxiliary_nstep=cfg.replay.get("auxiliary_nstep", None),
+        nstep_explore_truncate=cfg.replay.get("nstep_explore_truncate", False),
         multiprocessing_context=multiprocessing_context,
         transition_uniform_sampling=bool(
             cfg.replay.get("transition_uniform_sampling", False)
@@ -471,6 +566,16 @@ class Workspace:
                 f"action_sequence, got {action_execution_start} + "
                 f"{cfg.execution_length} > {cfg.action_sequence}."
             )
+        obs_delay = int(cfg.get("obs_delay", 0) or 0)
+        if obs_delay < 0:
+            raise ValueError(f"obs_delay must be >= 0, got {obs_delay}.")
+        if obs_delay > 0:
+            logging.info(
+                "Delayed-policy conditioning enabled: acting on o_{t-%d} "
+                "(obs_delay=%d environment steps).",
+                obs_delay,
+                obs_delay,
+            )
         noise_mask_steps = int(cfg.method.get("noise_mask_steps", 0))
         if noise_mask_steps < 0 or noise_mask_steps >= cfg.action_sequence:
             raise ValueError(
@@ -512,6 +617,13 @@ class Workspace:
         self.cfg = cfg
         _set_seed_everywhere(cfg.seed)
         self.use_demo_replay = cfg.demo_batch_size is not None
+        self.demo_only_updates = bool(
+            cfg.replay.get("demo_only_updates", False)
+        )
+        if self.demo_only_updates and not self.use_demo_replay:
+            raise ValueError(
+                "replay.demo_only_updates=true requires demo_batch_size."
+            )
         self._skip_demo_loading_from_dataset = False
 
         # create logger
@@ -605,6 +717,23 @@ class Workspace:
             )
             self.demo_replay_num_workers = self.replay_num_workers
 
+        self._shared_demo_cache = None
+        demo_cache_dir = cfg.replay.get("demo_cache_dir", None)
+        if self.use_demo_replay and demo_cache_dir:
+            signatures = {
+                "all_demos": self.replay_buffer.storage_signature(),
+                "expert_demos": self.demo_replay_buffer.storage_signature(),
+            }
+            cache_key = demo_cache_key(cfg, signatures)
+            self._shared_demo_cache = SharedDemoReplayCache(
+                demo_cache_dir,
+                cache_key,
+            )
+            logging.info(
+                "Shared demo replay cache: %s",
+                self._shared_demo_cache.path,
+            )
+
         if self.prioritized_replay:
             if self.use_demo_replay:
                 raise NotImplementedError(
@@ -689,6 +818,8 @@ class Workspace:
         device-side concat) and it lands *inside* any prefetch wrapper the
         property adds afterwards.
         """
+        if getattr(self, "demo_only_updates", False):
+            return iter(_DemoOnlyIterator(replay_iter, demo_replay_iter))
         return _merge_replay_demo_iter(replay_iter, demo_replay_iter)
 
     @property
@@ -750,6 +881,14 @@ class Workspace:
                     worker_name="jax_replay_prefetch",
                     map_fn=map_fn,
                     num_workers=prefetch_workers,
+                )
+            if bool(self.cfg.get("nonfinite_dump", True)):
+                _replay_iter = _NonFiniteForensicTap(
+                    _replay_iter,
+                    keep=int(self.cfg.get("nonfinite_dump_keep_batches", 3)),
+                    include_uint8=bool(
+                        self.cfg.get("nonfinite_dump_include_uint8", False)
+                    ),
                 )
             self._replay_iter = _replay_iter
         return self._replay_iter
@@ -913,6 +1052,8 @@ class Workspace:
 
         if self.cfg.save_snapshot:
             self.save_snapshot()
+
+        self._finalize_completed_training_artifacts()
 
         self.shutdown()
 
@@ -1199,6 +1340,12 @@ class Workspace:
             metrics["episode_success"] = float(np.mean(completed_successes))
         return metrics
 
+    def _get_rollout_diagnostics(self) -> dict[str, Any]:
+        rollout_diagnostics = getattr(self.agent, "rollout_diagnostics", None)
+        if not callable(rollout_diagnostics):
+            return {}
+        return dict(rollout_diagnostics())
+
     def _eval(self, eval_record_all_episode: bool = False) -> dict[str, Any]:
         # TODO: In future, this func could do with a further refactor
         self._ensure_eval_envs_created()
@@ -1223,9 +1370,7 @@ class Workspace:
                 metrics = self._run_single_env_eval(
                     eval_record_all_episode=eval_record_all_episode
                 )
-            rollout_diagnostics = getattr(self.agent, "rollout_diagnostics", None)
-            if callable(rollout_diagnostics):
-                metrics.update(rollout_diagnostics())
+            metrics.update(self._get_rollout_diagnostics())
             return metrics
         finally:
             self._set_agent_active_eval_seeds(None)
@@ -1255,6 +1400,22 @@ class Workspace:
         ]
         store_structured_explore = (
             "structured_explore" in self.extra_replay_elements.keys()
+        )
+        store_explored = "explored" in self.extra_replay_elements.keys()
+        if os.environ.get("ROBOBASE_DEBUG_EXPLORED") and store_explored:
+            logging.info(
+                "[dbg] flag=%s applied=%s countdown=%s",
+                getattr(self.agent, "_last_bin_explored", "NOATTR"),
+                getattr(self.agent, "_last_bin_explore_applied", "NOATTR"),
+                getattr(self.agent, "_bin_explored_exec_remaining", "NOATTR"),
+            )
+        bin_explored = np.asarray(
+            getattr(
+                self.agent,
+                "_last_bin_explored",
+                np.zeros((self.train_envs.num_envs,), dtype=np.bool_),
+            ),
+            dtype=np.bool_,
         )
         structured_explore_mask = np.asarray(
             getattr(
@@ -1324,6 +1485,8 @@ class Workspace:
         for i in range(self.train_envs.num_envs):
             # Add transitions to episode rollout
             transition_info = {k: infos[k][i] for k in infos.keys()}
+            if store_explored:
+                transition_info["explored"] = np.uint8(bin_explored[i])
             if store_structured_explore:
                 transition_info["structured_explore"] = np.uint8(
                     structured_explore_mask[i]
@@ -1466,17 +1629,22 @@ class Workspace:
             )
             return
         if (num_demos := self.cfg.demos) != 0:
-            # NOTE: Currently we do not protect demos from being evicted from replay
-            self.env_factory.load_demos_into_replay(
-                self.cfg,
-                self.replay_buffer,
-                is_demo_buffer=True if self.cfg.is_imitation_learning else False,
-            )
-            if self.use_demo_replay:
-                # Load demos to the dedicated demo_replay_buffer
+            if self._shared_demo_cache is not None:
+                self._load_demos_with_shared_cache()
+            else:
+                # NOTE: Currently we do not protect demos from being evicted from replay
                 self.env_factory.load_demos_into_replay(
-                    self.cfg, self.demo_replay_buffer, is_demo_buffer=True
+                    self.cfg,
+                    self.replay_buffer,
+                    is_demo_buffer=(
+                        True if self.cfg.is_imitation_learning else False
+                    ),
                 )
+                if self.use_demo_replay:
+                    # Load demos to the dedicated demo_replay_buffer
+                    self.env_factory.load_demos_into_replay(
+                        self.cfg, self.demo_replay_buffer, is_demo_buffer=True
+                    )
             if bool(self.cfg.replay.get("discard_loaded_demos_after_replay", True)):
                 clear_loaded_demos = getattr(
                     self.env_factory,
@@ -1497,6 +1665,208 @@ class Workspace:
                     "Please make sure that this is an intended behavior."
                 )
 
+    def _load_demos_with_shared_cache(self) -> None:
+        cache = self._shared_demo_cache
+        if cache is None:
+            raise RuntimeError("shared demo cache was not configured")
+        if self.replay_buffer.reused_existing:
+            raise ValueError(
+                "Shared demo cache cannot seed a non-empty reused online replay."
+            )
+        if self.demo_replay_buffer.reused_existing:
+            raise ValueError(
+                "Shared demo cache cannot seed a non-empty reused demo replay."
+            )
+        with cache.lock():
+            if cache.is_complete():
+                online_count = self.replay_buffer.seed_from_replay_directory(
+                    cache.source("all_demos")
+                )
+                expert_count = self.demo_replay_buffer.seed_from_replay_directory(
+                    cache.source("expert_demos")
+                )
+                logging.info(
+                    "Reused shared demo replay cache (%d all-demo, %d expert files).",
+                    online_count,
+                    expert_count,
+                )
+                return
+
+            self.env_factory.load_demos_into_replay(
+                self.cfg,
+                self.replay_buffer,
+                is_demo_buffer=False,
+            )
+            self.env_factory.load_demos_into_replay(
+                self.cfg,
+                self.demo_replay_buffer,
+                is_demo_buffer=True,
+            )
+            manifest = cache.publish(
+                {
+                    "all_demos": self.replay_buffer.replay_dir,
+                    "expert_demos": self.demo_replay_buffer.replay_dir,
+                }
+            )
+            logging.info(
+                "Published shared demo replay cache (%d all-demo, %d expert files).",
+                manifest["files"]["all_demos"],
+                manifest["files"]["expert_demos"],
+            )
+
+    def _guard_non_finite_update(self, metrics: dict[str, Any]) -> None:
+        """Abort as soon as the loss or any instrumented update stage is bad.
+
+        Divergence poisons every parameter in one step, after which training
+        keeps running for hours producing zero-success rollouts that read like
+        a behavioural collapse (cqn-flow.md 64.2 retracted a whole verdict to
+        this). Checking once per update block costs one scalar sync.
+        """
+        self._last_update_metrics = dict(metrics)
+        loss = metrics.get("critic_loss", None)
+        if loss is None:
+            return
+        try:
+            value = float(loss)
+        except (TypeError, ValueError):
+            return
+        committed = metrics.get("nan_diag/update_committed", 1.0)
+        try:
+            committed = float(np.asarray(committed))
+        except (TypeError, ValueError):
+            committed = 0.0
+        if math.isfinite(value) and committed >= 0.5:
+            return
+        step = self.main_loop_iterations
+        dump_dir = self._dump_non_finite_forensics(step, value)
+        logging.error(
+            "Non-finite update (critic_loss=%s, committed=%s) at iteration %d; "
+            "aborting. "
+            "Forensics: %s",
+            value,
+            committed,
+            step,
+            dump_dir or "(dump failed; see traceback above)",
+        )
+        raise FloatingPointError(
+            f"critic update became non-finite at iteration {step} "
+            f"(loss={value}, committed={committed})"
+        )
+
+    def _dump_non_finite_forensics(self, step: int, loss_value: float):
+        """Write the inputs and parameter state behind a non-finite update.
+
+        Everything here is best-effort: a forensics failure must never mask the
+        abort itself, so each section is guarded independently.
+        """
+        try:
+            out = self.work_dir / "nonfinite_dump"
+            out.mkdir(parents=True, exist_ok=True)
+            summary: dict[str, Any] = {
+                "iteration": int(step),
+                "critic_loss": str(loss_value),
+                "env_steps": int(getattr(self, "_global_env_episode_step", -1)),
+            }
+            summary["nan_diag"] = {
+                key: float(np.asarray(value))
+                for key, value in getattr(self, "_last_update_metrics", {}).items()
+                if str(key).startswith("nan_diag/")
+            }
+
+            def leaf_report(tree, label):
+                import jax
+
+                rows = []
+                try:
+                    leaves, treedef = jax.tree_util.tree_flatten(tree)
+                    paths = [str(p) for p in range(len(leaves))]
+                    try:
+                        flat = jax.tree_util.tree_flatten_with_path(tree)[0]
+                        paths = ["/".join(str(k) for k in p) for p, _ in flat]
+                        leaves = [v for _, v in flat]
+                    except Exception:
+                        pass
+                    for name, leaf in zip(paths, leaves):
+                        arr = np.asarray(leaf)
+                        if arr.dtype.kind not in "fc":
+                            continue
+                        finite = np.isfinite(arr)
+                        rows.append(
+                            {
+                                "leaf": name,
+                                "shape": list(arr.shape),
+                                "finite_fraction": float(finite.mean()),
+                                "max_abs_finite": (
+                                    float(np.abs(arr[finite]).max())
+                                    if finite.any()
+                                    else None
+                                ),
+                            }
+                        )
+                except Exception as exc:  # pragma: no cover - diagnostics only
+                    rows = [{"error": repr(exc)}]
+                summary[label] = rows
+
+            leaf_report(getattr(self.agent, "params", None), "params")
+            leaf_report(getattr(self.agent, "opt_state", None), "opt_state")
+            leaf_report(
+                getattr(self.agent, "target_critic_params", None),
+                "target_critic_params",
+            )
+
+            if bool(self.cfg.get("nonfinite_dump_save_state", False)):
+                self._atomic_pickle_dump(
+                    {
+                        "agent": self.agent.state_dict(),
+                        "agent_checkpoint_state": (
+                            self.agent.checkpoint_state_dict()
+                        ),
+                    },
+                    out / f"pre_update_state_iter{step}.pkl",
+                )
+
+            # The batches that produced the blow-up. `recent[-1]` is the one
+            # the failing update consumed.
+            tap = self._replay_iter
+            recent = list(getattr(tap, "recent", []) or [])
+            arrays: dict[str, np.ndarray] = {}
+            batch_reports = []
+            for i, batch in enumerate(recent):
+                rep = {}
+                for k, v in batch.items():
+                    try:
+                        arr = np.asarray(v)
+                    except Exception:
+                        continue
+                    arrays[f"b{i}__{k}"] = arr
+                    if arr.dtype.kind in "fc":
+                        finite = np.isfinite(arr)
+                        entry = {
+                            "shape": list(arr.shape),
+                            "finite_fraction": float(finite.mean()),
+                        }
+                        if finite.any():
+                            absv = np.abs(np.where(finite, arr, 0.0))
+                            entry["max_abs"] = float(absv.max())
+                            entry["argmax"] = [
+                                int(x) for x in np.unravel_index(absv.argmax(), absv.shape)
+                            ]
+                        rep[k] = entry
+                    else:
+                        rep[k] = {"shape": list(arr.shape), "dtype": str(arr.dtype)}
+                batch_reports.append(rep)
+            summary["batches"] = batch_reports
+            summary["batches_retained"] = len(recent)
+            if arrays:
+                np.savez_compressed(out / f"batches_iter{step}.npz", **arrays)
+            (out / f"summary_iter{step}.json").write_text(
+                json.dumps(summary, indent=2, sort_keys=True)
+            )
+            return str(out)
+        except Exception as exc:  # pragma: no cover - diagnostics only
+            logging.exception("Non-finite forensics dump failed: %r", exc)
+            return None
+
     def _perform_updates(self) -> dict[str, Any]:
         if self.agent.logging:
             start_time = time.time()
@@ -1513,6 +1883,7 @@ class Workspace:
                 )
             )
         self.agent.train(False)
+        self._guard_non_finite_update(metrics)
         if self.agent.logging:
             execution_time_for_update = time.time() - start_time
             metrics["agent_batched_updates_per_second"] = (
@@ -1745,6 +2116,7 @@ class Workspace:
             info = next_info
             if should_log(self.main_loop_iterations):
                 metrics.update(self._get_common_metrics())
+                metrics.update(self._get_rollout_diagnostics())
                 if agent_0_prev_reward is not None and agent_0_prev_ep_len is not None:
                     metrics.update(
                         {
@@ -1879,9 +2251,9 @@ class Workspace:
         )
         snapshot = self.work_dir / "snapshots" / f"{snapshot_step}_snapshot.pkl"
         snapshot.parent.mkdir(parents=True, exist_ok=True)
-        payload["snapshot_version"] = 2
+        payload["snapshot_version"] = 3
+        payload["snapshot_step"] = snapshot_step
         payload["agent"] = self.agent.state_dict()
-        payload["agent_checkpoint_state"] = self.agent.checkpoint_state_dict()
         payload["replay_buffer"] = self.replay_buffer.state_dict()
         payload["rng_state"] = self._rng_state_dict()
         payload["timer_state"] = self._timer_state_dict()
@@ -1889,8 +2261,19 @@ class Workspace:
             payload["wandb_run_id"] = self.logger.wandb_run_id
         if self.use_demo_replay:
             payload["demo_replay_buffer"] = self.demo_replay_buffer.state_dict()
-        with snapshot.open("wb") as f:
-            pickle.dump(payload, f)
+        self._atomic_pickle_dump(payload, snapshot)
+        # The optimizer tree is ~half of a snapshot and is only ever read by a
+        # resume, which always resumes from the newest one. Keeping it in a
+        # single overwritten sidecar leaves every numbered snapshot a valid
+        # evaluation checkpoint at half the size.
+        self._atomic_pickle_dump(
+            {
+                "resume_state_version": 1,
+                "snapshot_step": snapshot_step,
+                "agent_checkpoint_state": self.agent.checkpoint_state_dict(),
+            },
+            self.work_dir / "snapshots" / "resume_state.pkl",
+        )
         latest_snapshot = self.work_dir / "snapshots" / "latest_snapshot.pkl"
         # Point `latest` at the just-written snapshot via a relative symlink
         # instead of a full copy, so we don't duplicate the (large) checkpoint
@@ -1898,6 +2281,175 @@ class Workspace:
         # the link; the numbered `<step>_snapshot.pkl` is kept as-is.
         latest_snapshot.unlink(missing_ok=True)
         latest_snapshot.symlink_to(snapshot.name)
+        if bool(self.cfg.get("artifacts", {}).get("save_eval_checkpoints", False)):
+            self._save_eval_checkpoint(payload, snapshot_step)
+        self._prune_resume_snapshots()
+
+    @staticmethod
+    def _atomic_pickle_dump(payload: dict[str, Any], destination: Path) -> None:
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        temporary = destination.with_name(
+            f".{destination.name}.tmp.{os.getpid()}"
+        )
+        try:
+            with temporary.open("wb") as handle:
+                pickle.dump(payload, handle)
+                handle.flush()
+                os.fsync(handle.fileno())
+            temporary.replace(destination)
+        finally:
+            temporary.unlink(missing_ok=True)
+
+    def _save_eval_checkpoint(self, snapshot_payload: dict, snapshot_step: int) -> Path:
+        """Write a params-only checkpoint suitable for evaluation, not resume."""
+
+        destination = (
+            self.work_dir
+            / "eval_checkpoints"
+            / f"{snapshot_step}_checkpoint.pkl"
+        )
+        payload = {
+            "eval_checkpoint_version": 1,
+            "snapshot_step": int(snapshot_step),
+            "_pretrain_step": snapshot_payload["_pretrain_step"],
+            "_main_loop_iterations": snapshot_payload["_main_loop_iterations"],
+            "_global_env_episode": snapshot_payload["_global_env_episode"],
+            "cfg": snapshot_payload["cfg"],
+            "agent": snapshot_payload["agent"],
+        }
+        self._atomic_pickle_dump(payload, destination)
+        return destination
+
+    def _prune_resume_snapshots(self) -> list[Path]:
+        keep = int(self.cfg.get("artifacts", {}).get("resume_keep_last", 0))
+        if keep <= 0:
+            return []
+        snapshot_dir = self.work_dir / "snapshots"
+        numbered = []
+        for path in snapshot_dir.glob("*_snapshot.pkl"):
+            if path.name == "latest_snapshot.pkl":
+                continue
+            try:
+                step = int(path.name.removesuffix("_snapshot.pkl"))
+            except ValueError:
+                continue
+            numbered.append((step, path))
+        removed = []
+        for _, path in sorted(numbered)[:-keep]:
+            path.unlink(missing_ok=True)
+            removed.append(path)
+        if removed:
+            logging.info(
+                "Pruned %d obsolete resume snapshots; retaining latest %d.",
+                len(removed),
+                keep,
+            )
+        return removed
+
+    def _finalize_completed_training_artifacts(self) -> None:
+        """Drop resume-only state after a natural, successfully saved finish."""
+
+        artifacts = self.cfg.get("artifacts", {})
+        delete_replay = bool(
+            artifacts.get("delete_replay_on_train_complete", False)
+        )
+        delete_resume = bool(
+            artifacts.get("delete_resume_on_train_complete", False)
+        )
+        if not (delete_replay or delete_resume):
+            return
+        if not bool(artifacts.get("save_eval_checkpoints", False)):
+            raise ValueError(
+                "Training artifact cleanup requires params-only eval checkpoints."
+            )
+        eval_checkpoints = sorted(
+            (self.work_dir / "eval_checkpoints").glob("*_checkpoint.pkl")
+        )
+        if not eval_checkpoints:
+            raise RuntimeError("Refusing cleanup: no eval checkpoint was written.")
+
+        self._close_replay_iter()
+        removed_replay_files = 0
+        if delete_replay:
+            clear = getattr(self.replay_buffer, "clear_persisted_episodes", None)
+            if callable(clear):
+                removed_replay_files += int(clear())
+            if self.use_demo_replay:
+                clear_demo = getattr(
+                    self.demo_replay_buffer, "clear_persisted_episodes", None
+                )
+                if callable(clear_demo):
+                    removed_replay_files += int(clear_demo())
+
+        removed_resume_files = 0
+        if delete_resume:
+            snapshot_dir = self.work_dir / "snapshots"
+            for path in snapshot_dir.glob("*_snapshot.pkl"):
+                path.unlink(missing_ok=True)
+                removed_resume_files += 1
+            # The optimizer sidecar is resume-only state and is meaningless
+            # once its snapshots are gone.
+            resume_state = snapshot_dir / "resume_state.pkl"
+            if resume_state.is_file():
+                resume_state.unlink(missing_ok=True)
+                removed_resume_files += 1
+
+        record = {
+            "completed_env_steps": int(self.global_env_steps),
+            "eval_checkpoint_count": len(eval_checkpoints),
+            "removed_replay_files": removed_replay_files,
+            "removed_resume_files": removed_resume_files,
+            "shared_demo_cache": (
+                str(self._shared_demo_cache.path)
+                if self._shared_demo_cache is not None
+                else None
+            ),
+        }
+        (self.work_dir / "training_artifacts_finalized.json").write_text(
+            json.dumps(record, indent=2, sort_keys=True) + "\n"
+        )
+        logging.info("Finalized completed training artifacts: %s", record)
+
+    @staticmethod
+    def _sidecar_checkpoint_state(
+        snapshot_path: Path,
+        snapshot_step: int | None,
+    ) -> dict | None:
+        """Optimizer state for ``snapshot_path`` from the resume sidecar.
+
+        Snapshot version 3 stores the optimizer tree once, beside the numbered
+        snapshots, because only the newest snapshot is ever resumed from. An
+        older or stripped snapshot has no matching sidecar; the caller then
+        restarts the optimizer from scratch, which is exact for evaluation and
+        approximate for training continuation.
+        """
+
+        sidecar = snapshot_path.resolve().parent / "resume_state.pkl"
+        if snapshot_step is None or not sidecar.is_file():
+            logging.warning(
+                "No optimizer state for %s; the optimizer will be "
+                "reinitialized. Evaluation is unaffected; an exact training "
+                "resume is not possible from this snapshot.",
+                snapshot_path,
+            )
+            return None
+        try:
+            with sidecar.open("rb") as handle:
+                stored = pickle.load(handle)
+        except (OSError, pickle.UnpicklingError) as exc:
+            logging.warning("Unreadable resume sidecar %s: %r", sidecar, exc)
+            return None
+        if int(stored.get("snapshot_step", -1)) != int(snapshot_step):
+            # The sidecar always tracks the newest snapshot, so this is the
+            # normal outcome when loading an earlier checkpoint for evaluation.
+            logging.info(
+                "Resume sidecar is for step %s, not %s; reinitializing the "
+                "optimizer.",
+                stored.get("snapshot_step"),
+                snapshot_step,
+            )
+            return None
+        return stored.get("agent_checkpoint_state")
 
     def load_snapshot(
         self,
@@ -1917,8 +2469,16 @@ class Workspace:
         with path_to_snapshot_to_load.open("rb") as f:
             payload = pickle.load(f)
         payload.pop("snapshot_version", None)
+        payload.pop("eval_checkpoint_version", None)
+        snapshot_step = payload.pop("snapshot_step", None)
         self.agent.load_state_dict(payload.pop("agent"))
-        self.agent.load_checkpoint_state_dict(payload.pop("agent_checkpoint_state", {}))
+        checkpoint_state = payload.pop("agent_checkpoint_state", None)
+        if checkpoint_state is None:
+            checkpoint_state = self._sidecar_checkpoint_state(
+                path_to_snapshot_to_load,
+                snapshot_step,
+            )
+        self.agent.load_checkpoint_state_dict(checkpoint_state or {})
         snapshot_cfg = payload.pop("cfg", None)
         replay_state = payload.pop("replay_buffer", None)
         if load_replay_buffer and replay_state is not None:

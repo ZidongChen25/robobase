@@ -14,7 +14,11 @@ from gymnasium import spaces
 from omegaconf import DictConfig
 
 from robobase.language import lang_feature_rows, lang_token_rows, tokens_to_feature_jax
-from robobase.method.bc import BCEncoderModelSpec, BCViewFusionModelSpec
+from robobase.method.bc import (
+    BCEncoderModelSpec,
+    BCViewFusionModelSpec,
+    legacy_resnet_encoder_impl,
+)
 from robobase.method.bc_runtime import bc_observation_layout
 from robobase.method.jax_base import JaxMethodBase
 from robobase.models.act import ACTImageProjection, JaxACTPolicy
@@ -170,6 +174,7 @@ def act_model_spec_from_cfg(cfg: DictConfig) -> ACTModelSpec:
             },
         )
         encoder_model_spec = BCEncoderModelSpec(
+            legacy_impl=legacy_resnet_encoder_impl(cfg),
             type=encoder_model_type,
             model=str(
                 encoder_model_cfg.get(
@@ -294,7 +299,12 @@ def _build_model(
                 "ACT encoder_model.use_plucker=true requires raymap or camera "
                 "parameter observations paired with every RGB observation."
             )
-        encoder_model = JaxResNetEncoder(
+        act_encoder_cls = JaxResNetEncoder
+        if getattr(model_spec.encoder_model, "legacy_impl", False):
+            from robobase.models.encoder import LegacyJaxResNetEncoder
+
+            act_encoder_cls = LegacyJaxResNetEncoder
+        encoder_model = act_encoder_cls(
             input_shape=obs_layout.rgb_input_shape,
             model=model_spec.encoder_model.model,
             jit=encoder_jit,
@@ -664,6 +674,15 @@ class ACT(JaxMethodBase):
         self._campose_augmentation = (
             jax.jit(campose_augmentation) if self._jit_enabled else campose_augmentation
         )
+        # The legacy augmentation is a chain of dozens of elementwise ops; run
+        # eagerly each dispatches its own kernel (measured 321 ms per
+        # 128-sample batch on a 5090). Jitting fuses it like the campose path
+        # above; the traced ops and RNG usage are unchanged, so outputs are
+        # identical.
+        self._legacy_rgb_augmentation = (
+            jax.jit(self._augment_rgb_impl) if self._jit_enabled
+            else self._augment_rgb_impl
+        )
         self.use_lang_cond = bool(self.actor_spec.use_lang_cond)
         self.gripper_dims = int(self.actor_spec.gripper_dims)
         if self.gripper_dims < 0 or self.gripper_dims > self.action_dim:
@@ -983,6 +1002,9 @@ class ACT(JaxMethodBase):
     def _augment_rgb(self, rgb: jnp.ndarray, rng_key) -> jnp.ndarray:
         if not self.data_augmentation or rgb.shape[2] != 3:
             return rgb
+        return self._legacy_rgb_augmentation(rgb, rng_key)
+
+    def _augment_rgb_impl(self, rgb: jnp.ndarray, rng_key) -> jnp.ndarray:
         batch_size, num_views, channels, height, width = rgb.shape
         elastic_key, color_key, crop_key, noise_key = jax.random.split(rng_key, 4)
         pad = 4

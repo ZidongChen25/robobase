@@ -22,7 +22,7 @@ from robobase.envs.wrappers import (
     RescaleFromTanh,
     ActionSequence,
     RecedingHorizonControl,
-    AppendDemoInfo,
+    AppendDemoInfo,    maybe_delay_observations,
 )
 from robobase.utils import add_demo_to_replay_buffer
 from robobase.envs.env import EnvFactory, DemoEnv
@@ -595,6 +595,11 @@ class D4RLEnvFactory(EnvFactory):
             env = OnehotTime(env, cfg.env.episode_length)
         if not demo_env:
             env = FrameStack(env, cfg.frame_stack)
+        # Delayed-policy conditioning; see ObservationDelay. Wraps the demo env
+        # too so imported demos are stored as (o_{t-h}, a_t), and stays inside
+        # the action-sequence wrapper so h counts environment steps.
+        env = maybe_delay_observations(env, cfg)
+        if not demo_env:
             execution_length = int(cfg.get("execution_length", cfg.action_sequence))
             if int(cfg.action_sequence) == execution_length:
                 env = ActionSequence(env, cfg.action_sequence)

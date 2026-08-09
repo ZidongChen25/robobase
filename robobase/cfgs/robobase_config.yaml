@@ -30,6 +30,18 @@ save_snapshot: false
 snapshot_every_n: 1000
 snapshot_every_epochs: null
 snapshot_save_start_step: 0
+# Artifact lifecycle is opt-in at the method launch level so legacy and
+# externally-managed runs retain their previous behaviour.
+artifacts:
+  # Numbered snapshots contain optimizer/RNG/replay state and exist only for
+  # crash recovery. 0 preserves every snapshot (legacy behaviour).
+  resume_keep_last: 0
+  # Params-only checkpoints are used for checkpoint sweeps and deployment.
+  save_eval_checkpoints: false
+  # These are safe only after a natural training completion and after a
+  # params-only final checkpoint has been written.
+  delete_replay_on_train_complete: false
+  delete_resume_on_train_complete: false
 batch_size: 256
 is_imitation_learning: false
 
@@ -43,6 +55,12 @@ pixels: false
 visual_observation_shape: [84, 84]
 frame_stack: 1
 frame_stack_on_channel: true
+# Delayed-policy conditioning (h). The policy sees o_{t-h} when producing the
+# action executed at step t, matching demonstrations where the operator reacted
+# to what they perceived h steps earlier. Counted in environment steps (not in
+# policy decisions), applied identically to training pairs, online rollouts and
+# evaluation. Episode starts repeat the reset observation. 0 = no delay.
+obs_delay: 0
 use_onehot_time_and_no_bootstrap: false
 
 # Action settings
@@ -56,6 +74,15 @@ use_min_max_normalization: false  # Demo-based min-max normalization for action 
 min_max_margin: 0.0  # If set to > 0, introduce margin for demo-driven min-max normalization
 norm_obs: false
 obs_norm_type: standardization
+# Abort the run the moment critic_loss stops being finite, and dump the
+# retained replay batches plus per-leaf finite masks of params and optimizer
+# state to <run_dir>/nonfinite_dump/. Full uint8 batches and a pre-update state
+# checkpoint are opt-in because each can consume hundreds of MB.
+nonfinite_dump: true
+nonfinite_dump_keep_batches: 3
+nonfinite_dump_include_uint8: false
+nonfinite_dump_save_state: false
+
 action_execution_start: 0
 
 # Replay buffer settings
@@ -67,6 +94,17 @@ replay:
   save_dir: null
   persist: false
   reuse_saved: false
+  # Optional immutable, replay-formatted demo cache shared across runs.
+  # Run-local buffers hard-link these files and can append self-imitation data.
+  demo_cache_dir: null
+  # Lossless NPZ payload compression. "zip" substantially reduces RGB replay
+  # storage (measured 69% on a 300-step three-camera BiGym episode) for about
+  # 1.1 ms per environment step, paid at episode boundaries. Set "none" to
+  # restore the legacy uncompressed I/O path.
+  compression: zip
+  # Route optimizer batches exclusively from the dedicated demo replay.
+  # Online rollouts may still be collected for a matched environment clock.
+  demo_only_updates: false
   nstep: 3
   num_workers: 4
   pin_memory: true
@@ -87,6 +125,13 @@ replay:
   max_cached_episodes: null
   max_cached_episode_bytes: 25769803776
   include_tp1: true
+  # Return the action sequence beginning at the n-step bootstrap state.
+  # Used by data-supported Bellman candidate maximization; false is legacy.
+  include_next_action: false
+  # Optionally return a second, terminal-truncated n-step transition from the
+  # same start state. This supports matched 1-step + n-step RL objectives
+  # without dropping the final 1-step transitions from replay.
+  auxiliary_nstep: null
   discard_loaded_demos_after_replay: true
   transition_seq_len: 1  # The length of transition sequence returned from sample() call. Only applicable if sequential is True
   action_sequence_start_offset: 0
@@ -95,6 +140,9 @@ replay:
   # length) instead of uniformly per episode. Matches flat-buffer replay
   # semantics such as the official ACFQL implementation.
   transition_uniform_sampling: false
+  # Explore-aware n-step: truncate reward sums (bootstrap early) at the first
+  # later step whose executed action came from a forced bin-explore shift.
+  nstep_explore_truncate: false
 
 lazy_replay:
   use: auto

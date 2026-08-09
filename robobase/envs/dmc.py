@@ -17,7 +17,7 @@ from robobase.envs.wrappers import (
     FrameStack,
     RescaleFromTanh,
     ActionSequence,
-    RecedingHorizonControl,
+    RecedingHorizonControl,    maybe_delay_observations,
 )
 
 import os
@@ -179,6 +179,9 @@ class DMCEnvFactory(EnvFactory):
             env = OnehotTime(
                 env, cfg.env.episode_length // cfg.action_repeat
             )  # Time limits are handles by DMC
+        # Delayed-policy conditioning; see ObservationDelay. Kept inside the
+        # action-sequence wrapper so h counts environment steps.
+        env = maybe_delay_observations(env, cfg)
         if int(cfg.execution_length) == int(cfg.action_sequence):
             env = ActionSequence(env, cfg.action_sequence)
         else:

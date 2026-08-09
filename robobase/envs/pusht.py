@@ -26,7 +26,7 @@ from robobase.envs.wrappers import (
     RecedingHorizonControl,
     RescaleFromTanh,
     RescaleFromTanhWithMinMax,
-    RescaleFromTanhWithStandardization,
+    RescaleFromTanhWithStandardization,    maybe_delay_observations,
 )
 from robobase.utils import add_demo_to_replay_buffer, rescale_demo_actions
 
@@ -751,6 +751,11 @@ class PushTEnvFactory(EnvFactory):
             env = OnehotTime(env, cfg.env.episode_length)
         if not demo_env:
             env = FrameStack(env, cfg.frame_stack)
+        # Delayed-policy conditioning; see ObservationDelay. Wraps the demo env
+        # too so imported demos are stored as (o_{t-h}, a_t), and stays inside
+        # the action-sequence wrapper so h counts environment steps.
+        env = maybe_delay_observations(env, cfg)
+        if not demo_env:
             if cfg.action_sequence == execution_length:
                 env = ActionSequence(env, cfg.action_sequence)
             else:

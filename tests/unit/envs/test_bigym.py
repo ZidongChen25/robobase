@@ -12,7 +12,12 @@ from robobase.envs.bigym import (
     bigym_task_description,
 )
 from robobase.envs.utils.bigym_utils import TASK_MAP
-from robobase.envs.wrappers import ConcatDim, RawProprioDropout, RecedingHorizonControl
+from robobase.envs.wrappers import (
+    ConcatDim,
+    ObservationDelay,
+    RawProprioDropout,
+    RecedingHorizonControl,
+)
 from tests.unit.wrappers.utils import DummyEnv
 
 
@@ -65,6 +70,55 @@ def test_bigym_receding_horizon_uses_action_execution_start(train):
 
     assert receding is not None
     assert receding._execution_start == 2
+
+
+@pytest.mark.parametrize("demo_env", [False, True])
+def test_bigym_obs_delay_wraps_both_live_and_demo_envs(demo_env):
+    # The demo env must be delayed too: demos imported through it are what the
+    # non-lazy replay stores, so the (o_{t-h}, a_t) pairing is baked in there.
+    factory = BiGymEnvFactory()
+    factory._action_stats = {
+        "mean": np.zeros(2, dtype=np.float32),
+        "std": np.ones(2, dtype=np.float32),
+        "min": -np.ones(2, dtype=np.float32),
+        "max": np.ones(2, dtype=np.float32),
+    }
+    factory._obs_stats = None
+
+    cfg = OmegaConf.create(
+        {
+            "demos": 1,
+            "action_repeat": 1,
+            "use_standardization": False,
+            "min_max_margin": 0.0,
+            "norm_obs": False,
+            "obs_norm_type": "standardization",
+            "use_onehot_time_and_no_bootstrap": False,
+            "frame_stack": 1,
+            "action_sequence": 1,
+            "execution_length": 1,
+            "obs_delay": 3,
+            "temporal_ensemble": False,
+            "temporal_ensemble_gain": 0.01,
+            "method": {"use_lang_cond": False},
+            "env": {
+                "episode_length": 50,
+                "demo_down_sample_rate": 1,
+                "task_name": "move_plate",
+            },
+        }
+    )
+
+    env = factory._wrap_env(DummyEnv(episode_len=50), cfg, demo_env=demo_env)
+    delay = _find_wrapper(env, ObservationDelay)
+
+    assert delay is not None
+    assert delay.delay == 3
+
+    cfg.obs_delay = 0
+    undelayed = factory._wrap_env(DummyEnv(episode_len=50), cfg, demo_env=demo_env)
+
+    assert _find_wrapper(undelayed, ObservationDelay) is None
 
 
 def test_bigym_language_wrapper_emits_jax_tokens_only():

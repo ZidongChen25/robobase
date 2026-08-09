@@ -21,6 +21,7 @@ from robobase.envs.wrappers import (
     AppendKeysToLowDim,
     RecedingHorizonControl,
     RawProprioDropout,
+    maybe_delay_observations,
 )
 from robobase.envs.camera_conditioning import (
     camera_conditioning_enabled,
@@ -153,6 +154,12 @@ class AddBiGymLanguageTokens(gym.ObservationWrapper):
         source = str(lang_feature_source).lower()
         if source in {"tokens", "jax", "hash"}:
             self._lang_tokens = tokenize_text(description).astype(np.int32, copy=False)
+            self._lang_features = None
+        elif source in {"clip", "clip_text"}:
+            # Pre-06a61d4 checkpoints trained on CLIP token ids.
+            from robobase.language import clip_tokenize_text
+
+            self._lang_tokens = clip_tokenize_text(description)
             self._lang_features = None
         elif source == "precomputed":
             self._lang_tokens = tokenize_text(description).astype(np.int32, copy=False)
@@ -414,7 +421,14 @@ class BiGymEnvFactory(EnvFactory):
             lang_feature_source = cfg.method.get("lang_feature_source", None)
             lang_description = cfg.method.get("lang_description", None)
             if lang_feature_source is None:
-                lang_feature_source = "tokens"
+                # Era fingerprint (see _compute_obs_stats): the hash tokenizer
+                # replaced clip.tokenize in the same commit that introduced
+                # env.truncate_demo_at_success (06a61d4, 2026-07-30). Saved
+                # configs lacking that key predate the switch and their
+                # checkpoints expect CLIP token ids.
+                lang_feature_source = (
+                    "tokens" if "truncate_demo_at_success" in cfg.env else "clip"
+                )
                 if lang_description is None:
                     lang_description = BIGYM_TASK_DESCRIPTIONS.get(
                         str(cfg.env.task_name),
@@ -434,6 +448,10 @@ class BiGymEnvFactory(EnvFactory):
             env = OnehotTime(env, episode_limit_steps)
         if not demo_env:
             env = FrameStack(env, cfg.frame_stack)
+        # Delayed-policy conditioning. Applied to the demo env too so imported
+        # demos land in replay already paired as (o_{t-h}, a_t), and kept inside
+        # the action-sequence wrapper so h counts environment steps.
+        env = maybe_delay_observations(env, cfg)
         env = TimeLimit(env, episode_limit_steps)
 
         if not demo_env:
@@ -728,6 +746,13 @@ class BiGymEnvFactory(EnvFactory):
                 reward = step.reward
                 rewards.append(reward)
             successful_demo = sum(rewards) > 0.25
+            if bool(cfg.env.get("treat_all_demos_as_expert", False)):
+                # Unlabeled-demo-quality regime: the practitioner has no
+                # success labels, so every demonstration is marked as
+                # expert. Imitation objectives then imitate failed demos
+                # too; reward-derived objectives keep reading the true
+                # returns. Rewards themselves are never altered.
+                successful_demo = True
 
             for i, step in enumerate(demo):
                 step.info.update({"demo": int(successful_demo)})
@@ -810,6 +835,14 @@ class BiGymEnvFactory(EnvFactory):
         obs_std = {key: np.clip(np.std(obs[key], 0), 1e-10, np.inf) for key in keys}
         obs_min = {key: np.min(obs[key], 0) for key in keys}
         obs_max = {key: np.max(obs[key], 0) for key in keys}
+
+        # Identity-normalization override for degenerate-scale dims
+        # (proprioception[0] and the gripper dims). NOTE: this predates the
+        # May-2026 IL checkpoints (verified: their era emits exactly these
+        # identity-normalized values), so it applies unconditionally -- do NOT
+        # era-gate it. The 2026-08-08 checkpoint-compat audit found the real
+        # old-checkpoint breaker was the lang tokenizer switch (see
+        # AddBiGymLanguageTokens), not these stats.
         if cfg.obs_norm_type == "standardization":
             if "proprioception" in obs_mean and obs_mean["proprioception"].shape[0] > 0:
                 obs_mean["proprioception"][0] = 0.0

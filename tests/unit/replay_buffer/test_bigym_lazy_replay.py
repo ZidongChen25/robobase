@@ -261,6 +261,8 @@ def _make_lazy_buffer(observation_timing: str):
     buffer._observation_timing = observation_timing
     buffer._action_index_offset = 1 if observation_timing == "post_action" else 0
     buffer._action_padding = "zero"
+    buffer._obs_delay = 0
+    buffer._low_dim_obs_keys = ("proprioception", "proprioception_grippers")
     buffer._manifest = LazyBiGymManifest(
         episodes=(),
         action_stats={},
@@ -309,6 +311,56 @@ def test_lazy_bigym_post_action_uses_next_action_index_and_pads_end():
     np.testing.assert_array_equal(first["action_pad_mask"][0], np.asarray([0, 0, 0]))
     np.testing.assert_array_equal(last["action"][0, :, 0], np.asarray([4, 0, 0]))
     np.testing.assert_array_equal(last["action_pad_mask"][0], np.asarray([0, 1, 1]))
+
+
+def test_lazy_bigym_obs_delay_shifts_observations_but_not_actions():
+    baseline = _make_lazy_buffer("pre_action")
+    delayed = _make_lazy_buffer("pre_action")
+    delayed._obs_delay = 2
+
+    reference = baseline.sample_batch_indices([3])
+    batch = delayed.sample_batch_indices([3])
+
+    # o_{t-2} is paired with the action sequence that still starts at a_t.
+    assert reference["low_dim_state"][0, 0, 0] == 3.0
+    assert batch["low_dim_state"][0, 0, 0] == 1.0
+    np.testing.assert_array_equal(
+        batch["action"][0, :, 0], reference["action"][0, :, 0]
+    )
+
+
+def test_lazy_bigym_obs_delay_repeats_reset_frame_at_episode_start():
+    buffer = _make_lazy_buffer("pre_action")
+    buffer._obs_delay = 2
+
+    batch = buffer.sample_batch_indices([0, 1, 2])
+
+    np.testing.assert_array_equal(
+        batch["low_dim_state"][:, 0, 0], np.asarray([0.0, 0.0, 0.0])
+    )
+
+
+def test_lazy_bigym_obs_delay_shifts_the_whole_frame_stack_and_tp1():
+    buffer = _make_lazy_buffer("pre_action")
+    buffer._obs_delay = 1
+    buffer.cfg.frame_stack = 2
+    buffer._frame_stacks = 2
+    buffer._include_tp1 = True
+    buffer.observation_elements["low_dim_state"] = spaces.Box(
+        -np.inf,
+        np.inf,
+        shape=(2, 2),
+        dtype=np.float32,
+    )
+
+    batch = buffer.sample_batch_indices([3])
+
+    np.testing.assert_array_equal(
+        batch["low_dim_state"][0, :, 0], np.asarray([1.0, 2.0])
+    )
+    np.testing.assert_array_equal(
+        batch["low_dim_state_tp1"][0, :, 0], np.asarray([2.0, 3.0])
+    )
 
 
 def test_lazy_bigym_raw_zero_padding_is_transformed_after_padding():

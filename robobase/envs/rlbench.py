@@ -22,7 +22,7 @@ from robobase.envs.wrappers import (
     RescaleFromTanhWithMinMax,
     ActionSequence,
     RecedingHorizonControl,
-    AppendDemoInfo,
+    AppendDemoInfo,    maybe_delay_observations,
 )
 from robobase.utils import (
     DemoStep,
@@ -661,7 +661,11 @@ class RLBenchEnvFactory(EnvFactory):
         # should ignores action sequence and frame stack wrapper.
         if not demo_env:
             env = FrameStack(env, cfg.frame_stack)
-
+        # Delayed-policy conditioning; see ObservationDelay. Wraps the demo env
+        # too so imported demos are stored as (o_{t-h}, a_t), and stays inside
+        # the action-sequence wrapper so h counts environment steps.
+        env = maybe_delay_observations(env, cfg)
+        if not demo_env:
             # If action_sequence length and execution length are the same, we do not
             # use receding horizon wrapper.
             # NOTE: for RL, action_sequence == execution_length == 1, so

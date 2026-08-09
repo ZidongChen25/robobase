@@ -20,6 +20,10 @@ from robobase.envs.wrappers.reward_modifiers import (
     ShapeRewards,
 )
 from robobase.envs.wrappers.raw_proprio_dropout import RawProprioDropout
+from robobase.envs.wrappers.observation_delay import (
+    ObservationDelay,
+    maybe_delay_observations,
+)
 
 __all__ = [
     "AppendKeysToLowDim",
@@ -39,4 +43,6 @@ __all__ = [
     "AppendDemoInfo",
     "RecedingHorizonControl",
     "RawProprioDropout",
+    "ObservationDelay",
+    "maybe_delay_observations",
 ]

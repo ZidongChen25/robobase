@@ -168,6 +168,20 @@ class JaxMethodBase(Method):
         low_dim_obs = flatten_time_into_channel(low_dim_obs)
         return low_dim_obs.reshape((low_dim_obs.shape[0], -1))
 
+    def _to_device_then_f32(self, value):
+        """Transfer in the source dtype, cast to float32 on device.
+
+        uint8 RGB crosses PCIe at a quarter of the float32 bytes and the cast
+        is a fused device kernel. Casting on the host instead serializes a
+        large single-threaded numpy conversion (measured 58 ms vs 2 ms per
+        128-sample camera batch on a 5090) and starves the GPU whenever the
+        CPU is busy. Value-identical: uint8 -> float32 is exact either way.
+        """
+        arr = self.jnp.asarray(value)
+        if arr.dtype != self.jnp.float32:
+            arr = arr.astype(self.jnp.float32)
+        return arr
+
     def _extract_rgb_obs(self, batch_or_obs: dict):
         if not self.use_pixels:
             return None, {}
@@ -179,10 +193,7 @@ class JaxMethodBase(Method):
             }
         rgb_obs = flatten_time_into_channel(
             self.jnp.stack(
-                [
-                    self._as_jax_array(value, self.jnp.float32)
-                    for value in rgb_obs_dict.values()
-                ],
+                [self._to_device_then_f32(value) for value in rgb_obs_dict.values()],
                 axis=1,
             ),
             has_view_axis=True,

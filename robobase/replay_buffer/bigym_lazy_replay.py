@@ -574,6 +574,10 @@ class LazyBiGymReplayBuffer(ReplayBuffer):
         self._action_sequence_start_offset = max(
             0, int(cfg.replay.get("action_sequence_start_offset", 0))
         )
+        # Delayed-policy conditioning; mirrors the ObservationDelay wrapper that
+        # the eval env applies. This buffer reads demo files directly, so the
+        # shift has to happen at sampling time.
+        self._obs_delay = max(0, int(cfg.get("obs_delay", 0) or 0))
         self._observation_timing = _lazy_observation_timing(cfg)
         self._action_index_offset = (
             1 if self._observation_timing == "post_action" else 0
@@ -646,6 +650,14 @@ class LazyBiGymReplayBuffer(ReplayBuffer):
             cfg.get("lazy_replay", {}).get("max_cached_episodes_per_worker", 2)
         )
         self._include_tp1 = bool(cfg.get("lazy_replay", {}).get("include_tp1", False))
+        # Mirror the live-env low_dim_state layout: ConcatDim excludes the
+        # floating base, AppendKeysToLowDim then appends it as the LAST dims
+        # when env.append_floating_base_to_low_dim is set (60 -> 63 on
+        # move_plate). The batch buffers are allocated from the env spec, so
+        # this assembly must follow the same flag or widths diverge.
+        self._low_dim_obs_keys = ("proprioception", "proprioception_grippers")
+        if bool(cfg.env.get("append_floating_base_to_low_dim", False)):
+            self._low_dim_obs_keys += ("proprioception_floating_base",)
 
         self._lang_tokens = self._build_lang_tokens()
         self._lang_features = self._build_lang_features()
@@ -884,7 +896,14 @@ class LazyBiGymReplayBuffer(ReplayBuffer):
             episode = self._cached_episode(int(episode_idx))
             ep_len = int(episode_meta.transition_len)
 
-            obs_shift = 1 if getattr(self, "_drop_reset_frame", False) else 0
+            # Delayed-policy conditioning: pair the action at ``t`` with the
+            # observation from ``t - obs_delay``. Only the observation indices
+            # move; actions, rewards and the n-step bootstrap keep their timing.
+            # Clamping to 0 repeats the reset frame at episode starts, matching
+            # the ObservationDelay wrapper used at rollout/eval time.
+            obs_shift = (1 if getattr(self, "_drop_reset_frame", False) else 0) - int(
+                getattr(self, "_obs_delay", 0)
+            )
             obs_idxs = np.clip(
                 idxs[:, None] + obs_shift + obs_offsets[None, :], 0, ep_len
             )
@@ -951,7 +970,7 @@ class LazyBiGymReplayBuffer(ReplayBuffer):
                     )
 
             low_dim_parts = []
-            for obs_key in ("proprioception", "proprioception_grippers"):
+            for obs_key in self._low_dim_obs_keys:
                 tensor_key = _state_key(obs_key)
                 if tensor_key not in episode:
                     continue
@@ -970,10 +989,7 @@ class LazyBiGymReplayBuffer(ReplayBuffer):
                 )
                 if self._include_tp1:
                     next_low_dim_parts = []
-                    for obs_key in (
-                        "proprioception",
-                        "proprioception_grippers",
-                    ):
+                    for obs_key in self._low_dim_obs_keys:
                         tensor_key = _state_key(obs_key)
                         if tensor_key not in episode:
                             continue
