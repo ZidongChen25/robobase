@@ -157,3 +157,15 @@ def test_old_snapshots_without_exploration_keys_still_load():
             state.pop(key)
     agent.load_checkpoint_state_dict(state)  # must not raise
     assert agent._bin_explore_remaining.shape == (1,)
+
+
+def test_apply_records_applied_rows_for_explored_flagging():
+    agent = _explore_agent()
+    agent._apply_bin_explore(_chunk(), np.asarray([True, False]))
+    np.testing.assert_array_equal(
+        agent._last_bin_explore_applied, [True, False]
+    )
+    agent._apply_bin_explore(_chunk(), np.asarray([False, False]))
+    np.testing.assert_array_equal(
+        agent._last_bin_explore_applied, [False, False]
+    )

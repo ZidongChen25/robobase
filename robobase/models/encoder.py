@@ -157,6 +157,194 @@ class JaxCQNEncoder:
         )
 
 
+def _drqv2_activation(x: jax.Array, name: str) -> jax.Array:
+    """Activation set supported by the configurable DrQ-v2 CNN."""
+
+    name = str(name).lower()
+    if name == "relu":
+        return nn.relu(x)
+    if name in {"silu", "swish"}:
+        return nn.silu(x)
+    if name == "gelu":
+        return nn.gelu(x)
+    if name == "tanh":
+        return jnp.tanh(x)
+    raise ValueError(f"Unsupported DrQ-v2 encoder activation {name!r}.")
+
+
+class _DrQV2MultiViewCNN(nn.Module):
+    """Official DrQ-v2 convolution pattern, independently per camera.
+
+    The reference agent has one camera and uses a stride-2 convolution followed
+    by three stride-1 convolutions.  RoboBase observations can contain multiple
+    cameras, so this keeps the historical RoboBase behavior of assigning each
+    view its own encoder while retaining the exact single-view architecture.
+    """
+
+    num_views: int
+    num_downsample_convs: int = 1
+    num_post_downsample_convs: int = 3
+    channels: int = 32
+    kernel_size: int = 3
+    padding: int = 0
+    channels_multiplier: int = 1
+    activation_name: str = "relu"
+    norm: str = "none"
+    normalize_inputs: bool = True
+
+    @nn.compact
+    def __call__(self, rgb_obs: jax.Array) -> jax.Array:
+        x = rgb_obs.astype(jnp.float32)
+        if self.normalize_inputs:
+            x = x / 255.0 - 0.5
+        kernel_init = nn.initializers.orthogonal(np.sqrt(2.0))
+        padding = (
+            "VALID"
+            if self.padding == 0
+            else ((self.padding, self.padding), (self.padding, self.padding))
+        )
+        norm = str(self.norm).lower()
+        if norm not in {"none", "identity", "layer"}:
+            raise ValueError(
+                "DrQ-v2 encoder norm must be one of "
+                f"{{'none', 'identity', 'layer'}}, got {self.norm!r}."
+            )
+
+        outputs = []
+        for view in range(self.num_views):
+            y = jnp.transpose(x[:, view], (0, 2, 3, 1))
+            output_channels = int(self.channels)
+            layer_index = 0
+            for stride, count in (
+                (2, int(self.num_downsample_convs)),
+                (1, int(self.num_post_downsample_convs)),
+            ):
+                for _ in range(count):
+                    y = nn.Conv(
+                        output_channels,
+                        kernel_size=(self.kernel_size, self.kernel_size),
+                        strides=(stride, stride),
+                        padding=padding,
+                        kernel_init=kernel_init,
+                        bias_init=nn.initializers.zeros_init(),
+                        name=f"view_{view}_conv_{layer_index}",
+                    )(y)
+                    if norm == "layer":
+                        y = nn.LayerNorm(
+                            name=f"view_{view}_norm_{layer_index}"
+                        )(y)
+                    y = _drqv2_activation(y, self.activation_name)
+                    output_channels *= int(self.channels_multiplier)
+                    layer_index += 1
+            outputs.append(y.reshape((y.shape[0], -1)))
+        return jnp.stack(outputs, axis=1)
+
+
+class JaxDrQV2Encoder:
+    """Trainable Flax adapter for the official DrQ-v2 pixel encoder."""
+
+    def __init__(
+        self,
+        input_shape: tuple[int, int, int, int],
+        *,
+        num_downsample_convs: int = 1,
+        num_post_downsample_convs: int = 3,
+        channels: int = 32,
+        kernel_size: int = 3,
+        padding: int = 0,
+        channels_multiplier: int = 1,
+        activation: str = "relu",
+        norm: str = "none",
+        normalize_inputs: bool = True,
+        jit: bool = True,
+        seed: int = 0,
+        **unused,
+    ):
+        del unused
+        if len(input_shape) != 4:
+            raise ValueError(
+                "DrQ-v2 RGB input must be [views, channels, H, W], "
+                f"got {input_shape}."
+            )
+        if num_downsample_convs < 0 or num_post_downsample_convs < 0:
+            raise ValueError("DrQ-v2 convolution counts must be non-negative.")
+        if num_downsample_convs + num_post_downsample_convs < 1:
+            raise ValueError("DrQ-v2 encoder requires at least one convolution.")
+        if channels < 1 or channels_multiplier < 1:
+            raise ValueError("DrQ-v2 encoder channels must be positive.")
+        if kernel_size < 1 or padding < 0:
+            raise ValueError("DrQ-v2 kernel_size must be positive and padding >= 0.")
+
+        self._input_shape = tuple(int(value) for value in input_shape)
+        self._model = _DrQV2MultiViewCNN(
+            num_views=self._input_shape[0],
+            num_downsample_convs=int(num_downsample_convs),
+            num_post_downsample_convs=int(num_post_downsample_convs),
+            channels=int(channels),
+            kernel_size=int(kernel_size),
+            padding=int(padding),
+            channels_multiplier=int(channels_multiplier),
+            activation_name=str(activation).lower(),
+            norm=str(norm).lower(),
+            normalize_inputs=bool(normalize_inputs),
+        )
+        dummy = jnp.zeros((1, *self._input_shape), dtype=jnp.float32)
+        self._variables = self._model.init(jax.random.PRNGKey(int(seed)), dummy)
+        output = self._model.apply(self._variables, dummy)
+        self._output_shape = tuple(int(value) for value in output.shape[1:])
+        self._jit = bool(jit)
+        self._encode = jax.jit(self._encode_impl) if self._jit else self._encode_impl
+
+    @property
+    def output_shape(self) -> tuple[int, int]:
+        return self._output_shape
+
+    @property
+    def trainable_params(self):
+        return self._variables["params"]
+
+    @property
+    def batch_stats(self):
+        return None
+
+    def frozen_state_dict(self) -> dict:
+        return {}
+
+    def load_frozen_state_dict(self, state_dict) -> None:
+        del state_dict
+
+    def _encode_impl(self, rgb_obs, *, params=None, stop_gradient=True):
+        variables = self._variables if params is None else {"params": params}
+        features = self._model.apply(variables, rgb_obs)
+        return jax.lax.stop_gradient(features) if stop_gradient else features
+
+    def encode(
+        self,
+        rgb_obs,
+        raymap_obs=None,
+        camera_intrinsic_obs=None,
+        camera_c2w_obs=None,
+    ):
+        del raymap_obs, camera_intrinsic_obs, camera_c2w_obs
+        return self._encode(jnp.asarray(rgb_obs, dtype=jnp.float32))
+
+    def apply_trainable(
+        self,
+        params,
+        rgb_obs,
+        raymap_obs=None,
+        camera_intrinsic_obs=None,
+        camera_c2w_obs=None,
+        task_emb=None,
+    ):
+        del raymap_obs, camera_intrinsic_obs, camera_c2w_obs, task_emb
+        return self._encode_impl(
+            jnp.asarray(rgb_obs, dtype=jnp.float32),
+            params=params,
+            stop_gradient=False,
+        )
+
+
 def _normalize_pretrained_weights_path(
     pretrained_weights_path: str | os.PathLike[str] | None,
 ) -> Path | None:
@@ -1836,3 +2024,156 @@ class JaxDPEarlyFusionEncoder:
             (batch_size, num_views, frame_stack, self._feature_size)
         ).mean(axis=2)
         return jax.lax.stop_gradient(features) if stop_gradient else features
+
+
+# --- Legacy (pre-06a61d4) frozen pretrained ResNet -------------------------
+# Verbatim port of the 8bf7999-era JaxResNetEncoder. Checkpoints trained
+# before the 2026-07-30 pure-JAX encoder rewrite hold parameters in the
+# jax_resnet module structure (timm torchvision weights, frozen batch stats);
+# the rewritten JaxResNetEncoder above silently mis-applies them (2026-08-08
+# compat audit: May FM sandwich 40% -> 4%, May DP -> NaN). Era-gated
+# construction in bc/act/diffusion/flow_matching routes old configs here.
+
+_LEGACY_IMAGENET_MEAN = np.asarray([0.485, 0.456, 0.406], dtype=np.float32)
+_LEGACY_IMAGENET_STD = np.asarray([0.229, 0.224, 0.225], dtype=np.float32)
+_LEGACY_SUPPORTED_RESNETS = {"resnet18": 18, "resnet34": 34}
+_LEGACY_RESNET_FEATURE_SIZES = {"resnet18": 512, "resnet34": 512}
+
+
+@lru_cache(maxsize=4)
+def _load_legacy_pretrained_resnet_feature_model(model_name: str):
+    if model_name not in _LEGACY_SUPPORTED_RESNETS:
+        raise NotImplementedError(
+            "Legacy JAX encoder supports only "
+            f"{sorted(_LEGACY_SUPPORTED_RESNETS)}. Got '{model_name}'."
+        )
+    try:
+        import flax.linen as legacy_nn
+        import jax_resnet
+        import timm
+        from jax_resnet.common import slice_variables
+    except ImportError as exc:
+        raise ImportError(
+            "LegacyJaxResNetEncoder requires `flax`, `jax-resnet`, and `timm`."
+        ) from exc
+
+    state_dict = timm.create_model(model_name, pretrained=True).state_dict()
+    model_cls, variables = jax_resnet.pretrained_resnet(
+        _LEGACY_SUPPORTED_RESNETS[model_name],
+        state_dict=state_dict,
+    )
+    model = model_cls()
+    feature_model = legacy_nn.Sequential(model.layers[:-1])
+    feature_variables = slice_variables(variables, end=-1)
+    return (
+        feature_model,
+        feature_variables,
+        _LEGACY_RESNET_FEATURE_SIZES[model_name],
+    )
+
+
+class LegacyJaxResNetEncoder:
+    """Frozen pretrained ResNet feature extractor (pre-06a61d4 semantics)."""
+
+    def __init__(
+        self,
+        input_shape: tuple[int, int, int, int],
+        model: str,
+        jit: bool = True,
+        **_new_era_kwargs,
+    ):
+        # Tolerate new-era construction kwargs (pretrained, seed, ...); the
+        # legacy path is always pretrained with frozen batch statistics.
+        if _new_era_kwargs.get("use_plucker"):
+            raise ValueError(
+                "LegacyJaxResNetEncoder does not support use_plucker."
+            )
+        assert input_shape[1] == 3, "ResNet only supports channel of size 3"
+
+        feature_model, feature_variables, num_features = (
+            _load_legacy_pretrained_resnet_feature_model(model)
+        )
+        self._feature_model = feature_model
+        self._feature_variables = jax.tree.map(
+            lambda x: jnp.asarray(x, dtype=jnp.float32),
+            feature_variables,
+        )
+        self._num_features = int(num_features)
+        self._input_shape = input_shape
+        self._mean = jnp.asarray(_LEGACY_IMAGENET_MEAN.reshape((1, 1, 1, 3)))
+        self._std = jnp.asarray(_LEGACY_IMAGENET_STD.reshape((1, 1, 1, 3)))
+
+        encode_impl = self._encode_impl
+        if jit:
+            encode_impl = jax.jit(encode_impl)
+        self._encode = encode_impl
+
+    @property
+    def output_shape(self) -> tuple[int, int]:
+        return (self._input_shape[0], self._num_features)
+
+    @property
+    def trainable_params(self):
+        return self._feature_variables["params"]
+
+    @property
+    def batch_stats(self):
+        return self._feature_variables.get("batch_stats", None)
+
+    def encode(self, rgb_obs) -> jnp.ndarray:
+        if hasattr(rgb_obs, "detach"):
+            rgb_obs = rgb_obs.detach().cpu().numpy()
+        else:
+            rgb_obs = np.asarray(rgb_obs)
+        return self._encode(jnp.asarray(rgb_obs))
+
+    def apply_trainable(
+        self,
+        params,
+        rgb_obs: jnp.ndarray,
+        raymap_obs=None,
+        **_new_era_kwargs,
+    ) -> jnp.ndarray:
+        if raymap_obs is not None:
+            raise ValueError(
+                "LegacyJaxResNetEncoder does not support raymap conditioning."
+            )
+        variables = {"params": params}
+        if self.batch_stats is not None:
+            variables["batch_stats"] = self.batch_stats
+        return self._encode_impl(
+            rgb_obs,
+            variables=freeze(variables),
+            stop_gradient=False,
+        )
+
+    def _preprocess(self, rgb_obs: jnp.ndarray) -> tuple[jnp.ndarray, int, int]:
+        x = rgb_obs.astype(jnp.float32)
+        batch_size, num_views, channels, height, width = x.shape
+        x = jnp.transpose(x, (0, 1, 3, 4, 2))
+        x = x.reshape((batch_size * num_views, height, width, channels))
+        x = jax.image.resize(
+            x,
+            shape=(x.shape[0], 224, 224, x.shape[-1]),
+            method="bilinear",
+        )
+        x = x / 255.0
+        x = (x - self._mean) / self._std
+        return x, batch_size, num_views
+
+    def _encode_impl(
+        self,
+        rgb_obs: jnp.ndarray,
+        *,
+        variables: FrozenDict | None = None,
+        stop_gradient: bool = True,
+    ) -> jnp.ndarray:
+        x, batch_size, num_views = self._preprocess(rgb_obs)
+        x = self._feature_model.apply(
+            self._feature_variables if variables is None else variables,
+            x,
+        )
+        x = x.reshape((batch_size, num_views, self._num_features))
+        if stop_gradient:
+            x = jax.lax.stop_gradient(x)
+        return x

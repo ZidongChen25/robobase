@@ -48,6 +48,11 @@ is_imitation_learning: false
 # Demonstration settings
 demos: 0
 demo_batch_size: null  # If set to > 0, introduce a separate buffer for demos
+# Step-scheduled demo fraction of the (constant) total batch, e.g.
+# "linear(0.75,0.25,20000)" over pretrain+online steps. null is the exact
+# legacy static split. Requires demo_batch_size and replay.num_workers=0;
+# total batch stays batch_size+demo_batch_size (JIT shape constant).
+demo_batch_fraction_schedule: null
 use_self_imitation: false  # When using a separate buffer for demos, If set to True, save successful (online) trajectories into the separate demo buffer
 
 # Observation settings

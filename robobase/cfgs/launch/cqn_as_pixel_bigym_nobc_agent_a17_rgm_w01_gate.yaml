@@ -1,0 +1,17 @@
+# @package _global_
+
+# Agent line Stage A17: return-gated margin (charter-boundary variant,
+# admissibility flagged for user review). One-sided expected-Q hinge on
+# non-executed bins, gated purely by positive completed return — never
+# a demo flag; exact zero-return action-label invariance (unit-tested).
+defaults:
+  - cqn_as_pixel_bigym_nobc_agent_a1_descale_gate
+  - _self_
+
+method:
+  return_gated_margin: 0.16
+  return_gated_margin_weight: 0.1
+
+hydra:
+  run:
+    dir: ./exp_local/cqn_no_bc/agent_a17_rgm_w01_${now:%Y%m%d%H%M%S}

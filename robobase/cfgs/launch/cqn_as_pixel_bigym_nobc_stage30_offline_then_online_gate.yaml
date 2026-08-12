@@ -1,0 +1,29 @@
+# @package _global_
+
+# Stage 30: reward-only offline Q-learning on demonstrations, followed by
+# online demo-driven Q-learning with the same critic. The runner executes the
+# two phases separately so the offline phase can use only protected demo
+# replay and exact demonstrated continuation backups, while the online phase
+# uses matched online+demo batches and candidate-max.
+defaults:
+  - cqn_as_pixel_bigym_nobc_stage22_demo_candidate_gate
+  - _self_
+
+num_pretrain_steps: 10000
+
+method:
+  # Keep the objective exactly on the replayed action bins. This is canonical
+  # C51/MC Q-learning, without the dense unseen-bin target used in Stage 22.
+  dense_return_q_target: false
+  dense_return_expected_q_loss: false
+  dense_return_advantage_alpha: 0.0
+  dense_return_advantage_clip_ratio: null
+  dense_return_finest_neighbor_weight: 0.0
+  unseen_return_floor_weight: 0.0
+  # The runner overrides this to 1.0 only during the offline phase and restores
+  # zero for online candidate-max.
+  demo_behavior_force_probability: 0.0
+
+hydra:
+  run:
+    dir: ./exp_local/cqn_no_bc/stage30_offline_then_online_${now:%Y%m%d%H%M%S}

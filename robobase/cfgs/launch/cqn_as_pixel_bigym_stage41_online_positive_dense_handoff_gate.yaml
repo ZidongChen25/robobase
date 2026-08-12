@@ -1,0 +1,15 @@
+# @package _global_
+
+# Stage 41 online phase: share Stage-38's full dense reward-Q offline
+# checkpoint, then retain the dense all-bin target only on completed
+# positive-return trajectories. Zero-return trajectories use canonical C51.
+defaults:
+  - cqn_as_pixel_bigym_stage38_offline_nobc_dense256_gate
+  - _self_
+
+method:
+  dense_return_positive_only: true
+
+hydra:
+  run:
+    dir: ./exp_local/cqn_no_bc/stage41_online_positive_dense_handoff_${now:%Y%m%d%H%M%S}

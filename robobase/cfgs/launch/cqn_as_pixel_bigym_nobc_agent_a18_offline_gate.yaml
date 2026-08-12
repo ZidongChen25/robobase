@@ -1,0 +1,15 @@
+# @package _global_
+
+# Agent line Stage A18 offline phase: the GPT project's Stage-38 offline
+# recipe (full dense reward-Q, candidate backup, official lambda=0.1,
+# b256) plus this line's support de-saturation. Single added field.
+defaults:
+  - cqn_as_pixel_bigym_stage38_offline_nobc_dense256_gate
+  - _self_
+
+method:
+  q_reward_scale: 0.07
+
+hydra:
+  run:
+    dir: ./exp_local/cqn_no_bc/agent_a18_offline_${now:%Y%m%d%H%M%S}

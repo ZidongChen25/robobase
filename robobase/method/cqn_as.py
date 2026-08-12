@@ -28,37 +28,130 @@ from robobase.method.cqn import (
     project_categorical,
     zoom_in,
 )
-from robobase.method.rl_common import JaxRLMethodBase, RLModelSpec, activation
+from robobase.method.rl_common import (
+    JaxRLMethodBase,
+    RLModelSpec,
+    activation,
+    random_shift_rgb,
+)
 from robobase.replay_buffer.replay_buffer import ReplayBuffer
 
 
-def random_shift_rgb(rgb: jax.Array, key: jax.Array, pad: int = 4) -> jax.Array:
-    """Reference RandomShiftsAug for ``[batch, views, channels, H, W]`` RGB."""
+def shift_replay_action_sequence(
+    actions: jax.Array,
+    action_sequence: int,
+    action_dim: int,
+) -> jax.Array:
+    """Return the consecutive replay action sequence starting at t+1."""
 
-    if pad <= 0:
-        return rgb
-    batch, views, channels, height, width = rgb.shape
-    flat = rgb.reshape((batch * views, channels, height, width))
-    flat = jnp.pad(
-        flat,
-        ((0, 0), (0, 0), (pad, pad), (pad, pad)),
-        mode="edge",
+    sequence = jnp.asarray(actions).reshape(
+        (actions.shape[0], int(action_sequence), int(action_dim))
     )
-    shifts = jax.random.randint(
-        key,
-        (batch * views, 2),
-        minval=0,
-        maxval=2 * pad + 1,
+    return jnp.concatenate(
+        [sequence[:, 1:], sequence[:, -1:]],
+        axis=1,
     )
 
-    def crop(image, shift):
-        return jax.lax.dynamic_slice(
-            image,
-            (0, shift[0], shift[1]),
-            (channels, height, width),
+
+def pessimistic_categorical_q(
+    logits1: jax.Array,
+    logits2: jax.Array,
+    support: jax.Array,
+) -> jax.Array:
+    """Lower expected C51 value from two independently trained critics."""
+
+    q1 = jnp.sum(jax.nn.softmax(logits1, axis=-1) * support, axis=-1)
+    q2 = jnp.sum(jax.nn.softmax(logits2, axis=-1) * support, axis=-1)
+    return jnp.minimum(q1, q2)
+
+
+def select_episodic_twin_actions(
+    action1: jax.Array,
+    action2: jax.Array,
+    head_indices: jax.Array,
+) -> jax.Array:
+    """Select one complete action chunk per environment and critic head."""
+
+    choose_second = jnp.asarray(head_indices, dtype=jnp.int32) == 1
+    return jnp.where(choose_second[:, None, None], action2, action1)
+
+
+def top2_joint_beam(
+    parent_scores: jax.Array,
+    q_values: jax.Array,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """Keep the best joint assignments from each factor's top-two bins.
+
+    ``parent_scores`` is ``[B, W]`` and ``q_values`` is
+    ``[B, W, F, bins]``.  Every parent defines a factorized binary search
+    space from its two highest reward-Q bins.  A width-``W`` dynamic program
+    keeps the globally best complete assignments without independently
+    sampling factors.  Returned tensors are the new cumulative scores,
+    source-parent indices, and complete bin assignments ``[B, W, F]``.
+
+    This is an action maximization helper only.  It creates no target, loss,
+    action-label gradient, or demonstration preference.
+    """
+
+    if q_values.ndim != 4:
+        raise ValueError("q_values must have shape [B, W, F, bins].")
+    if parent_scores.shape != q_values.shape[:2]:
+        raise ValueError("parent_scores must match q_values [B, W].")
+    if q_values.shape[-1] < 2:
+        raise ValueError("top2_joint_beam requires at least two bins.")
+
+    batch, width, factors, _ = q_values.shape
+    top_values, top_indices = jax.lax.top_k(q_values, 2)
+    best_values = top_values[..., 0]
+    regrets = (best_values - top_values[..., 1]) / float(factors)
+    second_indices = top_indices[..., 1]
+
+    scores = parent_scores + jnp.mean(best_values, axis=-1)
+    origins = jnp.broadcast_to(
+        jnp.arange(width, dtype=jnp.int32)[None],
+        (batch, width),
+    )
+    assignments = top_indices[..., 0]
+
+    def expand_factor(carry, factor):
+        current_scores, current_origins, current_assignments = carry
+        origin_regrets = jnp.take_along_axis(
+            regrets[:, :, factor], current_origins, axis=1
+        )
+        origin_seconds = jnp.take_along_axis(
+            second_indices[:, :, factor], current_origins, axis=1
         )
 
-    return jax.vmap(crop)(flat, shifts).reshape(rgb.shape)
+        flipped_assignments = current_assignments.at[:, :, factor].set(
+            origin_seconds
+        )
+        expanded_scores = jnp.concatenate(
+            [current_scores, current_scores - origin_regrets], axis=1
+        )
+        expanded_origins = jnp.concatenate(
+            [current_origins, current_origins], axis=1
+        )
+        expanded_assignments = jnp.concatenate(
+            [current_assignments, flipped_assignments], axis=1
+        )
+
+        kept_scores, kept_positions = jax.lax.top_k(expanded_scores, width)
+        kept_origins = jnp.take_along_axis(
+            expanded_origins, kept_positions, axis=1
+        )
+        kept_assignments = jnp.take_along_axis(
+            expanded_assignments,
+            kept_positions[:, :, None],
+            axis=1,
+        )
+        return (kept_scores, kept_origins, kept_assignments), None
+
+    (scores, origins, assignments), _ = jax.lax.scan(
+        expand_factor,
+        (scores, origins, assignments),
+        jnp.arange(factors, dtype=jnp.int32),
+    )
+    return scores, origins, assignments
 
 
 @dataclass(frozen=True)
@@ -67,13 +160,42 @@ class CQNASpec(CQNSpec):
 
     demo_fosd: bool
     strict_demo_rl_only: bool
+    autoregressive_action_dims: bool
+    pessimistic_twin_critic: bool
+    auxiliary_td_loss_weight: float
+    episodic_twin_head_exploration: bool
+    twin_rollout_beam_width: int
+    dense_return_q_target: bool
+    dense_return_positive_only: bool
+    dense_return_expected_q_loss: bool
+    dense_return_advantage_alpha: float
+    dense_return_advantage_clip_ratio: float | None
+    q_reward_scale: float
+    dense_return_label_smoothing: float
+    dense_return_floor_satisfaction_margin: float | None
+    dense_return_relative_floor_margin: float | None
+    return_gated_margin: float | None
+    return_gated_margin_weight: float
+    dense_return_finest_neighbor_weight: float
+    episodic_success_q_target: bool
+    ordered_success_return_mix: float
+    sequence_aligned_mc_discount: float | None
     unseen_return_floor_weight: float
     unseen_return_floor_value: float
+    unseen_return_floor_reduction: str
+    unseen_return_floor_topk: int
     gru_layers: int
     temporal_ensemble: bool
     temporal_ensemble_replan_interval: int
     temporal_ensemble_gain: float
     tie_break_delta: float
+    random_levels_from: int | None
+    level_override_mode: str
+    post_ensemble_random_keep_levels: int | None
+    post_ensemble_fixed_leaf: int | None
+    post_ensemble_l1_flip_prob: float
+    post_ensemble_l2_flip_prob: float
+    post_ensemble_l1_flip_horizon: int
     structured_exploration_prob: float
     structured_exploration_level: int
     structured_exploration_horizon: int
@@ -81,9 +203,13 @@ class CQNASpec(CQNSpec):
     bc_policy_stop_gradient: bool
     distinct_policy_encoder: bool
     td_target_action_source: str
+    demo_behavior_force_probability: float
     td_target_policy_value_beta: float | None
     critic_sequence_mode: str
+    token_split_horizon_targets: bool
+    token_split_boundary: int | None
     mc_return_weight: float
+    mc_lower_bound_target: bool
     mc_return_stop_gradient_encoder: bool
     mc_return_value_only: bool
     policy_value_beta: float | None
@@ -115,15 +241,58 @@ class CQNASpec(CQNSpec):
 
 def cqn_as_spec_from_cfg(cfg: DictConfig) -> CQNASpec:
     method = cfg.method
+    auxiliary_td_loss_weight = float(
+        method.get("auxiliary_td_loss_weight", 0.0)
+    )
+    if auxiliary_td_loss_weight < 0.0:
+        raise ValueError("method.auxiliary_td_loss_weight must be non-negative.")
+    if auxiliary_td_loss_weight > 0.0:
+        auxiliary_nstep = cfg.replay.get("auxiliary_nstep", None)
+        auxiliary_violations = []
+        if not bool(method.get("pessimistic_twin_critic", False)):
+            auxiliary_violations.append("method.pessimistic_twin_critic=true")
+        if int(cfg.replay.get("nstep", 1)) != 1:
+            auxiliary_violations.append("replay.nstep=1")
+        if auxiliary_nstep is None or int(auxiliary_nstep) <= 1:
+            auxiliary_violations.append("replay.auxiliary_nstep > 1")
+        if not bool(cfg.replay.get("include_tp1", True)):
+            auxiliary_violations.append("replay.include_tp1=true")
+        if not bool(cfg.replay.get("include_next_action", False)):
+            auxiliary_violations.append("replay.include_next_action=true")
+        if auxiliary_violations:
+            raise ValueError(
+                "auxiliary TD requires the matched 1-step + n-step twin-C51 "
+                "path: " + "; ".join(auxiliary_violations)
+            )
+    token_split_horizon_targets = bool(
+        method.get("token_split_horizon_targets", False)
+    )
+    if token_split_horizon_targets:
+        token_split_nstep = cfg.replay.get("auxiliary_nstep", None)
+        token_split_violations = []
+        if int(cfg.replay.get("nstep", 1)) != 1:
+            token_split_violations.append("replay.nstep=1")
+        if token_split_nstep is None or int(token_split_nstep) <= 1:
+            token_split_violations.append("replay.auxiliary_nstep > 1")
+        if not bool(cfg.replay.get("include_tp1", True)):
+            token_split_violations.append("replay.include_tp1=true")
+        if token_split_violations:
+            raise ValueError(
+                "token_split_horizon_targets requires the auxiliary-horizon "
+                "replay fields: " + "; ".join(token_split_violations)
+            )
     strict_demo_rl_only = bool(method.get("strict_demo_rl_only", False))
     if strict_demo_rl_only:
         violations = []
-        if int(cfg.get("num_pretrain_steps", 0)) != 0:
-            violations.append("num_pretrain_steps must be 0")
         if bool(cfg.get("is_imitation_learning", False)):
             violations.append("is_imitation_learning must be false")
-        if bool(cfg.get("use_self_imitation", False)):
-            violations.append("use_self_imitation must be false")
+        if bool(cfg.get("use_self_imitation", False)) and not bool(
+            method.get("strict_allow_reward_only_success_replay", False)
+        ):
+            violations.append(
+                "use_self_imitation requires "
+                "method.strict_allow_reward_only_success_replay=true"
+            )
         forbidden_nonzero = {
             "bc_lambda": method.get("bc_lambda", 0.0),
             "bc_margin": method.get("bc_margin", 0.0),
@@ -157,14 +326,43 @@ def cqn_as_spec_from_cfg(cfg: DictConfig) -> CQNASpec:
         for name in forbidden_optional:
             if method.get(name, None) is not None:
                 violations.append(f"method.{name} must be null")
+        td_target_action_source = str(
+            method.get("td_target_action_source", "critic")
+        ).lower()
+        if td_target_action_source not in {
+            "critic",
+            "replay_next",
+            "critic_replay_max",
+        }:
+            violations.append(
+                "method.td_target_action_source must be critic, replay_next, "
+                "or critic_replay_max"
+            )
         if (
-            str(method.get("td_target_action_source", "critic")).lower()
-            != "critic"
+            td_target_action_source == "critic_replay_max"
+            and not bool(cfg.replay.get("include_next_action", False))
         ):
-            violations.append("method.td_target_action_source must be critic")
+            violations.append(
+                "replay.include_next_action must be true for critic_replay_max"
+            )
+        demo_behavior_force_probability = float(
+            method.get("demo_behavior_force_probability", 0.0)
+        )
+        if not 0.0 <= demo_behavior_force_probability <= 1.0:
+            violations.append(
+                "method.demo_behavior_force_probability must be in [0, 1]"
+            )
+        if (
+            demo_behavior_force_probability > 0.0
+            and td_target_action_source != "critic_replay_max"
+        ):
+            violations.append(
+                "method.demo_behavior_force_probability > 0 requires "
+                "td_target_action_source=critic_replay_max"
+            )
         if violations:
             raise ValueError(
-                "strict_demo_rl_only forbids imitation/pretraining paths: "
+                "strict_demo_rl_only forbids imitation/non-RL paths: "
                 + "; ".join(violations)
             )
     base = cqn_spec_from_cfg(cfg)
@@ -178,11 +376,87 @@ def cqn_as_spec_from_cfg(cfg: DictConfig) -> CQNASpec:
         **base_values,
         demo_fosd=bool(method.get("demo_fosd", True)),
         strict_demo_rl_only=strict_demo_rl_only,
+        autoregressive_action_dims=bool(
+            method.get("autoregressive_action_dims", False)
+        ),
+        pessimistic_twin_critic=bool(
+            method.get("pessimistic_twin_critic", False)
+        ),
+        auxiliary_td_loss_weight=auxiliary_td_loss_weight,
+        episodic_twin_head_exploration=bool(
+            method.get("episodic_twin_head_exploration", False)
+        ),
+        twin_rollout_beam_width=int(
+            method.get("twin_rollout_beam_width", 1)
+        ),
+        dense_return_q_target=bool(
+            method.get("dense_return_q_target", False)
+        ),
+        dense_return_positive_only=bool(
+            method.get("dense_return_positive_only", False)
+        ),
+        dense_return_expected_q_loss=bool(
+            method.get("dense_return_expected_q_loss", False)
+        ),
+        dense_return_advantage_alpha=float(
+            method.get("dense_return_advantage_alpha", 0.0)
+        ),
+        dense_return_advantage_clip_ratio=(
+            None
+            if method.get("dense_return_advantage_clip_ratio", None) is None
+            else float(method.dense_return_advantage_clip_ratio)
+        ),
+        q_reward_scale=float(method.get("q_reward_scale", 1.0)),
+        dense_return_label_smoothing=float(
+            method.get("dense_return_label_smoothing", 0.0)
+        ),
+        dense_return_floor_satisfaction_margin=(
+            None
+            if method.get("dense_return_floor_satisfaction_margin", None)
+            is None
+            else float(
+                method.get("dense_return_floor_satisfaction_margin")
+            )
+        ),
+        dense_return_relative_floor_margin=(
+            None
+            if method.get("dense_return_relative_floor_margin", None)
+            is None
+            else float(method.get("dense_return_relative_floor_margin"))
+        ),
+        return_gated_margin=(
+            None
+            if method.get("return_gated_margin", None) is None
+            else float(method.get("return_gated_margin"))
+        ),
+        return_gated_margin_weight=float(
+            method.get("return_gated_margin_weight", 0.0)
+        ),
+        dense_return_finest_neighbor_weight=float(
+            method.get("dense_return_finest_neighbor_weight", 0.0)
+        ),
+        episodic_success_q_target=bool(
+            method.get("episodic_success_q_target", False)
+        ),
+        ordered_success_return_mix=float(
+            method.get("ordered_success_return_mix", 0.0)
+        ),
+        sequence_aligned_mc_discount=(
+            None
+            if method.get("sequence_aligned_mc_discount", None) is None
+            else float(method.sequence_aligned_mc_discount)
+        ),
         unseen_return_floor_weight=float(
             method.get("unseen_return_floor_weight", 0.0)
         ),
         unseen_return_floor_value=float(
             method.get("unseen_return_floor_value", 0.0)
+        ),
+        unseen_return_floor_reduction=str(
+            method.get("unseen_return_floor_reduction", "mean")
+        ).lower(),
+        unseen_return_floor_topk=int(
+            method.get("unseen_return_floor_topk", 1)
         ),
         gru_layers=int(method.get("gru_layers", 1)),
         temporal_ensemble=bool(method.get("temporal_ensemble", True)),
@@ -191,6 +465,33 @@ def cqn_as_spec_from_cfg(cfg: DictConfig) -> CQNASpec:
         ),
         temporal_ensemble_gain=float(method.get("temporal_ensemble_gain", 0.01)),
         tie_break_delta=float(method.get("tie_break_delta", 1e-4)),
+        random_levels_from=(
+            None
+            if method.get("random_levels_from", None) is None
+            else int(method.random_levels_from)
+        ),
+        level_override_mode=str(
+            method.get("level_override_mode", "random")
+        ),
+        post_ensemble_random_keep_levels=(
+            None
+            if method.get("post_ensemble_random_keep_levels", None) is None
+            else int(method.post_ensemble_random_keep_levels)
+        ),
+        post_ensemble_fixed_leaf=(
+            None
+            if method.get("post_ensemble_fixed_leaf", None) is None
+            else int(method.post_ensemble_fixed_leaf)
+        ),
+        post_ensemble_l1_flip_prob=float(
+            method.get("post_ensemble_l1_flip_prob", 0.0)
+        ),
+        post_ensemble_l2_flip_prob=float(
+            method.get("post_ensemble_l2_flip_prob", 0.0)
+        ),
+        post_ensemble_l1_flip_horizon=int(
+            method.get("post_ensemble_l1_flip_horizon", 4)
+        ),
         structured_exploration_prob=float(
             method.get("structured_exploration_prob", 0.0)
         ),
@@ -210,6 +511,9 @@ def cqn_as_spec_from_cfg(cfg: DictConfig) -> CQNASpec:
         td_target_action_source=str(
             method.get("td_target_action_source", "critic")
         ).lower(),
+        demo_behavior_force_probability=float(
+            method.get("demo_behavior_force_probability", 0.0)
+        ),
         td_target_policy_value_beta=(
             None
             if td_target_policy_value_beta is None
@@ -218,7 +522,16 @@ def cqn_as_spec_from_cfg(cfg: DictConfig) -> CQNASpec:
         critic_sequence_mode=str(
             method.get("critic_sequence_mode", "full")
         ).lower(),
+        token_split_horizon_targets=token_split_horizon_targets,
+        token_split_boundary=(
+            None
+            if method.get("token_split_boundary", None) is None
+            else int(method.get("token_split_boundary"))
+        ),
         mc_return_weight=float(method.get("mc_return_weight", 0.0)),
+        mc_lower_bound_target=bool(
+            method.get("mc_lower_bound_target", False)
+        ),
         mc_return_stop_gradient_encoder=bool(
             method.get("mc_return_stop_gradient_encoder", False)
         ),
@@ -680,6 +993,286 @@ class C2FSequenceDistributionalCritic(nn.Module):
         return combined
 
 
+class AutoregressiveActionCorrection(nn.Module):
+    """Causal action-dimension correction for a parallel sequence critic."""
+
+    hidden_dim: int
+    action_sequence: int
+    action_dim: int
+    bins: int
+    atoms: int
+    activation_name: str = "silu"
+
+    def setup(self):
+        self.feature_projection = nn.Dense(
+            self.hidden_dim,
+            use_bias=False,
+            kernel_init=nn.initializers.orthogonal(),
+            name="feature_projection",
+        )
+        self.base_logit_projection = nn.Dense(
+            self.hidden_dim,
+            use_bias=False,
+            kernel_init=nn.initializers.orthogonal(),
+            name="base_logit_projection",
+        )
+        self.previous_action_projection = nn.Dense(
+            self.hidden_dim,
+            use_bias=False,
+            kernel_init=nn.initializers.orthogonal(),
+            name="previous_action_projection",
+        )
+        self.dimension_embedding = nn.Embed(
+            num_embeddings=self.action_dim,
+            features=self.hidden_dim,
+            embedding_init=nn.initializers.normal(stddev=0.02),
+            name="dimension_embedding",
+        )
+        self.input_norm = nn.LayerNorm(name="input_norm")
+        self.gru = nn.GRUCell(
+            features=self.hidden_dim,
+            name="action_dimension_gru",
+        )
+        self.output_projection = nn.Dense(
+            self.bins * self.atoms,
+            kernel_init=nn.initializers.zeros_init(),
+            bias_init=nn.initializers.zeros_init(),
+            name="output_projection",
+        )
+
+    def _step(
+        self,
+        carry: jax.Array,
+        base_logits: jax.Array,
+        feature_embedding: jax.Array,
+        dimension: int,
+        previous_action: jax.Array,
+    ) -> tuple[jax.Array, jax.Array]:
+        batch_size, sequence_length = base_logits.shape[:2]
+        repeated_feature_embedding = jnp.broadcast_to(
+            feature_embedding[:, None, :],
+            (batch_size, sequence_length, self.hidden_dim),
+        )
+        base_embedding = self.base_logit_projection(
+            base_logits.reshape(
+                (batch_size, sequence_length, self.bins * self.atoms)
+            )
+        )
+        previous_action_embedding = self.previous_action_projection(
+            previous_action[..., None]
+        )
+        dimension_embedding = self.dimension_embedding(
+            jnp.asarray(dimension, dtype=jnp.int32)
+        )
+        inputs = (
+            base_embedding
+            + repeated_feature_embedding
+            + previous_action_embedding
+            + dimension_embedding
+        )
+        inputs = self.input_norm(inputs).reshape(
+            (batch_size * sequence_length, self.hidden_dim)
+        )
+        inputs = activation(inputs, self.activation_name)
+        flat_carry = carry.reshape(
+            (batch_size * sequence_length, self.hidden_dim)
+        )
+        flat_carry, recurrent = self.gru(flat_carry, inputs)
+        correction = self.output_projection(recurrent).reshape(
+            (
+                batch_size,
+                sequence_length,
+                self.bins,
+                self.atoms,
+            )
+        )
+        return (
+            flat_carry.reshape(
+                (batch_size, sequence_length, self.hidden_dim)
+            ),
+            correction,
+        )
+
+    def __call__(
+        self,
+        base_logits: jax.Array,
+        features: jax.Array,
+        action_context: jax.Array,
+    ) -> jax.Array:
+        """Teacher-force corrections using only preceding action dimensions."""
+
+        batch_size = base_logits.shape[0]
+        carry = jnp.zeros(
+            (batch_size, self.action_sequence, self.hidden_dim),
+            dtype=base_logits.dtype,
+        )
+        previous_action = jnp.zeros(
+            (batch_size, self.action_sequence),
+            dtype=base_logits.dtype,
+        )
+        feature_embedding = self.feature_projection(features)
+        corrections = []
+        for dimension in range(self.action_dim):
+            carry, correction = self._step(
+                carry,
+                base_logits[:, :, dimension],
+                feature_embedding,
+                dimension,
+                previous_action,
+            )
+            corrections.append(correction)
+            previous_action = action_context[:, :, dimension]
+        return jnp.stack(corrections, axis=2)
+
+    def greedy_bins(
+        self,
+        base_logits: jax.Array,
+        features: jax.Array,
+        low: jax.Array,
+        high: jax.Array,
+        support: jax.Array,
+        tie_break_delta: float,
+        key: jax.Array | None = None,
+    ) -> jax.Array:
+        """Select bins causally, feeding each selected center to the next head."""
+
+        batch_size = base_logits.shape[0]
+        carry = jnp.zeros(
+            (batch_size, self.action_sequence, self.hidden_dim),
+            dtype=base_logits.dtype,
+        )
+        previous_action = jnp.zeros(
+            (batch_size, self.action_sequence),
+            dtype=base_logits.dtype,
+        )
+        feature_embedding = self.feature_projection(features)
+        dimension_keys = [None] * self.action_dim
+        if key is not None:
+            dimension_keys = list(jax.random.split(key, self.action_dim))
+        selected = []
+        for dimension in range(self.action_dim):
+            carry, correction = self._step(
+                carry,
+                base_logits[:, :, dimension],
+                feature_embedding,
+                dimension,
+                previous_action,
+            )
+            logits = base_logits[:, :, dimension] + correction
+            probabilities = jax.nn.softmax(logits, axis=-1)
+            q_values = jnp.sum(probabilities * support, axis=-1)
+            index = jnp.argmax(q_values, axis=-1)
+            dimension_key = dimension_keys[dimension]
+            if dimension_key is not None:
+                random_index = jax.random.randint(
+                    dimension_key,
+                    index.shape,
+                    minval=0,
+                    maxval=self.bins,
+                )
+                q_span = q_values.max(axis=-1) - q_values.min(axis=-1)
+                index = jnp.where(
+                    q_span < tie_break_delta,
+                    random_index,
+                    index,
+                )
+            selected.append(index)
+            bin_width = (
+                high[:, :, dimension] - low[:, :, dimension]
+            ) / self.bins
+            previous_action = low[:, :, dimension] + (
+                index.astype(base_logits.dtype) + 0.5
+            ) * bin_width
+        return jnp.stack(selected, axis=-1)
+
+
+class AutoregressiveSequenceDistributionalCritic(nn.Module):
+    """Legacy CQN-AS critic plus a causal action-dimension Q correction."""
+
+    hidden_dims: tuple[int, ...]
+    action_sequence: int
+    action_dim: int
+    levels: int
+    bins: int
+    atoms: int
+    low_dim_size: int = 0
+    gru_layers: int = 1
+    activation_name: str = "silu"
+    use_dueling: bool = True
+
+    def setup(self):
+        self.base_critic = C2FSequenceDistributionalCritic(
+            hidden_dims=self.hidden_dims,
+            action_sequence=self.action_sequence,
+            action_dim=self.action_dim,
+            levels=self.levels,
+            bins=self.bins,
+            atoms=self.atoms,
+            low_dim_size=self.low_dim_size,
+            gru_layers=self.gru_layers,
+            activation_name=self.activation_name,
+            use_dueling=self.use_dueling,
+        )
+        self.action_correction = AutoregressiveActionCorrection(
+            hidden_dim=self.hidden_dims[-1],
+            action_sequence=self.action_sequence,
+            action_dim=self.action_dim,
+            bins=self.bins,
+            atoms=self.atoms,
+            activation_name=self.activation_name,
+        )
+
+    def __call__(
+        self,
+        features: jax.Array,
+        level_one_hot: jax.Array,
+        low_high_midpoint: jax.Array,
+        action_context: jax.Array,
+        return_streams: bool = False,
+    ) -> jax.Array | tuple[jax.Array, jax.Array, jax.Array]:
+        base_logits, values, _ = self.base_critic(
+            features,
+            level_one_hot,
+            low_high_midpoint,
+            return_streams=True,
+        )
+        correction = self.action_correction(
+            base_logits,
+            features,
+            action_context,
+        )
+        combined = base_logits + correction
+        if return_streams:
+            return combined, values, combined - values
+        return combined
+
+    def greedy_bins(
+        self,
+        features: jax.Array,
+        level_one_hot: jax.Array,
+        low_high_midpoint: jax.Array,
+        low: jax.Array,
+        high: jax.Array,
+        support: jax.Array,
+        tie_break_delta: float,
+        key: jax.Array | None = None,
+    ) -> jax.Array:
+        base_logits = self.base_critic(
+            features,
+            level_one_hot,
+            low_high_midpoint,
+        )
+        return self.action_correction.greedy_bins(
+            base_logits,
+            features,
+            low,
+            high,
+            support,
+            tie_break_delta,
+            key,
+        )
+
+
 class CQNAS(CQN):
     """Distributional CQN-AS action-sequence agent.
 
@@ -726,15 +1319,39 @@ class CQNAS(CQN):
         bc_policy_stop_gradient: bool,
         distinct_policy_encoder: bool,
         td_target_action_source: str,
+        demo_behavior_force_probability: float,
         td_target_policy_value_beta: float | None,
         critic_sequence_mode: str,
         mc_return_weight: float,
+        mc_lower_bound_target: bool,
         mc_return_stop_gradient_encoder: bool,
         mc_return_value_only: bool,
         policy_value_beta: float | None,
         strict_demo_rl_only: bool,
+        autoregressive_action_dims: bool,
+        pessimistic_twin_critic: bool,
+        auxiliary_td_loss_weight: float,
+        episodic_twin_head_exploration: bool,
+        twin_rollout_beam_width: int,
+        dense_return_q_target: bool,
+        dense_return_positive_only: bool,
+        dense_return_expected_q_loss: bool,
+        dense_return_advantage_alpha: float,
+        dense_return_advantage_clip_ratio: float | None,
+        q_reward_scale: float,
+        dense_return_label_smoothing: float,
+        dense_return_floor_satisfaction_margin: float | None,
+        dense_return_relative_floor_margin: float | None,
+        return_gated_margin: float | None,
+        return_gated_margin_weight: float,
+        dense_return_finest_neighbor_weight: float,
+        episodic_success_q_target: bool,
+        ordered_success_return_mix: float,
+        sequence_aligned_mc_discount: float | None,
         unseen_return_floor_weight: float,
         unseen_return_floor_value: float,
+        unseen_return_floor_reduction: str,
+        unseen_return_floor_topk: int,
         model: RLModelSpec,
         observation_space: spaces.Dict,
         action_space: spaces.Box,
@@ -744,6 +1361,8 @@ class CQNAS(CQN):
         replay_beta: float,
         frame_stack_on_channel: bool,
         intrinsic_reward_module=None,
+        token_split_horizon_targets: bool = False,
+        token_split_boundary: int | None = None,
         demo_fosd: bool = True,
         critic_grad_clip: Optional[float] = None,
         jit: bool = True,
@@ -775,6 +1394,13 @@ class CQNAS(CQN):
         bin_explore_persist_plans: int | None = None,
         low_dim_mask_prob: float = 0.0,
         low_dim_mask_keep_last: int = 0,
+        random_levels_from: int | None = None,
+        level_override_mode: str = "random",
+        post_ensemble_random_keep_levels: int | None = None,
+        post_ensemble_fixed_leaf: int | None = None,
+        post_ensemble_l1_flip_prob: float = 0.0,
+        post_ensemble_l2_flip_prob: float = 0.0,
+        post_ensemble_l1_flip_horizon: int = 4,
     ):
         JaxRLMethodBase.__init__(
             self,
@@ -796,8 +1422,8 @@ class CQNAS(CQN):
             is_rl=True,
             update_block_every_steps=update_block_every_steps,
         )
-        if self.action_sequence < 2:
-            raise ValueError("CQN-AS requires action_sequence >= 2.")
+        if self.action_sequence < 1:
+            raise ValueError("CQN-AS requires action_sequence >= 1.")
         if levels < 1 or bins < 2:
             raise ValueError("CQN-AS requires levels >= 1 and bins >= 2.")
         if atoms < 2 or v_max <= v_min:
@@ -831,22 +1457,88 @@ class CQNAS(CQN):
         if td_target_action_source not in {
             "critic",
             "replay_next",
+            "critic_replay_max",
             "bc_policy",
             "policy_value",
         }:
             raise ValueError(
                 "td_target_action_source must be one of "
-                "{'critic', 'replay_next', 'bc_policy', 'policy_value'}."
+                "{'critic', 'replay_next', 'critic_replay_max', "
+                "'bc_policy', 'policy_value'}."
             )
         critic_sequence_mode = str(critic_sequence_mode).lower()
         if critic_sequence_mode not in {"full", "effective_k0"}:
             raise ValueError(
                 "critic_sequence_mode must be one of {'full', 'effective_k0'}."
             )
-        if not separate_bc_policy and td_target_action_source != "critic":
+        token_split_horizon_targets = bool(token_split_horizon_targets)
+        if token_split_horizon_targets:
+            token_split_violations = []
+            if pessimistic_twin_critic:
+                token_split_violations.append("pessimistic_twin_critic=false")
+            if float(auxiliary_td_loss_weight) > 0.0:
+                token_split_violations.append("auxiliary_td_loss_weight=0")
+            if separate_bc_policy:
+                token_split_violations.append("separate_bc_policy=false")
+            if str(td_target_action_source).lower() != "critic":
+                token_split_violations.append("td_target_action_source=critic")
+            if dense_return_q_target:
+                token_split_violations.append("dense_return_q_target=false")
+            if episodic_success_q_target:
+                token_split_violations.append(
+                    "episodic_success_q_target=false"
+                )
+            if mc_lower_bound_target:
+                token_split_violations.append("mc_lower_bound_target=false")
+            if sequence_aligned_mc_discount is not None:
+                token_split_violations.append(
+                    "sequence_aligned_mc_discount=null"
+                )
+            if critic_sequence_mode != "full":
+                token_split_violations.append("critic_sequence_mode=full")
+            if int(self.action_sequence) < 2:
+                token_split_violations.append("action_sequence >= 2")
+            if token_split_violations:
+                raise ValueError(
+                    "token_split_horizon_targets requires: "
+                    + "; ".join(token_split_violations)
+                )
+            if token_split_boundary is None:
+                raise ValueError(
+                    "token_split_horizon_targets requires an explicit "
+                    "token_split_boundary (1-based token index at or below "
+                    "which the exact legacy 1-step backup is kept)."
+                )
+            token_split_boundary = int(token_split_boundary)
+            if not 1 <= token_split_boundary < int(self.action_sequence):
+                raise ValueError(
+                    "token_split_boundary must lie in [1, action_sequence)."
+                )
+        if (
+            not separate_bc_policy
+            and td_target_action_source
+            not in {"critic", "replay_next", "critic_replay_max"}
+        ):
             raise ValueError(
-                "td_target_action_source requires separate_bc_policy=true unless "
-                "it is 'critic'."
+                "td_target_action_source requires separate_bc_policy=true "
+                "unless it is critic, replay_next, or critic_replay_max."
+            )
+        if separate_bc_policy and td_target_action_source == "critic_replay_max":
+            raise ValueError(
+                "critic_replay_max is implemented only for the single-objective "
+                "critic path."
+            )
+        if not 0.0 <= demo_behavior_force_probability <= 1.0:
+            raise ValueError(
+                "demo_behavior_force_probability must be in [0, 1]."
+            )
+        if (
+            demo_behavior_force_probability > 0.0
+            and td_target_action_source != "critic_replay_max"
+        ):
+            raise ValueError(
+                "demo_behavior_force_probability > 0 requires "
+                "td_target_action_source=critic_replay_max."
             )
         if (
             td_target_policy_value_beta is not None
@@ -873,6 +1565,258 @@ class CQNAS(CQN):
             )
         if separate_bc_policy and bc_lambda <= 0.0:
             raise ValueError("separate_bc_policy=true requires bc_lambda > 0.")
+        if autoregressive_action_dims and separate_bc_policy:
+            raise ValueError(
+                "autoregressive_action_dims requires "
+                "separate_bc_policy=false."
+            )
+        if dense_return_q_target and separate_bc_policy:
+            raise ValueError(
+                "dense_return_q_target requires separate_bc_policy=false."
+            )
+        if dense_return_positive_only and not dense_return_q_target:
+            raise ValueError(
+                "dense_return_positive_only requires "
+                "dense_return_q_target=true."
+            )
+        if dense_return_positive_only and not mc_lower_bound_target:
+            raise ValueError(
+                "dense_return_positive_only requires "
+                "mc_lower_bound_target=true so completed returns are present."
+            )
+        if dense_return_expected_q_loss and not dense_return_q_target:
+            raise ValueError(
+                "dense_return_expected_q_loss requires "
+                "dense_return_q_target=true."
+            )
+        if not 0.0 <= dense_return_advantage_alpha < 1.0:
+            raise ValueError(
+                "dense_return_advantage_alpha must be in [0, 1)."
+            )
+        if (
+            dense_return_advantage_alpha > 0.0
+            and not dense_return_q_target
+        ):
+            raise ValueError(
+                "dense_return_advantage_alpha requires "
+                "dense_return_q_target=true."
+            )
+        if (
+            dense_return_advantage_alpha > 0.0
+            and dense_return_expected_q_loss
+        ):
+            raise ValueError(
+                "dense_return_advantage_alpha requires "
+                "dense_return_expected_q_loss=false."
+            )
+        if dense_return_advantage_clip_ratio is not None:
+            if not 0.0 < dense_return_advantage_clip_ratio < 1.0:
+                raise ValueError(
+                    "dense_return_advantage_clip_ratio must be in (0, 1)."
+                )
+            if dense_return_advantage_alpha <= 0.0:
+                raise ValueError(
+                    "dense_return_advantage_clip_ratio requires "
+                    "dense_return_advantage_alpha > 0."
+                )
+        if q_reward_scale <= 0.0:
+            raise ValueError("q_reward_scale must be positive.")
+        if q_reward_scale != 1.0:
+            if not dense_return_q_target:
+                raise ValueError(
+                    "q_reward_scale != 1 requires "
+                    "dense_return_q_target=true."
+                )
+            if not mc_lower_bound_target:
+                raise ValueError(
+                    "q_reward_scale != 1 requires "
+                    "mc_lower_bound_target=true."
+                )
+            if episodic_success_q_target:
+                raise ValueError(
+                    "q_reward_scale != 1 is incompatible with "
+                    "episodic_success_q_target."
+                )
+            if ordered_success_return_mix > 0.0:
+                raise ValueError(
+                    "q_reward_scale != 1 is incompatible with "
+                    "ordered_success_return_mix."
+                )
+            if sequence_aligned_mc_discount is not None:
+                raise ValueError(
+                    "q_reward_scale != 1 is incompatible with "
+                    "sequence_aligned_mc_discount."
+                )
+            if not v_min <= q_reward_scale <= v_max:
+                raise ValueError(
+                    "q_reward_scale terminal target must lie on "
+                    "the C51 support."
+                )
+        if not 0.0 <= dense_return_label_smoothing < 1.0:
+            raise ValueError(
+                "dense_return_label_smoothing must be in [0, 1)."
+            )
+        if dense_return_floor_satisfaction_margin is not None:
+            if dense_return_floor_satisfaction_margin < 0.0:
+                raise ValueError(
+                    "dense_return_floor_satisfaction_margin must be "
+                    "nonnegative."
+                )
+            if not dense_return_q_target:
+                raise ValueError(
+                    "dense_return_floor_satisfaction_margin requires "
+                    "dense_return_q_target=true."
+                )
+            if dense_return_label_smoothing > 0.0:
+                raise ValueError(
+                    "dense_return_floor_satisfaction_margin is "
+                    "incompatible with dense_return_label_smoothing."
+                )
+            if dense_return_advantage_alpha > 0.0:
+                raise ValueError(
+                    "dense_return_floor_satisfaction_margin is "
+                    "incompatible with dense_return_advantage_alpha."
+                )
+        if (
+            dense_return_label_smoothing > 0.0
+            and not dense_return_q_target
+        ):
+            raise ValueError(
+                "dense_return_label_smoothing requires "
+                "dense_return_q_target=true."
+            )
+        if dense_return_relative_floor_margin is not None:
+            if dense_return_relative_floor_margin <= 0.0:
+                raise ValueError(
+                    "dense_return_relative_floor_margin must be positive."
+                )
+            if not dense_return_q_target:
+                raise ValueError(
+                    "dense_return_relative_floor_margin requires "
+                    "dense_return_q_target=true."
+                )
+            if dense_return_floor_satisfaction_margin is not None:
+                raise ValueError(
+                    "dense_return_relative_floor_margin is incompatible "
+                    "with dense_return_floor_satisfaction_margin."
+                )
+            if dense_return_advantage_alpha > 0.0:
+                raise ValueError(
+                    "dense_return_relative_floor_margin is incompatible "
+                    "with dense_return_advantage_alpha."
+                )
+        if return_gated_margin is not None:
+            if return_gated_margin <= 0.0:
+                raise ValueError("return_gated_margin must be positive.")
+            if return_gated_margin_weight <= 0.0:
+                raise ValueError(
+                    "return_gated_margin requires a positive "
+                    "return_gated_margin_weight."
+                )
+            if not dense_return_q_target:
+                raise ValueError(
+                    "return_gated_margin requires dense_return_q_target=true."
+                )
+            if not mc_lower_bound_target:
+                raise ValueError(
+                    "return_gated_margin requires mc_lower_bound_target=true."
+                )
+        if not 0.0 <= dense_return_finest_neighbor_weight <= 1.0:
+            raise ValueError(
+                "dense_return_finest_neighbor_weight must be in [0, 1]."
+            )
+        if (
+            dense_return_finest_neighbor_weight > 0.0
+            and not dense_return_q_target
+        ):
+            raise ValueError(
+                "dense_return_finest_neighbor_weight requires "
+                "dense_return_q_target=true."
+            )
+        if (
+            dense_return_expected_q_loss
+            and dense_return_finest_neighbor_weight > 0.0
+        ):
+            raise ValueError(
+                "dense_return_expected_q_loss requires "
+                "dense_return_finest_neighbor_weight=0."
+            )
+        if episodic_success_q_target and not dense_return_q_target:
+            raise ValueError(
+                "episodic_success_q_target requires "
+                "dense_return_q_target=true."
+            )
+        if episodic_success_q_target and mc_lower_bound_target:
+            raise ValueError(
+                "episodic_success_q_target replaces the discounted "
+                "MC-lower-bound/Bellman target; set "
+                "mc_lower_bound_target=false."
+            )
+        if episodic_success_q_target and mc_return_weight != 0.0:
+            raise ValueError(
+                "episodic_success_q_target is the complete Q objective; "
+                "set mc_return_weight=0."
+            )
+        if (
+            episodic_success_q_target
+            and unseen_return_floor_value != 0.0
+        ):
+            raise ValueError(
+                "episodic_success_q_target requires "
+                "unseen_return_floor_value=0."
+            )
+        if episodic_success_q_target and not (
+            v_min <= 0.0 <= 1.0 <= v_max
+        ):
+            raise ValueError(
+                "episodic_success_q_target requires C51 support to "
+                "contain both 0 and 1."
+            )
+        if not 0.0 <= ordered_success_return_mix <= 1.0:
+            raise ValueError(
+                "ordered_success_return_mix must be in [0, 1]."
+            )
+        if (
+            ordered_success_return_mix > 0.0
+            and not mc_lower_bound_target
+        ):
+            raise ValueError(
+                "ordered_success_return_mix requires "
+                "mc_lower_bound_target=true."
+            )
+        if (
+            ordered_success_return_mix > 0.0
+            and not dense_return_q_target
+        ):
+            raise ValueError(
+                "ordered_success_return_mix requires "
+                "dense_return_q_target=true."
+            )
+        if sequence_aligned_mc_discount is not None:
+            if not 0.0 < sequence_aligned_mc_discount <= 1.0:
+                raise ValueError(
+                    "sequence_aligned_mc_discount must be in (0, 1]."
+                )
+            if not mc_lower_bound_target:
+                raise ValueError(
+                    "sequence_aligned_mc_discount requires "
+                    "mc_lower_bound_target=true."
+                )
+            if not dense_return_q_target:
+                raise ValueError(
+                    "sequence_aligned_mc_discount requires "
+                    "dense_return_q_target=true."
+                )
+            if ordered_success_return_mix > 0.0:
+                raise ValueError(
+                    "sequence_aligned_mc_discount and "
+                    "ordered_success_return_mix are mutually exclusive."
+                )
+            if critic_sequence_mode != "full":
+                raise ValueError(
+                    "sequence_aligned_mc_discount requires "
+                    "critic_sequence_mode=full."
+                )
         if distinct_policy_encoder and not separate_bc_policy:
             raise ValueError(
                 "distinct_policy_encoder=true requires separate_bc_policy=true."
@@ -887,13 +1831,44 @@ class CQNAS(CQN):
             )
         if mc_return_weight < 0.0:
             raise ValueError("mc_return_weight must be non-negative.")
+        if auxiliary_td_loss_weight < 0.0:
+            raise ValueError(
+                "auxiliary_td_loss_weight must be non-negative."
+            )
+        if auxiliary_td_loss_weight > 0.0 and not pessimistic_twin_critic:
+            raise ValueError(
+                "auxiliary_td_loss_weight > 0 requires "
+                "pessimistic_twin_critic=true."
+            )
+        if mc_lower_bound_target and separate_bc_policy:
+            raise ValueError(
+                "mc_lower_bound_target requires the canonical critic path "
+                "(separate_bc_policy=false)."
+            )
         if unseen_return_floor_weight < 0.0:
             raise ValueError(
                 "unseen_return_floor_weight must be non-negative."
             )
+        if dense_return_q_target and unseen_return_floor_weight != 0.0:
+            raise ValueError(
+                "dense_return_q_target is the complete Q objective and "
+                "requires unseen_return_floor_weight=0."
+            )
         if not v_min <= unseen_return_floor_value <= v_max:
             raise ValueError(
                 "unseen_return_floor_value must lie on the C51 support."
+            )
+        unseen_return_floor_reduction = str(
+            unseen_return_floor_reduction
+        ).lower()
+        if unseen_return_floor_reduction not in {"mean", "max", "topk"}:
+            raise ValueError(
+                "unseen_return_floor_reduction must be one of "
+                "{'mean', 'max', 'topk'}."
+            )
+        if not 1 <= unseen_return_floor_topk < bins:
+            raise ValueError(
+                "unseen_return_floor_topk must be in [1, bins - 1]."
             )
         # Canonical (non-decoupled) MC anchor is a deliberate Stage-147 arm:
         # it calibrates the same Q head that drives behavior.  The historical
@@ -902,10 +1877,103 @@ class CQNAS(CQN):
         self._canonical_mc_anchor = bool(
             mc_return_weight > 0.0 and not separate_bc_policy
         )
+        self.mc_lower_bound_target = bool(mc_lower_bound_target)
+        self.episodic_success_q_target = bool(
+            episodic_success_q_target
+        )
+        self.ordered_success_return_mix = float(
+            ordered_success_return_mix
+        )
+        self.sequence_aligned_mc_discount = (
+            None
+            if sequence_aligned_mc_discount is None
+            else float(sequence_aligned_mc_discount)
+        )
+        self._uses_canonical_mc_returns = bool(
+            self._canonical_mc_anchor
+            or self.mc_lower_bound_target
+            or self.episodic_success_q_target
+        )
         if mc_return_weight > 0.0 and mc_return_value_only and not use_dueling:
             raise ValueError(
                 "mc_return_value_only=true requires use_dueling=true."
             )
+        if pessimistic_twin_critic:
+            twin_violations = []
+            if not strict_demo_rl_only:
+                twin_violations.append("strict_demo_rl_only=true")
+            if use_dueling:
+                twin_violations.append("use_dueling=false")
+            if autoregressive_action_dims:
+                twin_violations.append("autoregressive_action_dims=false")
+            if td_target_action_source != "critic_replay_max":
+                twin_violations.append(
+                    "td_target_action_source=critic_replay_max"
+                )
+            if not mc_lower_bound_target:
+                twin_violations.append("mc_lower_bound_target=true")
+            if dense_return_q_target:
+                twin_violations.append("dense_return_q_target=false")
+            if unseen_return_floor_weight != 0.0:
+                twin_violations.append("unseen_return_floor_weight=0")
+            if episodic_success_q_target:
+                twin_violations.append("episodic_success_q_target=false")
+            if ordered_success_return_mix != 0.0:
+                twin_violations.append("ordered_success_return_mix=0")
+            if sequence_aligned_mc_discount is not None:
+                twin_violations.append("sequence_aligned_mc_discount=null")
+            if mc_return_weight != 0.0:
+                twin_violations.append("mc_return_weight=0")
+            if centralized_critic:
+                twin_violations.append("centralized_critic=false")
+            if critic_sequence_mode != "full":
+                twin_violations.append("critic_sequence_mode=full")
+            if q_reward_scale != 1.0:
+                twin_violations.append("q_reward_scale=1")
+            if twin_violations:
+                raise ValueError(
+                    "pessimistic_twin_critic requires the isolated "
+                    "reward-only direct-C51 path: "
+                    + "; ".join(twin_violations)
+                )
+        if episodic_twin_head_exploration:
+            exploration_violations = []
+            if not pessimistic_twin_critic:
+                exploration_violations.append("pessimistic_twin_critic=true")
+            if structured_exploration_prob != 0.0:
+                exploration_violations.append("structured_exploration_prob=0")
+            if bin_flip_prob != 0.0:
+                exploration_violations.append("bin_flip_prob=0")
+            if bin_explore_probs is not None:
+                exploration_violations.append("bin_explore_probs=null")
+            if exploration_violations:
+                raise ValueError(
+                    "episodic_twin_head_exploration requires the isolated "
+                    "twin-C51 exploration path: "
+                    + "; ".join(exploration_violations)
+                )
+        if twin_rollout_beam_width < 1:
+            raise ValueError("twin_rollout_beam_width must be at least 1.")
+        if twin_rollout_beam_width > 1:
+            beam_violations = []
+            if pessimistic_twin_critic and not episodic_twin_head_exploration:
+                beam_violations.append(
+                    "episodic_twin_head_exploration=true"
+                )
+            if separate_bc_policy:
+                beam_violations.append("separate_bc_policy=false")
+            if coarse_flow:
+                beam_violations.append("coarse_flow=false")
+            if autoregressive_action_dims:
+                beam_violations.append("autoregressive_action_dims=false")
+            if bins < 2:
+                beam_violations.append("bins>=2")
+            if beam_violations:
+                raise ValueError(
+                    "twin_rollout_beam_width > 1 requires a direct-C51 "
+                    "critic rollout-search path: "
+                    + "; ".join(beam_violations)
+                )
 
         self.levels = int(levels)
         self.bins = int(bins)
@@ -920,11 +1988,62 @@ class CQNAS(CQN):
         self.bc_margin = float(bc_margin)
         self.demo_fosd = bool(demo_fosd)
         self.strict_demo_rl_only = bool(strict_demo_rl_only)
+        self.autoregressive_action_dims = bool(
+            autoregressive_action_dims
+        )
+        self.pessimistic_twin_critic = bool(pessimistic_twin_critic)
+        self.auxiliary_td_loss_weight = float(auxiliary_td_loss_weight)
+        self.episodic_twin_head_exploration = bool(
+            episodic_twin_head_exploration
+        )
+        self.twin_rollout_beam_width = int(twin_rollout_beam_width)
+        self.dense_return_q_target = bool(dense_return_q_target)
+        self.dense_return_positive_only = bool(
+            dense_return_positive_only
+        )
+        self.dense_return_expected_q_loss = bool(
+            dense_return_expected_q_loss
+        )
+        self.dense_return_advantage_alpha = float(
+            dense_return_advantage_alpha
+        )
+        self.dense_return_advantage_clip_ratio = (
+            None
+            if dense_return_advantage_clip_ratio is None
+            else float(dense_return_advantage_clip_ratio)
+        )
+        self.q_reward_scale = float(q_reward_scale)
+        self.dense_return_label_smoothing = float(
+            dense_return_label_smoothing
+        )
+        self.dense_return_floor_satisfaction_margin = (
+            None
+            if dense_return_floor_satisfaction_margin is None
+            else float(dense_return_floor_satisfaction_margin)
+        )
+        self.dense_return_relative_floor_margin = (
+            None
+            if dense_return_relative_floor_margin is None
+            else float(dense_return_relative_floor_margin)
+        )
+        self.return_gated_margin = (
+            None if return_gated_margin is None else float(return_gated_margin)
+        )
+        self.return_gated_margin_weight = float(return_gated_margin_weight)
+        self.dense_return_finest_neighbor_weight = float(
+            dense_return_finest_neighbor_weight
+        )
         self.unseen_return_floor_weight = float(
             unseen_return_floor_weight
         )
         self.unseen_return_floor_value = float(
             unseen_return_floor_value
+        )
+        self.unseen_return_floor_reduction = (
+            unseen_return_floor_reduction
+        )
+        self.unseen_return_floor_topk = int(
+            unseen_return_floor_topk
         )
         self.use_target_network_for_rollout = bool(use_target_network_for_rollout)
         self.num_update_steps = int(num_update_steps)
@@ -936,6 +2055,21 @@ class CQNAS(CQN):
         )
         self.temporal_ensemble_gain = float(temporal_ensemble_gain)
         self.tie_break_delta = float(tie_break_delta)
+        self.random_levels_from = random_levels_from
+        self.post_ensemble_random_keep_levels = (
+            None
+            if post_ensemble_random_keep_levels is None
+            else int(post_ensemble_random_keep_levels)
+        )
+        self.post_ensemble_fixed_leaf = (
+            None
+            if post_ensemble_fixed_leaf is None
+            else int(post_ensemble_fixed_leaf)
+        )
+        self.post_ensemble_l1_flip_prob = float(post_ensemble_l1_flip_prob)
+        self.post_ensemble_l2_flip_prob = float(post_ensemble_l2_flip_prob)
+        self.post_ensemble_l1_flip_horizon = int(post_ensemble_l1_flip_horizon)
+        self.level_override_mode = str(level_override_mode)
         self.structured_exploration_prob = float(
             structured_exploration_prob
         )
@@ -949,12 +2083,19 @@ class CQNAS(CQN):
         self.bc_policy_stop_gradient = bool(bc_policy_stop_gradient)
         self.distinct_policy_encoder = bool(distinct_policy_encoder)
         self.td_target_action_source = td_target_action_source
+        self.demo_behavior_force_probability = float(
+            demo_behavior_force_probability
+        )
         self.td_target_policy_value_beta = (
             None
             if td_target_policy_value_beta is None
             else float(td_target_policy_value_beta)
         )
         self.critic_sequence_mode = critic_sequence_mode
+        self.token_split_horizon_targets = token_split_horizon_targets
+        self.token_split_boundary = (
+            None if token_split_boundary is None else int(token_split_boundary)
+        )
         self.bc_lambda_schedule = (
             None if bc_lambda_schedule is None else str(bc_lambda_schedule)
         )
@@ -982,6 +2123,13 @@ class CQNAS(CQN):
             (int(num_train_envs), self.action_sequence), dtype=np.float32
         )
         self._bin_flip_rng = np.random.default_rng(int(seed) + 151)
+        self._episodic_twin_head_rng = np.random.default_rng(int(seed) + 157)
+        self._episodic_twin_heads = np.full(
+            (int(num_train_envs),), -1, dtype=np.int8
+        )
+        self._episodic_twin_head_assignments = np.zeros(
+            (2,), dtype=np.int64
+        )
         # Stage-153 hierarchical epsilon-bin exploration (ensemble-safe).
         if bin_explore_probs is not None:
             probs = tuple(float(p) for p in bin_explore_probs)
@@ -1014,6 +2162,8 @@ class CQNAS(CQN):
             (int(num_train_envs),), -1, dtype=np.int16
         )
         self._bin_explore_rng = np.random.default_rng(int(seed) + 153)
+        self._bin_explore_fired_total = 0
+        self._bin_explore_applied_total = 0
         # Stage-162: optional schedule multiplying every level's activation
         # probability (e.g. "linear(1.0,0.0,100000)" anneals exploration
         # away as TD takes over). None keeps the static probabilities.
@@ -1207,7 +2357,12 @@ class CQNAS(CQN):
         self._step_action_low = jnp.asarray(action_space.low[0], dtype=jnp.float32)
         self._step_action_high = jnp.asarray(action_space.high[0], dtype=jnp.float32)
         self.support = jnp.linspace(v_min, v_max, atoms, dtype=jnp.float32)
-        self.critic_model = C2FSequenceDistributionalCritic(
+        critic_model_type = (
+            AutoregressiveSequenceDistributionalCritic
+            if self.autoregressive_action_dims
+            else C2FSequenceDistributionalCritic
+        )
+        self.critic_model = critic_model_type(
             hidden_dims=model.hidden_dims,
             action_sequence=self.action_sequence,
             action_dim=self.action_dim,
@@ -1225,13 +2380,36 @@ class CQNAS(CQN):
             (1, self.action_sequence, self.action_dim),
             dtype=jnp.float32,
         )
-        critic_params = self.critic_model.init(
-            self.rng_key,
-            dummy_features,
-            dummy_level,
-            dummy_midpoint,
-        )
-        self.params = {"critic": critic_params}
+        def init_critic(key):
+            if self.autoregressive_action_dims:
+                return self.critic_model.init(
+                    key,
+                    dummy_features,
+                    dummy_level,
+                    dummy_midpoint,
+                    dummy_midpoint,
+                )
+            return self.critic_model.init(
+                key,
+                dummy_features,
+                dummy_level,
+                dummy_midpoint,
+            )
+
+        if self.pessimistic_twin_critic:
+            self.rng_key, critic_key, critic2_key = jax.random.split(
+                self.rng_key, 3
+            )
+            critic_params = init_critic(critic_key)
+            critic2_params = init_critic(critic2_key)
+            self.params = {
+                "critic": critic_params,
+                "critic2": critic2_params,
+            }
+        else:
+            critic_params = init_critic(self.rng_key)
+            critic2_params = None
+            self.params = {"critic": critic_params}
         if self.separate_bc_policy:
             # The policy has its own coarse-to-fine bin logits.  It deliberately
             # has no value atoms: demo CE can train this head without changing
@@ -1356,7 +2534,11 @@ class CQNAS(CQN):
                     lambda value: jnp.array(value),
                     self._encoder_params,
                 )
-        self.target_critic_params = critic_params
+        self.target_critic_params = (
+            (critic_params, critic2_params)
+            if self.pessimistic_twin_critic
+            else critic_params
+        )
 
         transforms = []
         if critic_grad_clip is not None:
@@ -1423,20 +2605,42 @@ class CQNAS(CQN):
                 jax.nn.one_hot(level, self.levels, dtype=jnp.float32),
                 (features.shape[0], self.levels),
             )
-            model_output = self.critic_model.apply(
-                critic_params,
-                features,
-                one_hot,
-                (0.5 * (low + high)).reshape(
-                    (features.shape[0], self.action_sequence, self.action_dim)
-                ),
-                return_streams=return_components,
+            index = discrete_action[:, level, :]
+            midpoint = (0.5 * (low + high)).reshape(
+                (features.shape[0], self.action_sequence, self.action_dim)
             )
+            if self.autoregressive_action_dims:
+                bin_width = (high - low) / self.bins
+                action_context = (
+                    low
+                    + (index.astype(jnp.float32) + 0.5) * bin_width
+                ).reshape(
+                    (
+                        features.shape[0],
+                        self.action_sequence,
+                        self.action_dim,
+                    )
+                )
+                model_output = self.critic_model.apply(
+                    critic_params,
+                    features,
+                    one_hot,
+                    midpoint,
+                    action_context,
+                    return_streams=return_components,
+                )
+            else:
+                model_output = self.critic_model.apply(
+                    critic_params,
+                    features,
+                    one_hot,
+                    midpoint,
+                    return_streams=return_components,
+                )
             if return_components:
                 logits, values, centered_advantages = model_output
             else:
                 logits = model_output
-            index = discrete_action[:, level, :]
             sequence_index = index.reshape(
                 (features.shape[0], self.action_sequence, self.action_dim)
             )
@@ -1616,16 +2820,150 @@ class CQNAS(CQN):
                 jax.nn.one_hot(level, self.levels, dtype=jnp.float32),
                 (batch_size, self.levels),
             )
-            logits = self.critic_model.apply(
-                critic_params,
+            level_key = level_keys[level]
+            midpoint = (0.5 * (low + high)).reshape(
+                (batch_size, self.action_sequence, self.action_dim)
+            )
+            if self.autoregressive_action_dims:
+                index = self.critic_model.apply(
+                    critic_params,
+                    features,
+                    one_hot,
+                    midpoint,
+                    low.reshape(
+                        (batch_size, self.action_sequence, self.action_dim)
+                    ),
+                    high.reshape(
+                        (batch_size, self.action_sequence, self.action_dim)
+                    ),
+                    self.support,
+                    self.tie_break_delta,
+                    level_key,
+                    method=self.critic_model.greedy_bins,
+                )
+            else:
+                logits = self.critic_model.apply(
+                    critic_params,
+                    features,
+                    one_hot,
+                    midpoint,
+                )
+                probabilities = jax.nn.softmax(logits, axis=-1)
+                q_values = jnp.sum(
+                    probabilities * self.support,
+                    axis=-1,
+                )
+                index = jnp.argmax(q_values, axis=-1)
+                if level_key is not None:
+                    random_index = jax.random.randint(
+                        level_key,
+                        index.shape,
+                        minval=0,
+                        maxval=self.bins,
+                    )
+                    q_span = (
+                        q_values.max(axis=-1)
+                        - q_values.min(axis=-1)
+                    )
+                    index = jnp.where(
+                        q_span < self.tie_break_delta,
+                        random_index,
+                        index,
+                    )
+                # Diagnostic (eval only, default off): replace the critic's
+                # bin choice with a uniform draw at this level and below.
+                # The powered sibling probe (08-04) put the critic's ordering
+                # at chance on the finest C2F level (sign accuracy 0.491/0.500
+                # at level 2) while forcing a different fine bin still moved
+                # realized return (regret 0.052-0.065 on 57% of states). This
+                # knob measures what that unexploited ordering is actually
+                # worth on task success: if randomizing the fine levels costs
+                # nothing, fixing their ordering cannot buy anything either.
+                if (
+                    self.random_levels_from is not None
+                    and level >= self.random_levels_from
+                ):
+                    if self.level_override_mode == "middle":
+                        # Deterministic centre bin == what an agent with this
+                        # level deleted would emit (the parent cell's centre).
+                        # Comparing against "random" separates two things the
+                        # fine levels could be doing: making a decision, or
+                        # merely dithering inside the parent cell.
+                        index = jnp.full_like(index, self.bins // 2)
+                    else:
+                        if level_key is None:
+                            raise ValueError(
+                                "random_levels_from needs an rng key; it is a "
+                                "diagnostic for eval-time action selection."
+                            )
+                        index = jax.random.randint(
+                            level_key,
+                            index.shape,
+                            minval=0,
+                            maxval=self.bins,
+                        )
+            selected.append(index)
+            flat_index = index.reshape((batch_size, self._flat_action_dim))
+            low, high = zoom_in(
+                low,
+                high,
+                flat_index,
+                self.bins,
+                self.action_low,
+                self.action_high,
+            )
+        action = (0.5 * (low + high)).reshape(
+            (batch_size, self.action_sequence, self.action_dim)
+        )
+        return action, jnp.stack(selected, axis=1)
+
+    def _pessimistic_greedy_action(
+        self,
+        critic1_params,
+        critic2_params,
+        features,
+        key=None,
+    ):
+        """Coarse-to-fine argmax under min(E[Z1], E[Z2])."""
+
+        batch_size = features.shape[0]
+        low = jnp.broadcast_to(
+            self.action_low,
+            (batch_size, self._flat_action_dim),
+        )
+        high = jnp.broadcast_to(
+            self.action_high,
+            (batch_size, self._flat_action_dim),
+        )
+        level_keys = [None] * self.levels
+        if key is not None:
+            level_keys = list(jax.random.split(key, self.levels))
+        selected = []
+        for level in range(self.levels):
+            one_hot = jnp.broadcast_to(
+                jax.nn.one_hot(level, self.levels, dtype=jnp.float32),
+                (batch_size, self.levels),
+            )
+            midpoint = (0.5 * (low + high)).reshape(
+                (batch_size, self.action_sequence, self.action_dim)
+            )
+            logits1 = self.critic_model.apply(
+                critic1_params,
                 features,
                 one_hot,
-                (0.5 * (low + high)).reshape(
-                    (batch_size, self.action_sequence, self.action_dim)
-                ),
+                midpoint,
             )
-            probabilities = jax.nn.softmax(logits, axis=-1)
-            q_values = jnp.sum(probabilities * self.support, axis=-1)
+            logits2 = self.critic_model.apply(
+                critic2_params,
+                features,
+                one_hot,
+                midpoint,
+            )
+            q_values = pessimistic_categorical_q(
+                logits1,
+                logits2,
+                self.support,
+            )
             index = jnp.argmax(q_values, axis=-1)
             level_key = level_keys[level]
             if level_key is not None:
@@ -1642,11 +2980,10 @@ class CQNAS(CQN):
                     index,
                 )
             selected.append(index)
-            flat_index = index.reshape((batch_size, self._flat_action_dim))
             low, high = zoom_in(
                 low,
                 high,
-                flat_index,
+                index.reshape((batch_size, self._flat_action_dim)),
                 self.bins,
                 self.action_low,
                 self.action_high,
@@ -1655,6 +2992,160 @@ class CQNAS(CQN):
             (batch_size, self.action_sequence, self.action_dim)
         )
         return action, jnp.stack(selected, axis=1)
+
+    def _pessimistic_score_action_sequence(
+        self,
+        critic1_params,
+        critic2_params,
+        features,
+        action,
+    ):
+        score1 = self._score_action_sequence_for_backup(
+            critic1_params,
+            features,
+            action,
+        )
+        score2 = self._score_action_sequence_for_backup(
+            critic2_params,
+            features,
+            action,
+        )
+        return jnp.minimum(score1, score2), score1, score2
+
+    def _joint_beam_action(
+        self,
+        critic1_params,
+        features,
+        critic2_params=None,
+    ):
+        """Top-two joint C2F beam followed by complete-chunk Q reranking.
+
+        With one critic this is the coherent rollout search used by a sampled
+        episode head.  With two critics, every bin score and the final chunk
+        score use clipped twin expected Q.  The beam acts only at rollout;
+        update-time Bellman maximization deliberately remains unchanged for
+        the Stage-34 isolation.
+        """
+
+        batch_size = features.shape[0]
+        beam_width = int(self.twin_rollout_beam_width)
+        flat_dim = self._flat_action_dim
+        low = jnp.broadcast_to(
+            self.action_low,
+            (batch_size, beam_width, flat_dim),
+        )
+        high = jnp.broadcast_to(
+            self.action_high,
+            (batch_size, beam_width, flat_dim),
+        )
+        beam_scores = jnp.full(
+            (batch_size, beam_width),
+            -jnp.inf,
+            dtype=jnp.float32,
+        ).at[:, 0].set(0.0)
+        repeated_features = jnp.repeat(features, beam_width, axis=0)
+
+        for level in range(self.levels):
+            one_hot = jnp.broadcast_to(
+                jax.nn.one_hot(level, self.levels, dtype=jnp.float32),
+                (batch_size * beam_width, self.levels),
+            )
+            midpoint = (0.5 * (low + high)).reshape(
+                (
+                    batch_size * beam_width,
+                    self.action_sequence,
+                    self.action_dim,
+                )
+            )
+            logits1 = self.critic_model.apply(
+                critic1_params,
+                repeated_features,
+                one_hot,
+                midpoint,
+            )
+            probabilities1 = jax.nn.softmax(logits1, axis=-1)
+            q_values = jnp.sum(
+                probabilities1 * self.support,
+                axis=-1,
+            )
+            if critic2_params is not None:
+                logits2 = self.critic_model.apply(
+                    critic2_params,
+                    repeated_features,
+                    one_hot,
+                    midpoint,
+                )
+                probabilities2 = jax.nn.softmax(logits2, axis=-1)
+                q_values2 = jnp.sum(
+                    probabilities2 * self.support,
+                    axis=-1,
+                )
+                q_values = jnp.minimum(q_values, q_values2)
+            q_values = q_values.reshape(
+                (batch_size, beam_width, flat_dim, self.bins)
+            )
+            beam_scores, parent_indices, selected_indices = top2_joint_beam(
+                beam_scores,
+                q_values,
+            )
+            gather_indices = jnp.broadcast_to(
+                parent_indices[:, :, None],
+                (batch_size, beam_width, flat_dim),
+            )
+            parent_low = jnp.take_along_axis(
+                low, gather_indices, axis=1
+            )
+            parent_high = jnp.take_along_axis(
+                high, gather_indices, axis=1
+            )
+            low, high = zoom_in(
+                parent_low.reshape((batch_size * beam_width, flat_dim)),
+                parent_high.reshape((batch_size * beam_width, flat_dim)),
+                selected_indices.reshape(
+                    (batch_size * beam_width, flat_dim)
+                ),
+                self.bins,
+                self.action_low,
+                self.action_high,
+            )
+            low = low.reshape((batch_size, beam_width, flat_dim))
+            high = high.reshape((batch_size, beam_width, flat_dim))
+
+        chunks = (0.5 * (low + high)).reshape(
+            (
+                batch_size,
+                beam_width,
+                self.action_sequence,
+                self.action_dim,
+            )
+        )
+        flat_chunks = chunks.reshape(
+            (
+                batch_size * beam_width,
+                self.action_sequence,
+                self.action_dim,
+            )
+        )
+        score1 = self._score_action_sequence_for_backup(
+            critic1_params,
+            repeated_features,
+            flat_chunks,
+        ).reshape((batch_size, beam_width))
+        final_scores = score1
+        if critic2_params is not None:
+            score2 = self._score_action_sequence_for_backup(
+                critic2_params,
+                repeated_features,
+                flat_chunks,
+            ).reshape((batch_size, beam_width))
+            final_scores = jnp.minimum(score1, score2)
+        best = jnp.argmax(final_scores, axis=-1)
+        selected = jnp.take_along_axis(
+            chunks,
+            best[:, None, None, None],
+            axis=1,
+        )[:, 0]
+        return selected, final_scores
 
     def _policy_value_action(
         self,
@@ -1934,7 +3425,14 @@ class CQNAS(CQN):
         )
 
     def _build_greedy_action_fn(self):
-        def action_fn(params, target_critic_params, obs_inputs, use_target, key):
+        def action_fn(
+            params,
+            target_critic_params,
+            obs_inputs,
+            use_target,
+            key,
+            twin_head_indices,
+        ):
             if self.separate_bc_policy:
                 policy_encoder_params = params.get("encoder", None)
                 if self.distinct_policy_encoder:
@@ -1999,6 +3497,78 @@ class CQNAS(CQN):
                 obs_inputs,
                 stop_gradient=True,
             )
+            if self.pessimistic_twin_critic:
+                critic1_params = jax.lax.cond(
+                    use_target,
+                    lambda _: target_critic_params[0],
+                    lambda _: params["critic"],
+                    operand=None,
+                )
+                critic2_params = jax.lax.cond(
+                    use_target,
+                    lambda _: target_critic_params[1],
+                    lambda _: params["critic2"],
+                    operand=None,
+                )
+                def pessimistic_action(_):
+                    if self.twin_rollout_beam_width > 1:
+                        return self._joint_beam_action(
+                            critic1_params,
+                            features,
+                            critic2_params=critic2_params,
+                        )[0]
+                    return self._pessimistic_greedy_action(
+                        critic1_params,
+                        critic2_params,
+                        features,
+                        key=key,
+                    )[0]
+
+                if self.episodic_twin_head_exploration:
+                    def sampled_head_action(_):
+                        key1 = (
+                            None
+                            if key is None
+                            else jax.random.fold_in(key, 3301)
+                        )
+                        key2 = (
+                            None
+                            if key is None
+                            else jax.random.fold_in(key, 3302)
+                        )
+                        if self.twin_rollout_beam_width > 1:
+                            action1 = self._joint_beam_action(
+                                critic1_params,
+                                features,
+                            )[0]
+                            action2 = self._joint_beam_action(
+                                critic2_params,
+                                features,
+                            )[0]
+                        else:
+                            action1 = self._greedy_action(
+                                critic1_params,
+                                features,
+                                key=key1,
+                            )[0]
+                            action2 = self._greedy_action(
+                                critic2_params,
+                                features,
+                                key=key2,
+                            )[0]
+                        return select_episodic_twin_actions(
+                            action1,
+                            action2,
+                            twin_head_indices,
+                        )
+
+                    return jax.lax.cond(
+                        jnp.all(twin_head_indices < 0),
+                        pessimistic_action,
+                        sampled_head_action,
+                        operand=None,
+                    )
+                return pessimistic_action(None)
             critic_params = jax.lax.cond(
                 use_target,
                 lambda _: target_critic_params,
@@ -2026,6 +3596,8 @@ class CQNAS(CQN):
                     indices,
                     flow_key,
                 )
+            if self.twin_rollout_beam_width > 1:
+                return self._joint_beam_action(critic_params, features)[0]
             return self._greedy_action(critic_params, features, key=key)[0]
 
         return action_fn
@@ -2036,6 +3608,108 @@ class CQNAS(CQN):
             features,
             key=action_key,
         )
+
+    def _td_target_action_for_update(
+        self,
+        critic_params,
+        features,
+        replay_actions,
+        replay_next_actions,
+        demos,
+        action_key,
+    ):
+        if self.td_target_action_source == "replay_next":
+            # This hook is used by the no-policy/single-objective parent update
+            # path.  The replay sequence contains consecutive executed actions,
+            # so shifting once supplies the action sequence at s_{t+1}.
+            return (
+                shift_replay_action_sequence(
+                    replay_actions,
+                    self.action_sequence,
+                    self.action_dim,
+                ),
+                {},
+            )
+        if self.td_target_action_source == "critic_replay_max":
+            greedy_action, _ = self._greedy_action_for_update(
+                critic_params,
+                features,
+                action_key,
+            )
+            behavior_action = jnp.asarray(
+                replay_next_actions,
+                dtype=jnp.float32,
+            ).reshape(
+                (
+                    replay_next_actions.shape[0],
+                    self.action_sequence,
+                    self.action_dim,
+                )
+            )
+            greedy_score = self._score_action_sequence_for_backup(
+                critic_params,
+                features,
+                greedy_action,
+            )
+            behavior_score = self._score_action_sequence_for_backup(
+                critic_params,
+                features,
+                behavior_action,
+            )
+            behavior_selected = behavior_score >= greedy_score
+            if self.demo_behavior_force_probability > 0.0:
+                force_key = jax.random.fold_in(action_key, 2601)
+                demo_behavior_forced = (
+                    demos >= 0.5
+                ) & jax.random.bernoulli(
+                    force_key,
+                    self.demo_behavior_force_probability,
+                    shape=demos.shape,
+                )
+                behavior_selected = (
+                    behavior_selected | demo_behavior_forced
+                )
+            else:
+                demo_behavior_forced = jnp.zeros_like(
+                    demos,
+                    dtype=jnp.bool_,
+                )
+            selected_action = jnp.where(
+                behavior_selected[:, None, None],
+                behavior_action,
+                greedy_action,
+            )
+            return selected_action, {
+                "behavior_selected": behavior_selected,
+                "behavior_score": behavior_score,
+                "greedy_score": greedy_score,
+                "demo_behavior_forced": demo_behavior_forced,
+            }
+        return self._greedy_action_for_update(
+            critic_params,
+            features,
+            action_key,
+        )
+
+    def _score_action_sequence_for_backup(
+        self,
+        critic_params,
+        features,
+        action,
+    ):
+        """Deepest-level mean expected C51 value for one complete chunk."""
+
+        chosen_logits, _ = self._critic_logits_per_level(
+            critic_params,
+            features,
+            action,
+        )
+        chosen_probabilities = jax.nn.softmax(chosen_logits, axis=-1)
+        chosen_q = jnp.sum(
+            chosen_probabilities * self.support,
+            axis=-1,
+        )
+        return chosen_q[:, -1].mean(axis=-1)
 
     def _next_action_key(self):
         self.rng_key, action_key = jax.random.split(self.rng_key)
@@ -2252,7 +3926,526 @@ class CQNAS(CQN):
             )
         return obs_inputs, next_obs_inputs, key
 
+    def _build_pessimistic_twin_update_fn(self):
+        """One clipped twin-C51 Bellman objective, with no policy loss."""
+
+        optimizer = self.optimizer
+        tau = self.critic_target_tau
+        auxiliary_weight = float(self.auxiliary_td_loss_weight)
+        use_auxiliary = auxiliary_weight > 0.0
+
+        def update_fn(
+            params,
+            target_critic_params,
+            opt_state,
+            obs_inputs,
+            next_obs_inputs,
+            actions,
+            next_actions,
+            rewards,
+            discounts,
+            bootstrap,
+            loss_weights,
+            demos,
+            mc_returns,
+            action_key,
+            *auxiliary_args,
+        ):
+            if use_auxiliary:
+                if len(auxiliary_args) != 5:
+                    raise ValueError(
+                        "auxiliary twin-C51 update requires next observations, "
+                        "next actions, rewards, discounts, and bootstrap."
+                    )
+                (
+                    auxiliary_next_obs_inputs,
+                    auxiliary_next_actions,
+                    auxiliary_rewards,
+                    auxiliary_discounts,
+                    auxiliary_bootstrap,
+                ) = auxiliary_args
+            elif auxiliary_args:
+                raise ValueError(
+                    "auxiliary arguments were provided with zero auxiliary weight."
+                )
+
+            obs_inputs, next_obs_inputs, action_key = (
+                self._augment_update_obs_inputs(
+                    obs_inputs,
+                    next_obs_inputs,
+                    action_key,
+                )
+            )
+            if use_auxiliary and isinstance(auxiliary_next_obs_inputs, dict):
+                auxiliary_next_obs_inputs = dict(auxiliary_next_obs_inputs)
+                if "rgb" in auxiliary_next_obs_inputs:
+                    auxiliary_next_obs_inputs["rgb"] = random_shift_rgb(
+                        auxiliary_next_obs_inputs["rgb"],
+                        jax.random.fold_in(action_key, 3401),
+                    )
+                if (
+                    getattr(self, "low_dim_mask_prob", 0.0) > 0.0
+                    and "low_dim" in auxiliary_next_obs_inputs
+                ):
+                    auxiliary_next_obs_inputs["low_dim"] = self._mask_low_dim(
+                        auxiliary_next_obs_inputs["low_dim"],
+                        jax.random.fold_in(action_key, 3402),
+                    )
+
+            def loss_fn(current_params):
+                encoder_params = current_params.get("encoder", None)
+                features = self._rl_features(encoder_params, obs_inputs)
+                next_features = self._rl_features(
+                    encoder_params,
+                    next_obs_inputs,
+                    stop_gradient=True,
+                )
+                auxiliary_next_features = None
+                if use_auxiliary:
+                    auxiliary_next_features = self._rl_features(
+                        encoder_params,
+                        auxiliary_next_obs_inputs,
+                        stop_gradient=True,
+                    )
+
+                target1_params, target2_params = target_critic_params
+
+                def horizon_target(
+                    horizon_next_features,
+                    horizon_next_actions,
+                    horizon_rewards,
+                    horizon_discounts,
+                    horizon_bootstrap,
+                    greedy_key,
+                    force_fold,
+                ):
+                    greedy_action, _ = self._pessimistic_greedy_action(
+                        current_params["critic"],
+                        current_params["critic2"],
+                        horizon_next_features,
+                        key=greedy_key,
+                    )
+                    behavior_action = jnp.asarray(
+                        horizon_next_actions,
+                        dtype=jnp.float32,
+                    ).reshape(
+                        (
+                            horizon_next_actions.shape[0],
+                            self.action_sequence,
+                            self.action_dim,
+                        )
+                    )
+                    greedy_score, greedy_score1, greedy_score2 = (
+                        self._pessimistic_score_action_sequence(
+                            current_params["critic"],
+                            current_params["critic2"],
+                            horizon_next_features,
+                            greedy_action,
+                        )
+                    )
+                    behavior_score, behavior_score1, behavior_score2 = (
+                        self._pessimistic_score_action_sequence(
+                            current_params["critic"],
+                            current_params["critic2"],
+                            horizon_next_features,
+                            behavior_action,
+                        )
+                    )
+                    behavior_selected = behavior_score >= greedy_score
+                    if self.demo_behavior_force_probability > 0.0:
+                        force_key = jax.random.fold_in(action_key, force_fold)
+                        demo_behavior_forced = (
+                            demos >= 0.5
+                        ) & jax.random.bernoulli(
+                            force_key,
+                            self.demo_behavior_force_probability,
+                            shape=demos.shape,
+                        )
+                        behavior_selected = (
+                            behavior_selected | demo_behavior_forced
+                        )
+                    else:
+                        demo_behavior_forced = jnp.zeros_like(
+                            demos,
+                            dtype=jnp.bool_,
+                        )
+                    next_action = jnp.where(
+                        behavior_selected[:, None, None],
+                        behavior_action,
+                        greedy_action,
+                    )
+
+                    target_logits1, _ = self._critic_logits_per_level(
+                        target1_params,
+                        horizon_next_features,
+                        next_action,
+                    )
+                    target_logits2, _ = self._critic_logits_per_level(
+                        target2_params,
+                        horizon_next_features,
+                        next_action,
+                    )
+                    target_probabilities1 = jax.nn.softmax(
+                        target_logits1,
+                        axis=-1,
+                    )
+                    target_probabilities2 = jax.nn.softmax(
+                        target_logits2,
+                        axis=-1,
+                    )
+                    target_q1 = jnp.sum(
+                        target_probabilities1 * self.support,
+                        axis=-1,
+                    )[:, -1].mean(axis=-1)
+                    target_q2 = jnp.sum(
+                        target_probabilities2 * self.support,
+                        axis=-1,
+                    )[:, -1].mean(axis=-1)
+                    target1_selected = target_q1 <= target_q2
+                    target_probabilities = jnp.where(
+                        target1_selected[:, None, None, None],
+                        target_probabilities1,
+                        target_probabilities2,
+                    )
+                    target_distribution = project_categorical(
+                        target_probabilities,
+                        horizon_rewards,
+                        horizon_discounts,
+                        horizon_bootstrap,
+                        self.support,
+                    )
+                    bellman_q = jnp.sum(
+                        target_distribution * self.support,
+                        axis=-1,
+                    )
+                    mc_distribution = project_categorical(
+                        target_probabilities,
+                        mc_returns,
+                        jnp.zeros_like(horizon_discounts),
+                        jnp.zeros_like(horizon_bootstrap),
+                        self.support,
+                    )
+                    use_mc_mask = mc_returns[:, None, None] > bellman_q
+                    target_distribution = jnp.where(
+                        use_mc_mask[..., None],
+                        mc_distribution,
+                        target_distribution,
+                    )
+                    target_distribution = jax.lax.stop_gradient(
+                        target_distribution
+                    )
+                    return target_distribution, (
+                        use_mc_mask,
+                        target1_selected,
+                        behavior_selected,
+                        demo_behavior_forced,
+                        behavior_score,
+                        greedy_score,
+                        behavior_score1,
+                        behavior_score2,
+                        greedy_score1,
+                        greedy_score2,
+                    )
+
+                target_distribution, horizon_diagnostics = horizon_target(
+                    next_features,
+                    next_actions,
+                    rewards,
+                    discounts,
+                    bootstrap,
+                    action_key,
+                    3201,
+                )
+                (
+                    use_mc_mask,
+                    target1_selected,
+                    behavior_selected,
+                    demo_behavior_forced,
+                    behavior_score,
+                    greedy_score,
+                    behavior_score1,
+                    behavior_score2,
+                    greedy_score1,
+                    greedy_score2,
+                ) = horizon_diagnostics
+
+                chosen_logits1, _ = self._critic_logits_per_level(
+                    current_params["critic"],
+                    features,
+                    actions,
+                )
+                chosen_logits2, _ = self._critic_logits_per_level(
+                    current_params["critic2"],
+                    features,
+                    actions,
+                )
+                chosen_log_probabilities1 = jax.nn.log_softmax(
+                    chosen_logits1,
+                    axis=-1,
+                )
+                chosen_log_probabilities2 = jax.nn.log_softmax(
+                    chosen_logits2,
+                    axis=-1,
+                )
+                one_step_per_sample1 = -jnp.sum(
+                    target_distribution * chosen_log_probabilities1,
+                    axis=-1,
+                ).mean(axis=(1, 2))
+                one_step_per_sample2 = -jnp.sum(
+                    target_distribution * chosen_log_probabilities2,
+                    axis=-1,
+                ).mean(axis=(1, 2))
+                auxiliary_per_sample1 = jnp.zeros_like(one_step_per_sample1)
+                auxiliary_per_sample2 = jnp.zeros_like(one_step_per_sample2)
+                auxiliary_target_distribution = target_distribution
+                auxiliary_diagnostics = horizon_diagnostics
+                if use_auxiliary:
+                    (
+                        auxiliary_target_distribution,
+                        auxiliary_diagnostics,
+                    ) = horizon_target(
+                        auxiliary_next_features,
+                        auxiliary_next_actions,
+                        auxiliary_rewards,
+                        auxiliary_discounts,
+                        auxiliary_bootstrap,
+                        jax.random.fold_in(action_key, 3403),
+                        3204,
+                    )
+                    auxiliary_per_sample1 = -jnp.sum(
+                        auxiliary_target_distribution
+                        * chosen_log_probabilities1,
+                        axis=-1,
+                    ).mean(axis=(1, 2))
+                    auxiliary_per_sample2 = -jnp.sum(
+                        auxiliary_target_distribution
+                        * chosen_log_probabilities2,
+                        axis=-1,
+                    ).mean(axis=(1, 2))
+                loss_normalizer = 1.0 + auxiliary_weight
+                per_sample1 = (
+                    one_step_per_sample1
+                    + auxiliary_weight * auxiliary_per_sample1
+                ) / loss_normalizer
+                per_sample2 = (
+                    one_step_per_sample2
+                    + auxiliary_weight * auxiliary_per_sample2
+                ) / loss_normalizer
+                per_sample = 0.5 * (per_sample1 + per_sample2)
+                critic1_loss = self.critic_lambda * jnp.mean(
+                    per_sample1 * loss_weights
+                )
+                critic2_loss = self.critic_lambda * jnp.mean(
+                    per_sample2 * loss_weights
+                )
+                critic_loss = 0.5 * (critic1_loss + critic2_loss)
+                one_step_critic_loss = 0.5 * self.critic_lambda * (
+                    jnp.mean(one_step_per_sample1 * loss_weights)
+                    + jnp.mean(one_step_per_sample2 * loss_weights)
+                )
+                auxiliary_critic_loss = 0.5 * self.critic_lambda * (
+                    jnp.mean(auxiliary_per_sample1 * loss_weights)
+                    + jnp.mean(auxiliary_per_sample2 * loss_weights)
+                )
+
+                chosen_probabilities1 = jax.nn.softmax(
+                    chosen_logits1,
+                    axis=-1,
+                )
+                chosen_probabilities2 = jax.nn.softmax(
+                    chosen_logits2,
+                    axis=-1,
+                )
+                chosen_q1 = jnp.sum(
+                    chosen_probabilities1 * self.support,
+                    axis=-1,
+                )
+                chosen_q2 = jnp.sum(
+                    chosen_probabilities2 * self.support,
+                    axis=-1,
+                )
+                entropy1 = -jnp.sum(
+                    chosen_probabilities1
+                    * jnp.log(jnp.maximum(chosen_probabilities1, 1e-9)),
+                    axis=-1,
+                ).mean()
+                entropy2 = -jnp.sum(
+                    chosen_probabilities2
+                    * jnp.log(jnp.maximum(chosen_probabilities2, 1e-9)),
+                    axis=-1,
+                ).mean()
+                target_entropy = -jnp.sum(
+                    target_distribution
+                    * jnp.log(jnp.maximum(target_distribution, 1e-9)),
+                    axis=-1,
+                ).mean()
+                auxiliary_target_entropy = -jnp.sum(
+                    auxiliary_target_distribution
+                    * jnp.log(
+                        jnp.maximum(auxiliary_target_distribution, 1e-9)
+                    ),
+                    axis=-1,
+                ).mean()
+                target_entropy = (
+                    target_entropy
+                    + auxiliary_weight * auxiliary_target_entropy
+                ) / (1.0 + auxiliary_weight)
+                (
+                    auxiliary_use_mc_mask,
+                    auxiliary_target1_selected,
+                    auxiliary_behavior_selected,
+                    auxiliary_demo_behavior_forced,
+                    auxiliary_behavior_score,
+                    auxiliary_greedy_score,
+                    _,
+                    _,
+                    _,
+                    _,
+                ) = auxiliary_diagnostics
+                return critic_loss, (
+                    per_sample,
+                    critic1_loss,
+                    critic2_loss,
+                    0.5 * (entropy1 + entropy2),
+                    target_entropy,
+                    jnp.mean(use_mc_mask.astype(jnp.float32)),
+                    jnp.mean(jnp.abs(chosen_q1 - chosen_q2)),
+                    jnp.mean(target1_selected.astype(jnp.float32)),
+                    behavior_selected,
+                    demo_behavior_forced,
+                    behavior_score,
+                    greedy_score,
+                    behavior_score1,
+                    behavior_score2,
+                    greedy_score1,
+                    greedy_score2,
+                    one_step_critic_loss,
+                    auxiliary_critic_loss,
+                    auxiliary_use_mc_mask,
+                    auxiliary_target1_selected,
+                    auxiliary_behavior_selected,
+                    auxiliary_demo_behavior_forced,
+                    auxiliary_behavior_score,
+                    auxiliary_greedy_score,
+                )
+
+            (critic_loss, aux), grads = jax.value_and_grad(
+                loss_fn,
+                has_aux=True,
+            )(params)
+            updates, opt_state = optimizer.update(grads, opt_state, params)
+            params = self.optax.apply_updates(params, updates)
+            target1_params, target2_params = target_critic_params
+            target1_params = jax.tree.map(
+                lambda target, online: (1.0 - tau) * target + tau * online,
+                target1_params,
+                params["critic"],
+            )
+            target2_params = jax.tree.map(
+                lambda target, online: (1.0 - tau) * target + tau * online,
+                target2_params,
+                params["critic2"],
+            )
+            (
+                per_sample,
+                critic1_loss,
+                critic2_loss,
+                entropy,
+                target_entropy,
+                mc_lower_bound_fraction,
+                twin_q_disagreement,
+                target1_fraction,
+                behavior_selected,
+                demo_behavior_forced,
+                behavior_score,
+                greedy_score,
+                behavior_score1,
+                behavior_score2,
+                greedy_score1,
+                greedy_score2,
+                one_step_critic_loss,
+                auxiliary_critic_loss,
+                auxiliary_use_mc_mask,
+                auxiliary_target1_selected,
+                auxiliary_behavior_selected,
+                auxiliary_demo_behavior_forced,
+                auxiliary_behavior_score,
+                auxiliary_greedy_score,
+            ) = aux
+            priority = jnp.sqrt(per_sample + 1e-10)
+            priority = priority / jnp.maximum(jnp.max(priority), 1e-10)
+            metrics = {
+                "critic_loss": critic_loss,
+                "critic1_loss": critic1_loss,
+                "critic2_loss": critic2_loss,
+                "one_step_critic_loss": one_step_critic_loss,
+                "auxiliary_critic_loss": auxiliary_critic_loss,
+                "auxiliary_td_loss_weight": jnp.asarray(
+                    auxiliary_weight, dtype=jnp.float32
+                ),
+                "entropy": entropy,
+                "target_entropy": target_entropy,
+                "loss_coeff": jnp.mean(loss_weights),
+                "mc_lower_bound_fraction": mc_lower_bound_fraction,
+                "mc_return_mean": jnp.mean(mc_returns),
+                "behavior_candidate_fraction": jnp.mean(
+                    behavior_selected.astype(jnp.float32)
+                ),
+                "demo_behavior_force_fraction": jnp.mean(
+                    demo_behavior_forced.astype(jnp.float32)
+                ),
+                "demo_behavior_force_probability": jnp.asarray(
+                    self.demo_behavior_force_probability,
+                    dtype=jnp.float32,
+                ),
+                "behavior_candidate_score": jnp.mean(behavior_score),
+                "greedy_candidate_score": jnp.mean(greedy_score),
+                "behavior_minus_greedy_q": jnp.mean(
+                    behavior_score - greedy_score
+                ),
+                "twin_q_disagreement": twin_q_disagreement,
+                "twin_target1_fraction": target1_fraction,
+                "behavior_critic_gap": jnp.mean(
+                    jnp.abs(behavior_score1 - behavior_score2)
+                ),
+                "greedy_critic_gap": jnp.mean(
+                    jnp.abs(greedy_score1 - greedy_score2)
+                ),
+                "auxiliary_mc_lower_bound_fraction": jnp.mean(
+                    auxiliary_use_mc_mask.astype(jnp.float32)
+                ),
+                "auxiliary_twin_target1_fraction": jnp.mean(
+                    auxiliary_target1_selected.astype(jnp.float32)
+                ),
+                "auxiliary_behavior_candidate_fraction": jnp.mean(
+                    auxiliary_behavior_selected.astype(jnp.float32)
+                ),
+                "auxiliary_demo_behavior_force_fraction": jnp.mean(
+                    auxiliary_demo_behavior_forced.astype(jnp.float32)
+                ),
+                "auxiliary_behavior_candidate_score": jnp.mean(
+                    auxiliary_behavior_score
+                ),
+                "auxiliary_greedy_candidate_score": jnp.mean(
+                    auxiliary_greedy_score
+                ),
+                "auxiliary_behavior_minus_greedy_q": jnp.mean(
+                    auxiliary_behavior_score - auxiliary_greedy_score
+                ),
+            }
+            return (
+                params,
+                (target1_params, target2_params),
+                opt_state,
+                priority,
+                metrics,
+            )
+
+        return update_fn
+
     def _build_update_fn(self):
+        if self.pessimistic_twin_critic:
+            return self._build_pessimistic_twin_update_fn()
         if not getattr(self, "separate_bc_policy", False):
             return super()._build_update_fn()
 
@@ -2309,16 +4502,14 @@ class CQNAS(CQN):
                     )
 
                 if self.td_target_action_source == "replay_next":
-                    action_sequence = actions.reshape(
-                        (actions.shape[0], self.action_sequence, self.action_dim)
-                    )
                     # Replay sequences are assembled from the actions that were
                     # actually executed at consecutive environment steps.  The
                     # shifted first token is therefore a_{t+1}, including the
                     # temporal ensemble, rather than a newly predicted raw plan.
-                    next_action = jnp.concatenate(
-                        [action_sequence[:, 1:], action_sequence[:, -1:]],
-                        axis=1,
+                    next_action = shift_replay_action_sequence(
+                        actions,
+                        self.action_sequence,
+                        self.action_dim,
                     )
                 elif self.td_target_action_source == "bc_policy":
                     next_action, _ = self._policy_action(
@@ -3027,7 +5218,195 @@ class CQNAS(CQN):
         weights = np.exp(-self.temporal_ensemble_gain * ages).astype(np.float32)
         weights = weights[None, :] * valid.astype(np.float32)
         weights /= np.maximum(weights.sum(axis=1, keepdims=True), 1e-8)
-        return np.sum(candidates * weights[..., None], axis=1)
+        out = np.sum(candidates * weights[..., None], axis=1)
+        if (not eval_mode) and (
+            self.post_ensemble_l1_flip_prob > 0.0
+            or self.post_ensemble_l2_flip_prob > 0.0
+        ):
+            out = self._post_ensemble_bin_flip(out)
+        if eval_mode and getattr(self, "log_ensemble_consensus", False):
+            self._accumulate_ensemble_consensus(candidates, valid)
+        pre = out
+        if eval_mode and self.post_ensemble_random_keep_levels is not None:
+            out = self._post_ensemble_randomize(out)
+        if eval_mode and getattr(self, "log_executed_actions", False):
+            trace = getattr(self, "_action_trace", None)
+            if trace is None:
+                trace = []
+                self._action_trace = trace
+            trace.append((pre[0].copy(), out[0].copy()))
+        return out
+
+    def _accumulate_ensemble_consensus(self, candidates, valid) -> None:
+        """Diagnostic: how consistent are the 16 plans' votes for the
+        CURRENT step's action, measured on the L0 grid?
+
+        candidates: (B, K, D) -- plan age k's prediction for the current step.
+        valid:      (B, K)    -- which history slots hold a real plan.
+        Accumulates: exact = votes agreeing with the modal L0 bin;
+        adjacent = votes within +-1 bin of the mode; full = (dim, step)
+        entries where ALL valid plans agree."""
+
+        lo = np.asarray(self.action_low, dtype=np.float32).reshape(
+            self.action_sequence, self.action_dim
+        )[0]
+        hi = np.asarray(self.action_high, dtype=np.float32).reshape(
+            self.action_sequence, self.action_dim
+        )[0]
+        w0 = (hi - lo) / float(self.bins)
+        B, K, D = candidates.shape
+        bins0 = np.clip(
+            np.floor((candidates - lo[None, None, :]) / w0[None, None, :]),
+            0,
+            self.bins - 1,
+        ).astype(np.int64)
+        v = valid.astype(np.float32)  # (B, K)
+        counts = np.zeros((B, self.bins, D), dtype=np.float32)
+        for k in range(K):
+            np.add.at(
+                counts,
+                (np.arange(B)[:, None], bins0[:, k, :], np.arange(D)[None, :]),
+                v[:, k, None],
+            )
+        nvalid = v.sum(axis=1)  # (B,)
+        modal = counts.argmax(axis=1)  # (B, D)
+        modal_count = counts.max(axis=1)  # (B, D)
+        below = np.take_along_axis(
+            counts, np.clip(modal - 1, 0, self.bins - 1)[:, None, :], axis=1
+        )[:, 0, :]
+        above = np.take_along_axis(
+            counts, np.clip(modal + 1, 0, self.bins - 1)[:, None, :], axis=1
+        )[:, 0, :]
+        below = np.where(modal - 1 < 0, 0.0, below)
+        above = np.where(modal + 1 > self.bins - 1, 0.0, above)
+        adj_count = modal_count + below + above
+        ok = nvalid > 0
+        st = getattr(self, "_ensemble_consensus_stats", None)
+        if st is None:
+            st = {"votes": 0.0, "exact": 0.0, "adjacent": 0.0,
+                  "entries": 0.0, "full": 0.0}
+            self._ensemble_consensus_stats = st
+        st["votes"] += float((nvalid[:, None] * np.ones((1, D)))[ok].sum())
+        st["exact"] += float(modal_count[ok].sum())
+        st["adjacent"] += float(adj_count[ok].sum())
+        st["entries"] += float(ok.sum() * D)
+        st["full"] += float((modal_count[ok] == nvalid[ok, None]).sum())
+
+    def _post_ensemble_bin_flip(self, action: np.ndarray) -> np.ndarray:
+        """Train-time exploration: persistent single-dimension bin flips
+        applied AFTER temporal ensembling, at one or two C2F granularities.
+
+        Two independent event processes:
+          L1 process (post_ensemble_l1_flip_prob): force one alternative L1
+            bin inside the CURRENT L0 cell (L2 center) on one dimension.
+          L2 process (post_ensemble_l2_flip_prob): force one alternative L2
+            bin inside the CURRENT L1 cell on one dimension.
+        Each event holds its flip for `horizon` steps so it survives plant
+        smoothing. The flipped action is executed AND stored, so 1-step TD
+        grounds the flipped bin with the realized outcome. Motivation and
+        dose logic: sibling-randomization diagnostics measured which levels'
+        content carries outcome (task-dependent), and single-factor
+        interventions keep the return contrast attributable. Eval untouched.
+        """
+
+        B, D = action.shape
+        lo = np.asarray(self.action_low, dtype=np.float32).reshape(
+            self.action_sequence, self.action_dim
+        )[0]
+        hi = np.asarray(self.action_high, dtype=np.float32).reshape(
+            self.action_sequence, self.action_dim
+        )[0]
+        w0 = (hi - lo) / float(self.bins)
+        w1 = w0 / float(self.bins)
+        w2 = w1 / float(self.bins)
+        out = action
+        for name, prob, parent_w, child_w in (
+            ("l1", self.post_ensemble_l1_flip_prob, w0, w1),
+            ("l2", self.post_ensemble_l2_flip_prob, w1, w2),
+        ):
+            if prob <= 0.0:
+                continue
+            key = "_%s_flip_state" % name
+            st = getattr(self, key, None)
+            if st is None or st["dim"].shape[0] != B:
+                st = {
+                    "dim": np.full((B,), -1, dtype=np.int64),
+                    "bin": np.zeros((B,), dtype=np.int64),
+                    "left": np.zeros((B,), dtype=np.int64),
+                }
+                setattr(self, key, st)
+            start_ = (st["left"] <= 0) & (np.random.rand(B) < float(prob))
+            n_new = int(start_.sum())
+            if n_new:
+                st["dim"][start_] = np.random.randint(0, D, size=n_new)
+                st["bin"][start_] = np.random.randint(0, self.bins, size=n_new)
+                st["left"][start_] = int(self.post_ensemble_l1_flip_horizon)
+            active = st["left"] > 0
+            if active.any():
+                if out is action:
+                    out = action.copy()
+                rows = np.where(active)[0]
+                dims = st["dim"][rows]
+                parent = np.clip(
+                    np.floor((out[rows, dims] - lo[dims]) / parent_w[dims]),
+                    0,
+                    (parent_w[dims] > 0).astype(np.int64) * 0
+                    + int(round((hi[0] - lo[0]) / parent_w[0])) - 1,
+                )
+                out[rows, dims] = (
+                    lo[dims]
+                    + parent * parent_w[dims]
+                    + (st["bin"][rows] + 0.5) * child_w[dims]
+                )
+                st["left"][active] -= 1
+        return out
+
+    def _post_ensemble_randomize(self, action: np.ndarray) -> np.ndarray:
+        """Diagnostic: keep the ensembled action's true C2F prefix, randomize
+        the rest.
+
+        Applied AFTER temporal ensembling, so the perturbation reaches the
+        environment at full strength instead of averaging out across the 16
+        plans (which is what made the pre-ensemble ``random_levels_from``
+        probe insensitive: independent per-plan jitter is mean-zero, while a
+        genuinely better fine policy would be CORRELATED across plans and
+        pass the weights-sum-to-1 average untouched). keep_levels=2 asks:
+        given the true L1 cell of the executed action, does the exact L2
+        position matter? Equal performance => the task does not need
+        resolution below the kept level."""
+
+        keep = int(self.post_ensemble_random_keep_levels)
+        if not 1 <= keep < self.levels:
+            raise ValueError(
+                "post_ensemble_random_keep_levels must be in [1, levels-1]."
+            )
+        lo = np.asarray(self.action_low, dtype=np.float32).reshape(
+            self.action_sequence, self.action_dim
+        )[0]
+        hi = np.asarray(self.action_high, dtype=np.float32).reshape(
+            self.action_sequence, self.action_dim
+        )[0]
+        span = hi - lo
+        parent_w = span / float(self.bins**keep)
+        leaf_w = span / float(self.bins**self.levels)
+        n_leaves = self.bins ** (self.levels - keep)
+        parent_idx = np.clip(
+            np.floor((action - lo) / parent_w),
+            0,
+            self.bins**keep - 1,
+        )
+        if self.post_ensemble_fixed_leaf is not None:
+            # Constant leaf: a PERSISTENT within-cell offset, in contrast to
+            # the iid random leaf which the plant low-pass filters. leaf 0 =
+            # the lowest sub-cell of the kept parent cell.
+            leaf = np.full(action.shape, int(self.post_ensemble_fixed_leaf))
+        else:
+            leaf = np.random.randint(0, n_leaves, size=action.shape)
+        return (
+            lo
+            + parent_idx * parent_w
+            + (leaf + 0.5) * leaf_w
+        ).astype(action.dtype)
 
     def _temporal_replan_mask(
         self,
@@ -3168,11 +5547,25 @@ class CQNAS(CQN):
 
         batch = action_chunk.shape[0]
         shifted = action_chunk.copy()
+        self._bin_explore_calls_total = (
+            getattr(self, "_bin_explore_calls_total", 0) + 1
+        )
+        self._bin_explore_mask_rows_total = getattr(
+            self, "_bin_explore_mask_rows_total", 0
+        ) + int(
+            batch
+            if register_mask is None
+            else int(np.sum(register_mask))
+        )
         if self._bin_explore_remaining.shape[0] != batch:
             self._bin_explore_remaining = np.zeros((batch,), dtype=np.int32)
             self._bin_explore_dimension = np.full((batch,), -1, dtype=np.int16)
             self._bin_explore_level = np.full((batch,), -1, dtype=np.int16)
             self._bin_explore_sibling = np.full((batch,), -1, dtype=np.int16)
+        # Rows whose chunk actually received a sibling shift this call; act()
+        # uses this to flag the executed steps of shifted registered plans
+        # for explore-aware n-step truncation (cqn-flow.md 60).
+        self._last_bin_explore_applied = np.zeros((batch,), dtype=np.bool_)
         low = np.asarray(self._step_action_low, dtype=np.float64)
         high = np.asarray(self._step_action_high, dtype=np.float64)
         scale = float(getattr(self, "_bin_explore_scale", 1.0))
@@ -3209,6 +5602,7 @@ class CQNAS(CQN):
                     self._bin_explore_dimension[row] = dim
                     self._bin_explore_level[row] = level
                     self._bin_explore_sibling[row] = sibling
+                    self._bin_explore_fired_total += 1
                     break
             if self._bin_explore_remaining[row] > 0:
                 dim = int(self._bin_explore_dimension[row])
@@ -3230,10 +5624,16 @@ class CQNAS(CQN):
                 )
                 shifted[row, :, dim] = new_values.astype(np.float32)
                 self._bin_explore_remaining[row] -= 1
+                self._last_bin_explore_applied[row] = True
+                self._bin_explore_applied_total += 1
         return shifted
 
     def act(self, observations: dict, step: int, eval_mode: bool):
         batch_size = int(next(iter(observations.values())).shape[0])
+        if not eval_mode:
+            self._act_train_calls_total = (
+                getattr(self, "_act_train_calls_total", 0) + 1
+            )
         register_mask = None
         if self.temporal_ensemble:
             register_mask = self._temporal_replan_mask(
@@ -3249,6 +5649,24 @@ class CQNAS(CQN):
         if needs_inference:
             obs_inputs = self._prepare_rl_obs_inputs(observations)
             self.rng_key, action_key = jax.random.split(self.rng_key)
+            twin_head_indices = np.full((batch_size,), -1, dtype=np.int32)
+            if (
+                self.episodic_twin_head_exploration
+                and not eval_mode
+                and step >= self.num_explore_steps
+            ):
+                if batch_size > self._episodic_twin_heads.shape[0]:
+                    raise ValueError(
+                        "Training action batch exceeds num_train_envs for "
+                        "episodic twin-head exploration."
+                    )
+                missing = np.flatnonzero(
+                    self._episodic_twin_heads[:batch_size] < 0
+                )
+                self._resample_episodic_twin_heads(missing.tolist())
+                twin_head_indices = self._episodic_twin_heads[
+                    :batch_size
+                ].astype(np.int32, copy=True)
             rollout_params = self.params
             if (
                 getattr(self, "flow_policy", False)
@@ -3266,9 +5684,13 @@ class CQNAS(CQN):
                 obs_inputs,
                 jnp.asarray(self.use_target_network_for_rollout),
                 action_key,
+                jnp.asarray(twin_head_indices, dtype=jnp.int32),
             )
             self._block(action)
             action_chunk = np.asarray(jax.device_get(action), dtype=np.float32)
+            # Freshest greedy plan (pre-ensemble, pre-exploration), exposed for
+            # external value-steered selection (scripts/eval_policy_qselect.py).
+            self._last_plan_chunk = action_chunk.copy()
             if (
                 getattr(self, "bin_flip_prob", 0.0) > 0.0
                 and not self.temporal_ensemble
@@ -3297,6 +5719,34 @@ class CQNAS(CQN):
             else:
                 prefix = "_eval" if eval_mode else "_train"
                 action_chunk = getattr(self, f"{prefix}_open_loop_plan").copy()
+        if not eval_mode and getattr(self, "bin_explore_probs", None) is not None:
+            # Executed-step explored flags: a registered plan that carried a
+            # sibling shift contributes replan_interval executed steps, so a
+            # persist-2 shift marks 2 x replan_interval steps. The workspace
+            # snapshots _last_bin_explored into the replay "explored" extra
+            # for explore-aware n-step truncation (cqn-flow.md 60).
+            if (
+                not hasattr(self, "_bin_explored_exec_remaining")
+                or self._bin_explored_exec_remaining.shape[0] != batch_size
+            ):
+                self._bin_explored_exec_remaining = np.zeros(
+                    (batch_size,), dtype=np.int32
+                )
+            applied = getattr(self, "_last_bin_explore_applied", None)
+            if needs_inference and applied is not None:
+                registered = (
+                    np.asarray(register_mask, dtype=bool)
+                    if register_mask is not None
+                    else np.ones((batch_size,), dtype=bool)
+                )
+                newly_shifted = registered & np.asarray(applied, dtype=bool)
+                self._bin_explored_exec_remaining[newly_shifted] = int(
+                    getattr(self, "temporal_ensemble_replan_interval", 1)
+                )
+            self._last_bin_explored = self._bin_explored_exec_remaining > 0
+            self._bin_explored_exec_remaining = np.maximum(
+                self._bin_explored_exec_remaining - 1, 0
+            )
         if self.temporal_ensemble:
             executed_action = self._ensemble_current_action(
                 action_chunk,
@@ -3471,6 +5921,9 @@ class CQNAS(CQN):
         return {
             "bin_flip_rng_state": self._bin_flip_rng.bit_generator.state,
             "bin_explore_rng_state": self._bin_explore_rng.bit_generator.state,
+            "episodic_twin_head_rng_state": (
+                self._episodic_twin_head_rng.bit_generator.state
+            ),
         }
 
     def _load_exploration_checkpoint_state(self, state_dict: dict) -> None:
@@ -3481,6 +5934,13 @@ class CQNAS(CQN):
         stored = state_dict.get("bin_explore_rng_state")
         if stored is not None:
             self._bin_explore_rng.bit_generator.state = stored
+        stored = state_dict.get("episodic_twin_head_rng_state")
+        if stored is not None:
+            self._episodic_twin_head_rng.bit_generator.state = stored
+        # Workspace snapshots do not carry environment state. A resumed
+        # online phase therefore starts fresh episodes and samples fresh
+        # episode heads on its first action rather than leaking old heads.
+        self._episodic_twin_heads.fill(-1)
         # Snapshots from the short-lived 48.2 format may carry
         # bin_explore_{remaining,dimension,level,sibling}; ignore them so
         # resumed runs start their fresh episodes windowless.
@@ -3490,7 +5950,7 @@ class CQNAS(CQN):
             getattr(self, "_structured_exploration_eligible", 0)
         )
         applied = int(getattr(self, "_structured_exploration_applied", 0))
-        return {
+        diagnostics = {
             "structured_exploration_rate": (
                 float(applied / eligible) if eligible else 0.0
             ),
@@ -3500,6 +5960,42 @@ class CQNAS(CQN):
                 getattr(self, "_structured_exploration_starts", 0)
             ),
         }
+        diagnostics.update(
+            {
+                "bin_explore_fired_total": float(
+                    getattr(self, "_bin_explore_fired_total", 0)
+                ),
+                "bin_explore_applied_total": float(
+                    getattr(self, "_bin_explore_applied_total", 0)
+                ),
+                "bin_explore_calls_total": float(
+                    getattr(self, "_bin_explore_calls_total", 0)
+                ),
+                "act_train_calls_total": float(
+                    getattr(self, "_act_train_calls_total", 0)
+                ),
+                "bin_explore_mask_rows_total": float(
+                    getattr(self, "_bin_explore_mask_rows_total", 0)
+                ),
+            }
+        )
+        assignments = int(self._episodic_twin_head_assignments.sum())
+        diagnostics.update(
+            {
+                "episodic_twin_head_assignments": float(assignments),
+                "episodic_twin_head0_rate": (
+                    float(self._episodic_twin_head_assignments[0] / assignments)
+                    if assignments
+                    else 0.0
+                ),
+                "episodic_twin_head1_rate": (
+                    float(self._episodic_twin_head_assignments[1] / assignments)
+                    if assignments
+                    else 0.0
+                ),
+            }
+        )
+        return diagnostics
 
     def update(
         self,
@@ -3625,6 +6121,14 @@ class CQNAS(CQN):
             uses_priorities = self._uses_replay_priorities(replay_buffer)
             if self._should_block_update(uses_priorities):
                 self._block(jax_metrics["critic_loss"], priority)
+            committed_metric = jax_metrics.get(
+                "nan_diag/update_committed", None
+            )
+            update_committed = True
+            if committed_metric is not None:
+                update_committed = bool(
+                    float(np.asarray(jax.device_get(committed_metric))) >= 0.5
+                )
             elapsed = time.perf_counter() - start_time
             self._update_step_count += 1
             if uses_priorities:
@@ -3641,11 +6145,44 @@ class CQNAS(CQN):
                     }
                 )
                 metrics["backend/update_time_sec"] = elapsed
+            elif not update_committed:
+                metrics.update(
+                    {
+                        key: float(np.asarray(jax.device_get(value)))
+                        for key, value in jax_metrics.items()
+                    }
+                )
         self._first_update_completed = True
         return metrics
 
+    def _resample_episodic_twin_heads(self, agent_indices: list[int]) -> None:
+        if not self.episodic_twin_head_exploration or not agent_indices:
+            return
+        valid = np.asarray(
+            [
+                index
+                for index in agent_indices
+                if 0 <= index < self.num_train_envs
+            ],
+            dtype=np.int32,
+        )
+        if valid.size == 0:
+            return
+        sampled = self._episodic_twin_head_rng.integers(
+            0,
+            2,
+            size=valid.size,
+            dtype=np.int8,
+        )
+        self._episodic_twin_heads[valid] = sampled
+        self._episodic_twin_head_assignments += np.bincount(
+            sampled,
+            minlength=2,
+        ).astype(np.int64)
+
     def reset(self, step: int, agents_to_reset: list[int]):
         del step
+        self._resample_episodic_twin_heads(agents_to_reset)
         for agent_index in agents_to_reset:
             if agent_index < self.num_train_envs:
                 if hasattr(self, "_structured_exploration_remaining"):
@@ -3662,6 +6199,12 @@ class CQNAS(CQN):
                     self._bin_explore_dimension[agent_index] = -1
                     self._bin_explore_level[agent_index] = -1
                     self._bin_explore_sibling[agent_index] = -1
+                if (
+                    hasattr(self, "_bin_explored_exec_remaining")
+                    and agent_index
+                    < self._bin_explored_exec_remaining.shape[0]
+                ):
+                    self._bin_explored_exec_remaining[agent_index] = 0
                 if self._train_action_history is not None:
                     self._train_action_history[agent_index] = 0
                     self._train_action_history_valid[agent_index] = False
@@ -3687,8 +6230,12 @@ class CQNAS(CQN):
 
 
 __all__ = [
+    "AutoregressiveActionCorrection",
+    "AutoregressiveSequenceDistributionalCritic",
     "C2FSequenceDistributionalCritic",
     "CQNAS",
     "CQNASpec",
     "cqn_as_spec_from_cfg",
+    "select_episodic_twin_actions",
+    "top2_joint_beam",
 ]

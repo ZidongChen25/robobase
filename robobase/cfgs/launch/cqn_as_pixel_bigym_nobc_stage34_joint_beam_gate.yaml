@@ -1,0 +1,15 @@
+# @package _global_
+
+# Stage 34: keep the Stage-33 reward objective, offline/online phases, twin
+# critics, and episode-persistent sampled head. Replace only rollout-time
+# independent factor argmax with a top-two, width-eight joint C2F beam.
+defaults:
+  - cqn_as_pixel_bigym_nobc_stage33_episodic_twin_explore_gate
+  - _self_
+
+method:
+  twin_rollout_beam_width: 8
+
+hydra:
+  run:
+    dir: ./exp_local/cqn_no_bc/stage34_joint_beam_${now:%Y%m%d%H%M%S}

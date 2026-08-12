@@ -1,0 +1,26 @@
+# @package _global_
+
+# R-line wave-3 arm D1 "cfaug" (cqn-rline.md): canonical recipe + injected
+# counterfactual failure episodes (generate_counterfactual_episodes.py) in a
+# pre-populated <run>/replay dir. Objective completely unchanged — demo
+# influence via BC as stock; the injected data supplies grounded low-value
+# evidence in the near-manifold band where F2's closed-loop collapse lives.
+defaults:
+  - cqn_as_pixel_bigym_demo_driven
+  - _self_
+
+save_csv: true
+eval_every_steps: 1000000
+num_eval_episodes: 0
+num_eval_envs: 0
+save_snapshot: true
+snapshot_every_n: 5000
+log_eval_video: false
+
+replay:
+  reuse_saved: true
+  demo_cache_dir: null
+
+hydra:
+  run:
+    dir: ./exp_local/cqn_rline/cfaug_${env.task_name}_${now:%Y%m%d%H%M%S}

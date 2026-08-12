@@ -12,7 +12,6 @@ LEGACY_TARGETS = {
     "robobase.method.alix.ALIX": "alix",
     "robobase.method.dreamerv3.DreamerV3": "dreamerv3",
     "robobase.method.drm.DrM": "drm",
-    "robobase.method.drqv2.DrQV2": "drqv2",
     "robobase.method.edp.DiffusionRL": "edp",
     "robobase.method.iql_drqv2.IQLDrQV2": "iql_drqv2",
     "robobase.method.mwm.MaskedWorldModel": "mwm",
@@ -30,6 +29,7 @@ LEGACY_TARGETS = {
         ("robobase.method.ppo.PPO", "ppo"),
         ("robobase.method.q_chunking.QChunking", "q_chunking"),
         ("robobase.method.sac.SAC", "sac"),
+        ("robobase.method.drqv2.DrQV2", "drqv2"),
     ],
 )
 def test_pure_jax_rl_method_targets_are_available(target, expected_name):

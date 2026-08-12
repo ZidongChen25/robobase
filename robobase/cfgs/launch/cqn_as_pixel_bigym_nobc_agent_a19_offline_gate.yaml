@@ -1,0 +1,21 @@
+# @package _global_
+
+# Agent line Stage A19 offline: the sibling project's Stage-38 offline recipe
+# on a WIDE C51 support. A18 showed calibrated ordering (scale 0.07 on the
+# [-2,2] support) and drift-robust separation are in tension: descaling
+# shrank every executed-vs-counterfactual gap ~14x and the online field
+# decayed. Widening the support to cover native returns (max discounted RTG
+# 24.5 -> v_max 29) keeps returns UNCLIPPED (ordering preserved) while
+# separations stay large in absolute value units.
+defaults:
+  - cqn_as_pixel_bigym_stage38_offline_nobc_dense256_gate
+  - _self_
+
+method:
+  v_min: -29.0
+  v_max: 29.0
+  atoms: 101
+
+hydra:
+  run:
+    dir: ./exp_local/cqn_no_bc/agent_a19_offline_${now:%Y%m%d%H%M%S}

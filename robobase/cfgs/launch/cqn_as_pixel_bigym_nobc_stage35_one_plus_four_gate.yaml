@@ -1,0 +1,14 @@
+# @package _global_
+
+# Stage-35 treatment. The only difference from the matched control is the
+# normalized reward-only objective 0.5 * (L_C51_1step + L_C51_4step).
+defaults:
+  - cqn_as_pixel_bigym_nobc_stage35_one_step_control
+  - _self_
+
+method:
+  auxiliary_td_loss_weight: 1.0
+
+hydra:
+  run:
+    dir: ./exp_local/cqn_no_bc/stage35_one_plus_four_${now:%Y%m%d%H%M%S}

@@ -33,15 +33,22 @@ from robobase.replay_buffer.iterator import get_replay_worker_id
 
 # String constants for storage
 ACTION = "action"
+ACTION_TP1 = "action_tp1"
+ACTION_TP_AUX = "action_tp_aux"
 REWARD = "reward"
+REWARD_AUX = "reward_aux"
 TERMINAL = "terminal"
+TERMINAL_AUX = "terminal_aux"
 TRUNCATED = "truncated"
+TRUNCATED_AUX = "truncated_aux"
 INDICES = "indices"
 IS_FIRST = "is_first"
 DISCOUNT = "discount"
+DISCOUNT_AUX = "discount_aux"
 ACTION_PAD_MASK = "action_pad_mask"
 ACTION_HISTORY = "action_history"
 ACTION_HISTORY_PAD_MASK = "action_history_pad_mask"
+OBS_TP_AUX_SUFFIX = "_tp_aux"
 
 
 def episode_len(episode):
@@ -49,9 +56,13 @@ def episode_len(episode):
     return next(iter(episode.values())).shape[0] - 1
 
 
-def save_episode(episode, fn):
+def save_episode(episode, fn, compression: str = "none"):
+    compression = str(compression).lower()
+    if compression not in {"none", "zip"}:
+        raise ValueError("Episode compression must be 'none' or 'zip'.")
     with io.BytesIO() as bs:
-        np.savez(bs, **episode)
+        save = np.savez_compressed if compression == "zip" else np.savez
+        save(bs, **episode)
         bs.seek(0)
         with fn.open("wb") as f:
             f.write(bs.read())
@@ -132,6 +143,7 @@ class UniformReplayBuffer(ReplayBuffer):
         save_dir: str = None,
         purge_replay_on_shutdown: bool = True,
         save_snapshot: bool = False,
+        episode_compression: str = "none",
         reuse_saved: bool = False,
         preprocessing_fn: list[Callable[[list[spaces.Dict]], list[spaces.Dict]]] = None,
         preprocess_every_sample: bool = False,
@@ -147,6 +159,9 @@ class UniformReplayBuffer(ReplayBuffer):
         max_cached_episodes: int | None = None,
         max_cached_episode_bytes: int | None = None,
         include_tp1: bool = True,
+        include_next_action: bool = False,
+        auxiliary_nstep: int | None = None,
+        nstep_explore_truncate: bool = False,
         multiprocessing_context: str = "fork",
         transition_uniform_sampling: bool = False,
     ):
@@ -231,7 +246,11 @@ class UniformReplayBuffer(ReplayBuffer):
             save_dir = self._tmpdir.name
         self._replay_dir = Path(save_dir)
         self._purge_replay_on_shutdown = purge_replay_on_shutdown
+        self._episode_compression = str(episode_compression).lower()
+        if self._episode_compression not in {"none", "zip"}:
+            raise ValueError("episode_compression must be 'none' or 'zip'.")
         logging.info("\t saving to disk: %s", self._replay_dir)
+        logging.info("\t episode compression: %s", self._episode_compression)
         os.makedirs(save_dir, exist_ok=True)
 
         self._action_shape = new_action_shape
@@ -290,6 +309,21 @@ class UniformReplayBuffer(ReplayBuffer):
         ):
             raise ValueError("max_cached_episode_bytes must be >= 0 or null.")
         self._include_tp1 = bool(include_tp1)
+        self._include_next_action = bool(include_next_action)
+        self._auxiliary_nstep = (
+            None if auxiliary_nstep is None else int(auxiliary_nstep)
+        )
+        self._nstep_explore_truncate = bool(nstep_explore_truncate)
+        if self._auxiliary_nstep is not None and self._auxiliary_nstep < 1:
+            raise ValueError("auxiliary_nstep must be >= 1 or null.")
+        if sequential and self._auxiliary_nstep is not None:
+            raise ValueError(
+                "Auxiliary n-step transitions are not supported by sequential replay."
+            )
+        if sequential and self._include_next_action:
+            raise ValueError(
+                "Next-action sequences are not supported by sequential replay."
+            )
         self._replay_capacity = replay_capacity
         self._batch_size = batch_size
         self._nstep = 1 if sequential else nstep
@@ -309,8 +343,10 @@ class UniformReplayBuffer(ReplayBuffer):
 
         # When the horizon is > 1, we compute the sum of discounted rewards as a dot
         # product using the precomputed vector <gamma^0, gamma^1, ..., gamma^{n-1}>.
+        max_nstep = max(nstep, self._auxiliary_nstep or nstep)
         self._cumulative_discount_vector = np.array(
-            [math.pow(self._gamma, n) for n in range(nstep)], dtype=np.float32
+            [math.pow(self._gamma, n) for n in range(max_nstep)],
+            dtype=np.float32,
         )
 
         # =======
@@ -361,6 +397,8 @@ class UniformReplayBuffer(ReplayBuffer):
         logging.info("\t batch_size: %d", self._batch_size)
         logging.info("\t nstep: %d", self._nstep)
         logging.info("\t gamma: %f", self._gamma)
+        logging.info("\t include_next_action: %s", self._include_next_action)
+        logging.info("\t auxiliary_nstep: %s", self._auxiliary_nstep)
         self._is_first = True
         if reuse_saved:
             self._bootstrap_from_existing_episodes()
@@ -386,8 +424,31 @@ class UniformReplayBuffer(ReplayBuffer):
         return self._replay_capacity
 
     @property
+    def replay_dir(self) -> Path:
+        return self._replay_dir
+
+    def storage_signature(self) -> list[dict]:
+        return [
+            {
+                "name": element.name,
+                "shape": list(element.shape),
+                "dtype": np.dtype(element.type).str,
+            }
+            for element in sorted(
+                self._storage_signature.values(), key=lambda item: item.name
+            )
+        ]
+
+    @property
     def batch_size(self):
         return self._batch_size
+
+    def set_batch_size(self, batch_size: int) -> None:
+        """Adjust the default sample size (scheduled demo-fraction support)."""
+        batch_size = int(batch_size)
+        if batch_size < 1:
+            raise ValueError("batch_size must be >= 1.")
+        self._batch_size = batch_size
 
     @property
     def reused_existing(self) -> bool:
@@ -545,7 +606,11 @@ class UniformReplayBuffer(ReplayBuffer):
         self._num_transitions += eps_len
         ts = datetime.now().strftime("%Y%m%dT%H%M%S")
         eps_fn = f"{ts}_{eps_idx}_{eps_len}_{global_idx}.npz"
-        save_episode(episode, self._replay_dir / eps_fn)
+        save_episode(
+            episode,
+            self._replay_dir / eps_fn,
+            compression=self._episode_compression,
+        )
 
         if self._is_first:
             # A special case for first insert. So that the user can have arbitrary
@@ -556,7 +621,11 @@ class UniformReplayBuffer(ReplayBuffer):
                 eps_fn = (
                     f"{worker_id}{ts}_{eps_idx + worker_id}_{eps_len}_{global_idx}.npz"
                 )
-                save_episode(episode, self._replay_dir / eps_fn)
+                save_episode(
+                    episode,
+                    self._replay_dir / eps_fn,
+                    compression=self._episode_compression,
+                )
 
     def _bootstrap_from_existing_episodes(self):
         episode_files = sorted(self._replay_dir.glob("*.npz"))
@@ -590,6 +659,37 @@ class UniformReplayBuffer(ReplayBuffer):
             len(episode_files),
             self._replay_dir,
         )
+
+    def seed_from_replay_directory(self, source_dir: str | Path) -> int:
+        """Hard-link an immutable replay seed into an empty run-local buffer."""
+
+        source_dir = Path(source_dir).resolve()
+        if self.add_count != 0 or any(self._replay_dir.glob("*.npz")):
+            raise ValueError("Replay seeding requires an empty destination buffer.")
+        source_files = sorted(source_dir.glob("*.npz"))
+        if not source_files:
+            raise ValueError(f"Replay seed contains no episodes: {source_dir}")
+        linked = []
+        try:
+            for source in source_files:
+                destination = self._replay_dir / source.name
+                os.link(source, destination)
+                linked.append(destination)
+            self._bootstrap_from_existing_episodes()
+        except BaseException:
+            for destination in linked:
+                destination.unlink(missing_ok=True)
+            raise
+        if not self.reused_existing:
+            raise RuntimeError(f"Failed to bootstrap replay seed: {source_dir}")
+        return len(linked)
+
+    def clear_persisted_episodes(self) -> int:
+        removed = 0
+        for path in self._replay_dir.glob("*.npz"):
+            path.unlink(missing_ok=True)
+            removed += 1
+        return removed
 
     def _final_transition(self, kwargs):
         transition = {}
@@ -1011,11 +1111,17 @@ class UniformReplayBuffer(ReplayBuffer):
             )
             if self._include_tp1:
                 batch[name + "_tp1"] = np.empty_like(batch[name])
+            if self._auxiliary_nstep is not None:
+                batch[name + OBS_TP_AUX_SUFFIX] = np.empty_like(batch[name])
 
         batch[ACTION] = np.empty(
             (batch_size, self._action_seq_len, *first_episode[ACTION].shape[1:]),
             dtype=first_episode[ACTION].dtype,
         )
+        if self._include_next_action:
+            batch[ACTION_TP1] = np.empty_like(batch[ACTION])
+        if self._auxiliary_nstep is not None:
+            batch[ACTION_TP_AUX] = np.empty_like(batch[ACTION])
         batch[ACTION_PAD_MASK] = np.zeros(
             (batch_size, self._action_seq_len), dtype=np.bool_
         )
@@ -1036,6 +1142,17 @@ class UniformReplayBuffer(ReplayBuffer):
         batch[TRUNCATED] = np.empty((batch_size,), dtype=first_episode[TRUNCATED].dtype)
         batch[INDICES] = indices.copy()
         batch[DISCOUNT] = np.empty((batch_size,), dtype=np.float64)
+        if self._auxiliary_nstep is not None:
+            batch[REWARD_AUX] = np.empty(
+                (batch_size,), dtype=first_episode[REWARD].dtype
+            )
+            batch[TERMINAL_AUX] = np.empty(
+                (batch_size,), dtype=first_episode[TERMINAL].dtype
+            )
+            batch[TRUNCATED_AUX] = np.empty(
+                (batch_size,), dtype=first_episode[TRUNCATED].dtype
+            )
+            batch[DISCOUNT_AUX] = np.empty((batch_size,), dtype=np.float64)
 
         for name in self._storage_signature.keys():
             if name in batch:
@@ -1055,6 +1172,11 @@ class UniformReplayBuffer(ReplayBuffer):
             ep_len = episode_len(episode)
 
             next_idxs = idxs + self._nstep
+            aux_next_idxs = (
+                np.minimum(idxs + self._auxiliary_nstep, ep_len)
+                if self._auxiliary_nstep is not None
+                else None
+            )
             obs_idxs = np.clip(idxs[:, None] + obs_offsets[None, :], 0, ep_len)
             next_obs_idxs = np.clip(
                 next_idxs[:, None] + obs_offsets[None, :], 0, ep_len
@@ -1063,6 +1185,15 @@ class UniformReplayBuffer(ReplayBuffer):
                 batch[name][out_idxs] = episode[name][obs_idxs]
                 if self._include_tp1:
                     batch[name + "_tp1"][out_idxs] = episode[name][next_obs_idxs]
+                if aux_next_idxs is not None:
+                    aux_obs_idxs = np.clip(
+                        aux_next_idxs[:, None] + obs_offsets[None, :],
+                        0,
+                        ep_len,
+                    )
+                    batch[name + OBS_TP_AUX_SUFFIX][out_idxs] = episode[name][
+                        aux_obs_idxs
+                    ]
 
             action_start_idxs = idxs - self._action_sequence_start_offset
             action_idxs = action_start_idxs[:, None] + action_offsets[None, :]
@@ -1074,6 +1205,48 @@ class UniformReplayBuffer(ReplayBuffer):
                 actions[invalid_action_idxs] = 0
                 batch[ACTION_PAD_MASK][out_idxs] = invalid_action_idxs
             batch[ACTION][out_idxs] = actions
+            if self._include_next_action:
+                next_action_start_idxs = (
+                    next_idxs
+                    - self._action_sequence_start_offset
+                )
+                next_action_idxs = (
+                    next_action_start_idxs[:, None]
+                    + action_offsets[None, :]
+                )
+                invalid_next_action_idxs = (
+                    (next_action_idxs < 0) | (next_action_idxs >= ep_len)
+                )
+                clipped_next_action_idxs = np.clip(
+                    next_action_idxs,
+                    0,
+                    max(ep_len - 1, 0),
+                )
+                next_actions = episode[ACTION][clipped_next_action_idxs]
+                if self._action_padding == "zero":
+                    next_actions = next_actions.copy()
+                    next_actions[invalid_next_action_idxs] = 0
+                batch[ACTION_TP1][out_idxs] = next_actions
+            if aux_next_idxs is not None:
+                aux_action_start_idxs = (
+                    aux_next_idxs - self._action_sequence_start_offset
+                )
+                aux_action_idxs = (
+                    aux_action_start_idxs[:, None] + action_offsets[None, :]
+                )
+                invalid_aux_action_idxs = (
+                    (aux_action_idxs < 0) | (aux_action_idxs >= ep_len)
+                )
+                clipped_aux_action_idxs = np.clip(
+                    aux_action_idxs,
+                    0,
+                    max(ep_len - 1, 0),
+                )
+                aux_actions = episode[ACTION][clipped_aux_action_idxs]
+                if self._action_padding == "zero":
+                    aux_actions = aux_actions.copy()
+                    aux_actions[invalid_aux_action_idxs] = 0
+                batch[ACTION_TP_AUX][out_idxs] = aux_actions
 
             if self._action_history_len:
                 feedback_history = (
@@ -1116,6 +1289,23 @@ class UniformReplayBuffer(ReplayBuffer):
                     batch[TERMINAL][out_idx] = episode[TERMINAL][next_idx - 1]
                     batch[TRUNCATED][out_idx] = episode[TRUNCATED][next_idx - 1]
                     batch[DISCOUNT][out_idx] = self._gamma**discount_slice_len
+
+            if aux_next_idxs is not None:
+                for out_idx, idx, aux_next_idx in zip(
+                    out_idxs, idxs, aux_next_idxs
+                ):
+                    aux_slice_len = int(aux_next_idx - idx)
+                    batch[REWARD_AUX][out_idx] = np.sum(
+                        episode[REWARD][idx:aux_next_idx]
+                        * self._cumulative_discount_vector[:aux_slice_len]
+                    )
+                    batch[TERMINAL_AUX][out_idx] = episode[TERMINAL][
+                        aux_next_idx - 1
+                    ]
+                    batch[TRUNCATED_AUX][out_idx] = episode[TRUNCATED][
+                        aux_next_idx - 1
+                    ]
+                    batch[DISCOUNT_AUX][out_idx] = self._gamma**aux_slice_len
 
             for name in self._storage_signature.keys():
                 if name in {
@@ -1229,6 +1419,25 @@ class UniformReplayBuffer(ReplayBuffer):
         # Construct replay sample from sampled transition index
         ep_len = episode_len(episode)
         next_idx = idx + self._nstep
+        if (
+            self._nstep_explore_truncate
+            and self._nstep > 1
+            and "explored" in episode
+        ):
+            # Explore-aware truncation: never sum rewards across a later
+            # explored (forced-bin) action — bootstrap just before it. The
+            # first action of the window may itself be explored; 1-step TD
+            # on it is the counterfactual contrast we want (cqn-flow.md 60).
+            flags = episode["explored"]
+            for j in range(1, self._nstep):
+                if idx + j < flags.shape[0] and flags[idx + j]:
+                    next_idx = idx + j
+                    break
+        aux_next_idx = (
+            min(idx + self._auxiliary_nstep, ep_len)
+            if self._auxiliary_nstep is not None
+            else None
+        )
         # If next_idx > eps_len, next_idx will point to final_obs
         replay_sample = {}
 
@@ -1253,6 +1462,17 @@ class UniformReplayBuffer(ReplayBuffer):
             # Retrieve tp1 observations
             if self._include_tp1:
                 replay_sample[name + "_tp1"] = episode[name][next_obs_idxs]
+            if aux_next_idx is not None:
+                aux_obs_start_idx = (aux_next_idx - self._frame_stacks) + 1
+                aux_obs_idxs = list(
+                    map(
+                        lambda x: np.clip(x, 0, ep_len),
+                        range(aux_obs_start_idx, aux_next_idx + 1),
+                    )
+                )
+                replay_sample[name + OBS_TP_AUX_SUFFIX] = episode[name][
+                    aux_obs_idxs
+                ]
 
         # Handle action sequences. CleanDiffuser-style diffusion-policy sampling
         # starts the prediction horizon before the latest observation frame.
@@ -1302,6 +1522,114 @@ class UniformReplayBuffer(ReplayBuffer):
             )
         replay_sample[ACTION] = action_seq
         replay_sample[ACTION_PAD_MASK] = action_pad_mask
+        if self._include_next_action:
+            next_action_start_idx = (
+                next_idx - self._action_sequence_start_offset
+            )
+            next_action_end_idx = (
+                next_action_start_idx + self._action_seq_len
+            )
+            next_buffer_start_idx = max(next_action_start_idx, 0)
+            next_buffer_end_idx = min(next_action_end_idx, ep_len)
+            next_action_idxs = list(
+                range(next_buffer_start_idx, next_buffer_end_idx)
+            )
+            next_action_seq = episode[ACTION][next_action_idxs]
+            next_pre_pad = max(0, -next_action_start_idx)
+            next_post_pad = max(0, next_action_end_idx - ep_len)
+            if len(next_action_seq) == 0:
+                edge_idx = int(
+                    np.clip(
+                        next_action_start_idx,
+                        0,
+                        max(ep_len - 1, 0),
+                    )
+                )
+                if self._action_padding in {"edge", "repeat"}:
+                    next_action_seq = np.repeat(
+                        episode[ACTION][edge_idx : edge_idx + 1],
+                        self._action_seq_len,
+                        axis=0,
+                    )
+                else:
+                    next_action_seq = np.zeros(
+                        (
+                            self._action_seq_len,
+                            *episode[ACTION].shape[1:],
+                        ),
+                        dtype=episode[ACTION].dtype,
+                    )
+                next_pre_pad = 0
+                next_post_pad = 0
+            if next_pre_pad or next_post_pad:
+                if self._action_padding in {"edge", "repeat"}:
+                    parts = []
+                    if next_pre_pad:
+                        parts.append(
+                            np.repeat(
+                                next_action_seq[:1],
+                                next_pre_pad,
+                                axis=0,
+                            )
+                        )
+                    parts.append(next_action_seq)
+                    if next_post_pad:
+                        parts.append(
+                            np.repeat(
+                                next_action_seq[-1:],
+                                next_post_pad,
+                                axis=0,
+                            )
+                        )
+                    next_action_seq = np.concatenate(parts, axis=0)
+                else:
+                    parts = []
+                    if next_pre_pad:
+                        parts.append(
+                            np.zeros(
+                                (
+                                    next_pre_pad,
+                                    *next_action_seq.shape[1:],
+                                ),
+                                dtype=next_action_seq.dtype,
+                            )
+                        )
+                    parts.append(next_action_seq)
+                    if next_post_pad:
+                        parts.append(
+                            np.zeros(
+                                (
+                                    next_post_pad,
+                                    *next_action_seq.shape[1:],
+                                ),
+                                dtype=next_action_seq.dtype,
+                            )
+                        )
+                    next_action_seq = np.concatenate(parts, axis=0)
+            if len(next_action_seq) != self._action_seq_len:
+                raise RuntimeError(
+                    "Internal next-action sequence padding error: "
+                    f"{len(next_action_seq)} != {self._action_seq_len}."
+                )
+            replay_sample[ACTION_TP1] = next_action_seq
+        if aux_next_idx is not None:
+            aux_action_start_idx = (
+                aux_next_idx - self._action_sequence_start_offset
+            )
+            aux_action_idxs = aux_action_start_idx + np.arange(
+                self._action_seq_len, dtype=np.int64
+            )
+            invalid_aux_action_idxs = (
+                (aux_action_idxs < 0) | (aux_action_idxs >= ep_len)
+            )
+            clipped_aux_action_idxs = np.clip(
+                aux_action_idxs, 0, max(ep_len - 1, 0)
+            )
+            aux_action_seq = episode[ACTION][clipped_aux_action_idxs]
+            if self._action_padding == "zero":
+                aux_action_seq = aux_action_seq.copy()
+                aux_action_seq[invalid_aux_action_idxs] = 0
+            replay_sample[ACTION_TP_AUX] = aux_action_seq
 
         if self._action_history_len:
             feedback_history = self._action_history_source == "executed_action_feedback"
@@ -1339,6 +1667,19 @@ class UniformReplayBuffer(ReplayBuffer):
                 DISCOUNT: self._gamma**discount_slice_len,  # effective discount
             }
         )
+        if aux_next_idx is not None:
+            aux_slice_len = aux_next_idx - idx
+            replay_sample.update(
+                {
+                    REWARD_AUX: np.sum(
+                        episode[REWARD][idx:aux_next_idx]
+                        * self._cumulative_discount_vector[:aux_slice_len]
+                    ),
+                    TERMINAL_AUX: episode[TERMINAL][aux_next_idx - 1],
+                    TRUNCATED_AUX: episode[TRUNCATED][aux_next_idx - 1],
+                    DISCOUNT_AUX: self._gamma**aux_slice_len,
+                }
+            )
         # Add remaining (extra) items
         for name in self._storage_signature.keys():
             if name not in replay_sample:
@@ -1441,11 +1782,31 @@ class UniformReplayBuffer(ReplayBuffer):
             )
             if self._include_tp1:
                 batch[name + "_tp1"] = np.empty_like(batch[name])
+            if self._auxiliary_nstep is not None:
+                batch[name + OBS_TP_AUX_SUFFIX] = np.empty_like(batch[name])
         action_source = template[ACTION]
         batch[ACTION] = np.empty(
             (batch_size, seq_len) + action_source.shape[1:],
             dtype=action_source.dtype,
         )
+        if self._include_next_action:
+            batch[ACTION_TP1] = np.empty_like(batch[ACTION])
+        if self._auxiliary_nstep is not None:
+            batch[ACTION_TP_AUX] = np.empty_like(batch[ACTION])
+
+        # Explore-aware truncation: per-row effective n-step (distance to the
+        # first later explored action), mirroring the scalar path exactly.
+        truncate = self._nstep_explore_truncate and nstep > 1
+        n_eff_by_row = np.full((batch_size,), nstep, dtype=np.int64)
+        if truncate:
+            for row, (episode, idx, _) in enumerate(picks):
+                if "explored" not in episode:
+                    continue
+                flags = episode["explored"]
+                for j in range(1, nstep):
+                    if idx + j < flags.shape[0] and flags[idx + j]:
+                        n_eff_by_row[row] = j
+                        break
 
         # Stacked frames and action sequences are consecutive rows of the
         # episode arrays, so away from episode edges each is one contiguous
@@ -1462,7 +1823,7 @@ class UniformReplayBuffer(ReplayBuffer):
                 else:
                     out[row] = source[np.clip(idx + obs_offsets, 0, ep_len)]
                 if self._include_tp1:
-                    next_idx = idx + nstep
+                    next_idx = idx + int(n_eff_by_row[row])
                     out_tp1 = batch[name + "_tp1"]
                     if next_idx >= frame_stacks - 1:
                         out_tp1[row] = source[
@@ -1471,6 +1832,17 @@ class UniformReplayBuffer(ReplayBuffer):
                     else:
                         out_tp1[row] = source[
                             np.clip(next_idx + obs_offsets, 0, ep_len)
+                        ]
+                if self._auxiliary_nstep is not None:
+                    aux_next_idx = min(idx + self._auxiliary_nstep, ep_len)
+                    out_aux = batch[name + OBS_TP_AUX_SUFFIX]
+                    if aux_next_idx >= frame_stacks - 1:
+                        out_aux[row] = source[
+                            aux_next_idx - frame_stacks + 1 : aux_next_idx + 1
+                        ]
+                    else:
+                        out_aux[row] = source[
+                            np.clip(aux_next_idx + obs_offsets, 0, ep_len)
                         ]
             # Edge/repeat padding with offset 0 is exactly an upper-clipped
             # gather: rows past the last action repeat action[ep_len - 1].
@@ -1482,6 +1854,41 @@ class UniformReplayBuffer(ReplayBuffer):
                 span = max(ep_len - 1 - idx, 0)
                 action_out[row, :span] = episode[ACTION][idx : idx + span]
                 action_out[row, span:] = episode[ACTION][max(ep_len - 1, 0)]
+            if self._include_next_action:
+                next_action_out = batch[ACTION_TP1]
+                next_action_start = idx + int(n_eff_by_row[row])
+                next_action_end = next_action_start + seq_len
+                if next_action_end <= ep_len - 1:
+                    next_action_out[row] = episode[ACTION][
+                        next_action_start:next_action_end
+                    ]
+                else:
+                    span = max(
+                        ep_len - 1 - next_action_start,
+                        0,
+                    )
+                    next_action_out[row, :span] = episode[ACTION][
+                        next_action_start : next_action_start + span
+                    ]
+                    next_action_out[row, span:] = episode[ACTION][
+                        max(ep_len - 1, 0)
+                    ]
+            if self._auxiliary_nstep is not None:
+                aux_action_out = batch[ACTION_TP_AUX]
+                aux_action_start = min(idx + self._auxiliary_nstep, ep_len)
+                aux_action_end = aux_action_start + seq_len
+                if aux_action_end <= ep_len - 1:
+                    aux_action_out[row] = episode[ACTION][
+                        aux_action_start:aux_action_end
+                    ]
+                else:
+                    span = max(ep_len - 1 - aux_action_start, 0)
+                    aux_action_out[row, :span] = episode[ACTION][
+                        aux_action_start : aux_action_start + span
+                    ]
+                    aux_action_out[row, span:] = episode[ACTION][
+                        max(ep_len - 1, 0)
+                    ]
 
         groups = {}
         for row, (episode, idx, _) in enumerate(picks):
@@ -1503,24 +1910,75 @@ class UniformReplayBuffer(ReplayBuffer):
         for episode, row_list, idx_list in groups.values():
             rows = np.asarray(row_list, dtype=np.int64)
             idxs = np.asarray(idx_list, dtype=np.int64)
+            n_eff_group = n_eff_by_row[rows]
 
             # Sampling guarantees idx <= ep_len - nstep for ep_len >= nstep,
             # so the reward window and next_idx - 1 stay in range (episodes
-            # shorter than nstep fail in the scalar path as well).
+            # shorter than nstep fail in the scalar path as well). Truncated
+            # rows zero-mask the tail; appending +0.0 terms preserves the
+            # scalar sum bit-for-bit (rewards are never -0.0).
             reward_idxs = idxs[:, None] + rew_offsets[None, :]
-            discounted = episode[REWARD][reward_idxs] * discount_vec[None, :]
+            reward_idxs = np.minimum(
+                reward_idxs, episode[REWARD].shape[0] - 1
+            )
+            window_mask = rew_offsets[None, :] < n_eff_group[:, None]
+            discounted = (
+                episode[REWARD][reward_idxs]
+                * discount_vec[None, :]
+                * window_mask
+            )
             _slot(REWARD, discounted.sum(axis=1), rows)
 
-            last_idxs = idxs + nstep - 1
+            last_idxs = idxs + n_eff_group - 1
             _slot(TERMINAL, episode[TERMINAL][last_idxs], rows)
             _slot(TRUNCATED, episode[TRUNCATED][last_idxs], rows)
 
             for name in extra_names:
                 _slot(name, episode[name][idxs], rows)
 
+            if self._auxiliary_nstep is not None:
+                ep_len = episode_len(episode)
+                aux_next_idxs = np.minimum(
+                    idxs + self._auxiliary_nstep, ep_len
+                )
+                aux_lengths = aux_next_idxs - idxs
+                aux_rewards = np.empty(len(idxs), dtype=episode[REWARD].dtype)
+                for local_idx, (idx, aux_next_idx) in enumerate(
+                    zip(idxs, aux_next_idxs)
+                ):
+                    aux_len = int(aux_next_idx - idx)
+                    aux_rewards[local_idx] = np.sum(
+                        episode[REWARD][idx:aux_next_idx]
+                        * self._cumulative_discount_vector[:aux_len]
+                    )
+                _slot(REWARD_AUX, aux_rewards, rows)
+                _slot(
+                    TERMINAL_AUX,
+                    episode[TERMINAL][aux_next_idxs - 1],
+                    rows,
+                )
+                _slot(
+                    TRUNCATED_AUX,
+                    episode[TRUNCATED][aux_next_idxs - 1],
+                    rows,
+                )
+                _slot(
+                    DISCOUNT_AUX,
+                    np.asarray(
+                        [
+                            self._gamma ** int(aux_len)
+                            for aux_len in aux_lengths
+                        ],
+                        dtype=np.float64,
+                    ),
+                    rows,
+                )
+
         batch[ACTION_PAD_MASK] = np.zeros((batch_size, seq_len), dtype=np.bool_)
         batch[INDICES] = np.stack([pick[2] for pick in picks])
-        batch[DISCOUNT] = np.stack([self._gamma**nstep] * batch_size)
+        batch[DISCOUNT] = np.stack(
+            [self._gamma ** int(n) for n in n_eff_by_row]
+        )
         return batch
 
     @override

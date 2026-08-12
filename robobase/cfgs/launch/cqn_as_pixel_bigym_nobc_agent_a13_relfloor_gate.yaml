@@ -1,0 +1,19 @@
+# @package _global_
+
+# Agent line Stage A13: relative floor derived from the D1 off-manifold
+# diagnosis. Unseen bins are supervised to max(E[chosen target] - m, 0)
+# instead of the absolute task minimum: the lesson that generalizes off
+# the replay manifold becomes a smooth preference field with a small
+# runner-up gap ("other actions are slightly worse here"), not "all
+# actions are worthless here" — the measured cause of the off-manifold
+# value collapse. m = 0.16 (two support atoms).
+defaults:
+  - cqn_as_pixel_bigym_nobc_agent_a1_descale_gate
+  - _self_
+
+method:
+  dense_return_relative_floor_margin: 0.16
+
+hydra:
+  run:
+    dir: ./exp_local/cqn_no_bc/agent_a13_relfloor_${now:%Y%m%d%H%M%S}

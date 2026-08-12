@@ -23,6 +23,9 @@ def _build_buffer(
     include_tp1,
     uniform,
     padding="edge",
+    include_next_action=False,
+    auxiliary_nstep=None,
+    explore_truncate=False,
     batch_size=64,
     tag="",
 ):
@@ -36,9 +39,10 @@ def _build_buffer(
             ),
         }
     )
-    extra_replay_elements = spaces.Dict(
-        {"demo": spaces.Box(0, 1, shape=(), dtype=np.int8)}
-    )
+    extra_spaces = {"demo": spaces.Box(0, 1, shape=(), dtype=np.int8)}
+    if explore_truncate:
+        extra_spaces["explored"] = spaces.Box(0, 1, shape=(), dtype=np.uint8)
+    extra_replay_elements = spaces.Dict(extra_spaces)
     return UniformReplayBuffer(
         batch_size=batch_size,
         replay_capacity=10_000,
@@ -57,13 +61,19 @@ def _build_buffer(
         fetch_every=17,
         action_padding=padding,
         include_tp1=include_tp1,
+        include_next_action=include_next_action,
+        auxiliary_nstep=auxiliary_nstep,
+        nstep_explore_truncate=explore_truncate,
         transition_uniform_sampling=uniform,
     )
 
 
-def _fill(buffer, episode_lengths, rng):
+def _fill(buffer, episode_lengths, rng, explored_flags=False):
     for episode_index, episode_length in enumerate(episode_lengths):
         for t in range(episode_length):
+            extra = {"demo": np.int8((episode_index + t) % 2)}
+            if explored_flags:
+                extra["explored"] = np.uint8(t % 3 == 1)
             buffer.add(
                 {
                     "rgb": rng.integers(
@@ -75,7 +85,7 @@ def _fill(buffer, episode_lengths, rng):
                 np.float32(rng.standard_normal()),
                 terminal=t == episode_length - 1,
                 truncated=False,
-                demo=np.int8((episode_index + t) % 2),
+                **extra,
             )
         buffer.add_final(
             {
@@ -95,16 +105,24 @@ def _assert_batches_bit_equal(reference, vectorized):
 
 
 @pytest.mark.parametrize(
-    "nstep,frame_stack,include_tp1,uniform",
+    "nstep,frame_stack,include_tp1,uniform,include_next_action,auxiliary_nstep",
     [
-        (1, 1, False, False),
-        (3, 2, True, False),
-        (8, 4, True, False),
-        (8, 4, True, True),
+        (1, 1, False, False, False, None),
+        (3, 2, True, False, False, None),
+        (8, 4, True, False, True, None),
+        (8, 4, True, True, True, None),
+        (1, 4, True, False, True, 4),
+        (1, 4, True, True, True, 4),
     ],
 )
 def test_vectorized_sample_bit_equal(
-    tmp_path, nstep, frame_stack, include_tp1, uniform
+    tmp_path,
+    nstep,
+    frame_stack,
+    include_tp1,
+    uniform,
+    include_next_action,
+    auxiliary_nstep,
 ):
     rng = np.random.default_rng(7)
     episode_lengths = [nstep, nstep + 1, 13, 29]
@@ -114,6 +132,8 @@ def test_vectorized_sample_bit_equal(
         frame_stack=frame_stack,
         include_tp1=include_tp1,
         uniform=uniform,
+        include_next_action=include_next_action,
+        auxiliary_nstep=auxiliary_nstep,
     )
     _fill(buffer, episode_lengths, rng)
     assert buffer._vectorized_sample_supported()
@@ -175,3 +195,88 @@ def test_scalar_sample_env_kill_switch(tmp_path, monkeypatch):
     assert buffer._vectorized_sample_supported()
     monkeypatch.setenv("ROBOBASE_SCALAR_SAMPLE", "1")
     assert not buffer._vectorized_sample_supported()
+
+
+@pytest.mark.parametrize("nstep", [3, 8])
+def test_vectorized_sample_bit_equal_with_explore_truncation(tmp_path, nstep):
+    rng = np.random.default_rng(23)
+    buffer = _build_buffer(
+        tmp_path,
+        nstep=nstep,
+        frame_stack=2,
+        include_tp1=True,
+        uniform=False,
+        include_next_action=True,
+        explore_truncate=True,
+    )
+    _fill(buffer, [nstep, 13, 29], rng, explored_flags=True)
+    assert buffer._vectorized_sample_supported()
+
+    buffer.sample(4)
+    np.random.seed(0xBEEF)
+    reference = [buffer._sample_batch_scalar(64, None) for _ in range(3)]
+    np.random.seed(0xBEEF)
+    vectorized = [buffer.sample(64) for _ in range(3)]
+    for ref, vec in zip(reference, vectorized):
+        _assert_batches_bit_equal(ref, vec)
+
+
+def test_explore_truncation_semantics(tmp_path):
+    buffer = _build_buffer(
+        tmp_path,
+        nstep=8,
+        frame_stack=1,
+        include_tp1=True,
+        uniform=False,
+        explore_truncate=True,
+    )
+    rng = np.random.default_rng(29)
+    # One 20-step episode with a single explored step at t=4.
+    rewards = []
+    for t in range(20):
+        extra = {"demo": np.int8(0), "explored": np.uint8(t == 4)}
+        reward = np.float32(rng.standard_normal())
+        rewards.append(float(reward))
+        buffer.add(
+            {
+                "rgb": rng.integers(0, 256, size=(3, 8, 8), dtype=np.uint8),
+                "low_dim_state": rng.standard_normal(5).astype(np.float32),
+            },
+            rng.standard_normal(4).astype(np.float32),
+            reward,
+            terminal=t == 19,
+            truncated=False,
+            **extra,
+        )
+    buffer.add_final(
+        {
+            "rgb": rng.integers(0, 256, size=(3, 8, 8), dtype=np.uint8),
+            "low_dim_state": rng.standard_normal(5).astype(np.float32),
+        }
+    )
+    buffer.sample(2)  # trigger fetch
+
+    # Window starting at idx=1 must truncate at the explored step t=4:
+    # n_eff = 3, summing rewards[1:4], discount gamma**3.
+    sample = buffer._sample_batch_scalar(1, [1])
+    gamma = 0.99
+    expected = np.float32(
+        np.sum(
+            np.asarray(rewards[1:4], dtype=np.float32)
+            * np.asarray(
+                [gamma**0, gamma**1, gamma**2], dtype=np.float32
+            )
+        )
+    )
+    assert abs(float(sample["reward"][0]) - float(expected)) < 1e-5
+    assert abs(float(sample["discount"][0]) - gamma**3) < 1e-12
+
+    # Window starting at idx=4 (explored first action itself): NOT truncated
+    # by its own flag; full n unless a later flag appears (none) -> n_eff=8.
+    sample = buffer._sample_batch_scalar(1, [4])
+    assert abs(float(sample["discount"][0]) - gamma**8) < 1e-12
+
+    # Vectorized path agrees on both.
+    vec = buffer.sample(2, [1, 4])
+    assert abs(float(vec["discount"][0]) - gamma**3) < 1e-12
+    assert abs(float(vec["discount"][1]) - gamma**8) < 1e-12

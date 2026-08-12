@@ -5,7 +5,7 @@ from robobase.models.backbones import (
     JaxDiT1DBackbone,
     JaxFullyConnectedBackbone,
 )
-from robobase.models.encoder import JaxCQNEncoder, JaxResNetEncoder
+from robobase.models.encoder import JaxCQNEncoder, JaxDrQV2Encoder, JaxResNetEncoder
 from robobase.models.fusion import JaxFusionMultiCamFeature
 from robobase.models.fully_connected import JaxMLPWithSequenceOutput
 from robobase.models.diffusion import JaxConditionalUnet1D
@@ -20,6 +20,7 @@ __all__ = [
     "JaxDiT1DBackbone",
     "JaxFullyConnectedBackbone",
     "JaxCQNEncoder",
+    "JaxDrQV2Encoder",
     "JaxResNetEncoder",
     "JaxFusionMultiCamFeature",
     "JaxMLPWithSequenceOutput",

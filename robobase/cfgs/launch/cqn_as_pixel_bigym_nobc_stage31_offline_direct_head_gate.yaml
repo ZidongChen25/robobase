@@ -1,0 +1,16 @@
+# @package _global_
+
+# Stage 31: isolate action-ranking leakage from the dueling value stream.
+# Keep the complete Stage-30 reward-only offline->online protocol, but predict
+# each categorical action bin directly so positive demo returns cannot lift
+# unseen bins through a shared V(s) head.
+defaults:
+  - cqn_as_pixel_bigym_nobc_stage30_offline_then_online_gate
+  - _self_
+
+method:
+  use_dueling: false
+
+hydra:
+  run:
+    dir: ./exp_local/cqn_no_bc/stage31_offline_direct_head_${now:%Y%m%d%H%M%S}

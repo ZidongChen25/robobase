@@ -83,6 +83,21 @@ def _latest_rows(array, *, dtype, context: str) -> np.ndarray:
     return rows
 
 
+def clip_tokenize_text(text: str) -> np.ndarray:
+    """CLIP BPE token ids, shape (1, 77) int32.
+
+    Checkpoints trained before 2026-07-30 (06a61d4) conditioned their language
+    embeddings on CLIP token ids (`clip.tokenize`); the hash tokenizer below
+    replaced it in the JAX-only runtime. Era-gated callers use this to keep
+    old checkpoints' language inputs bit-identical to training. Imports clip
+    (and its torch dependency) lazily so the pure-JAX path stays torch-free.
+    """
+
+    import clip
+
+    return clip.tokenize([str(text)]).numpy().astype(np.int32, copy=False)
+
+
 def tokenize_text(text: str, *, context_length: int = LANG_TOKEN_LENGTH) -> np.ndarray:
     """Return stable integer tokens for a short task description.
 
@@ -167,3 +182,56 @@ def tokens_to_feature_jax(tokens, *, feature_dim: int = 512):
     features = features.mean(axis=1)
     norms = jnp.linalg.norm(features, axis=-1, keepdims=True)
     return features / jnp.maximum(norms, jnp.asarray(1.0e-6, dtype=features.dtype))
+
+
+_CLIP_TEXT_FEATURE_CACHE: dict = {}
+_CLIP_TEXT_MODEL = None
+
+
+def clip_text_features_from_tokens(tokens, *, feature_dim: int = 512):
+    """CLIP ViT-B/32 text features for CLIP token rows (pre-06a61d4 semantics).
+
+    Port of the May-era FlowMatching._encode_clip_text: language-conditioned
+    checkpoints trained before the JAX-only runtime consumed REAL CLIP text
+    embeddings, not the sinusoidal hash projection in tokens_to_feature_jax.
+    Lazily imports torch+clip; results are cached per token row.
+    """
+
+    import numpy as _np
+
+    global _CLIP_TEXT_MODEL
+    token_rows = _np.asarray(tokens, dtype=_np.int32)
+    if token_rows.ndim == 1:
+        token_rows = token_rows[None, :]
+    features = []
+    for row in token_rows:
+        key = tuple(int(v) for v in row.tolist())
+        cached = _CLIP_TEXT_FEATURE_CACHE.get(key)
+        if cached is None:
+            import torch
+            import clip
+
+            if _CLIP_TEXT_MODEL is None:
+                model, _ = clip.load("ViT-B/32", device="cpu")
+                model.eval()
+                for param in model.parameters():
+                    param.requires_grad_(False)
+                _CLIP_TEXT_MODEL = model
+            with torch.no_grad():
+                encoded = (
+                    _CLIP_TEXT_MODEL.encode_text(
+                        torch.as_tensor(row[None, :], dtype=torch.long)
+                    )
+                    .float()
+                    .cpu()
+                    .numpy()[0]
+                )
+            if encoded.shape[-1] != int(feature_dim):
+                raise ValueError(
+                    "CLIP text feature dimension does not match "
+                    f"lang_feature_dim: {encoded.shape[-1]} != {feature_dim}."
+                )
+            cached = encoded.astype(_np.float32, copy=False)
+            _CLIP_TEXT_FEATURE_CACHE[key] = cached
+        features.append(cached)
+    return _np.stack(features, axis=0).astype(_np.float32, copy=False)

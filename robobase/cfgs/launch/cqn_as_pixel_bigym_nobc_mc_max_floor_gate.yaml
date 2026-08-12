@@ -1,0 +1,14 @@
+# @package _global_
+
+# Stage 3 treatment: the only change from the matched control is that the
+# absolute reward floor trains the largest unseen Q bin in every C2F head.
+defaults:
+  - cqn_as_pixel_bigym_nobc_mc_mean_floor_gate
+  - _self_
+
+method:
+  unseen_return_floor_reduction: max
+
+hydra:
+  run:
+    dir: ./exp_local/cqn_no_bc/stage3_mc_max_floor_${now:%Y%m%d%H%M%S}

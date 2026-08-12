@@ -1,0 +1,18 @@
+# @package _global_
+
+# Agent line Stage A7: finite-optimum cross-entropy via label smoothing on
+# the dense categorical targets, on top of the de-saturated recipe. The
+# smoothed target has strictly positive mass on every atom, so the CE has
+# a finite logit optimum and training self-terminates like a satisfied
+# margin instead of sharpening point masses indefinitely (the leading
+# retention hypothesis after A2b/A3/A5).
+defaults:
+  - cqn_as_pixel_bigym_nobc_agent_a1_descale_gate
+  - _self_
+
+method:
+  dense_return_label_smoothing: 0.05
+
+hydra:
+  run:
+    dir: ./exp_local/cqn_no_bc/agent_a7_smooth_${now:%Y%m%d%H%M%S}

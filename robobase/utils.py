@@ -370,6 +370,8 @@ def add_demo_to_replay_buffer(wrapped_env: DemoEnv, replay_buffer: ReplayBuffer)
     )
     for index, (obs, action, rew, term, trunc, info, _) in enumerate(ep):
         extra = {"demo": info["demo"]}
+        if "explored" in replay_buffer.extra_replay_elements.keys():
+            extra["explored"] = np.uint8(0)
         if store_mc_return:
             extra["mc_return"] = mc_returns[index]
         if store_structured_explore:

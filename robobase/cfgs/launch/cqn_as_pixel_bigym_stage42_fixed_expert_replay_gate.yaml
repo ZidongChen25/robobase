@@ -1,0 +1,18 @@
+# @package _global_
+
+# Stage 42: keep Stage-41's single positive-return reward-Q objective, but
+# keep the protected prior replay fixed to the original expert trajectories.
+# Successful online trajectories remain in ordinary replay and are never
+# relabeled as demonstrations.
+defaults:
+  - cqn_as_pixel_bigym_stage41_online_positive_dense_handoff_gate
+  - _self_
+
+use_self_imitation: false
+
+method:
+  strict_allow_reward_only_success_replay: false
+
+hydra:
+  run:
+    dir: ./exp_local/cqn_no_bc/stage42_fixed_expert_replay_${now:%Y%m%d%H%M%S}

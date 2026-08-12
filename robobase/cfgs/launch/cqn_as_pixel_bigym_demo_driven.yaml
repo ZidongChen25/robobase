@@ -15,6 +15,11 @@ batch_size: 256
 demo_batch_size: 256
 replay_size_before_train: 500
 save_snapshot: true
+artifacts:
+  resume_keep_last: 2
+  save_eval_checkpoints: true
+  delete_replay_on_train_complete: true
+  delete_resume_on_train_complete: true
 
 pixels: true
 visual_observation_shape: [84, 84]
@@ -36,6 +41,8 @@ replay:
   nstep: 1
   size: 1000000
   demo_size: 1000000
+  compression: zip
+  demo_cache_dir: ./exp_local/_shared_demo_replay
   # In-process sampling keeps the already-loaded demo episodes hot. Spawned
   # workers repeatedly decompress the NPZ episodes and starve the GPU.
   num_workers: 0

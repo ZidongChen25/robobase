@@ -1,0 +1,16 @@
+# @package _global_
+
+# Stage 11 treatment: retain discounted return ordering while lifting every
+# successful trajectory's single MC lower-bound target halfway toward one.
+defaults:
+  - cqn_as_pixel_bigym_nobc_stage10_discounted_dense_control
+  - _self_
+
+method:
+  mc_lower_bound_target: true
+  episodic_success_q_target: false
+  ordered_success_return_mix: 0.5
+
+hydra:
+  run:
+    dir: ./exp_local/cqn_no_bc/stage11_ordered_success_${now:%Y%m%d%H%M%S}

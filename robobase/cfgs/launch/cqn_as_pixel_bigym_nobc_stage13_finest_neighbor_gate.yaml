@@ -1,0 +1,15 @@
+# @package _global_
+
+# Stage 13: the single dense categorical Q target is locally smoothed only
+# across immediate action-bin neighbors at the finest C2F level.
+defaults:
+  - cqn_as_pixel_bigym_nobc_stage10_discounted_dense_control
+  - _self_
+
+method:
+  dense_return_finest_neighbor_weight: 0.5
+  ordered_success_return_mix: 0.0
+
+hydra:
+  run:
+    dir: ./exp_local/cqn_no_bc/stage13_finest_neighbor_${now:%Y%m%d%H%M%S}

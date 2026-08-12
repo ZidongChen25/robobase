@@ -1,0 +1,29 @@
+# @package _global_
+
+# Stage 36 control: official CQN-AS architecture, replay, optimizer, batch,
+# and objective, with the same offline-then-online clock used by the no-BC arm.
+defaults:
+  - cqn_as_pixel_bigym_demo_driven
+  - _self_
+
+num_pretrain_steps: 10000
+num_train_frames: 20000
+eval_every_steps: 1000000
+num_eval_episodes: 0
+num_eval_envs: 0
+log_eval_video: false
+save_snapshot: true
+snapshot_every_n: 2500
+save_csv: true
+
+# Keep the official per-buffer values. Online updates concatenate 256 online
+# and 256 protected-replay samples; offline demo-only updates contain 256.
+batch_size: 256
+demo_batch_size: 256
+
+replay:
+  demo_only_updates: false
+
+hydra:
+  run:
+    dir: ./exp_local/cqn_no_bc/stage36_bc256_control_${now:%Y%m%d%H%M%S}

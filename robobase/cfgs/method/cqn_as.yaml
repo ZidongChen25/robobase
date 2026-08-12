@@ -71,13 +71,94 @@ method:
   demo_fosd: true
   # Audit guard for demo-driven RL experiments with no imitation path. When
   # true, config composition rejects BC/FOSD/margin, policy/flow heads,
-  # pretraining, self-imitation, and behavior-policy TD targets.
+  # self-imitation, and behavior-policy TD targets. Reward-only offline
+  # critic updates through num_pretrain_steps are allowed: they are offline
+  # RL, not actor or behavior-cloning pretraining.
   strict_demo_rl_only: false
+  # The official CQN-AS launch copies successful online trajectories into the
+  # protected replay.  This switch lets a strict no-imitation configuration
+  # preserve that replay-only behavior.  It never enables an action-label
+  # objective; the strict guard still requires every BC/policy loss to be off.
+  strict_allow_reward_only_success_replay: false
+  # Pure-Q factorization across the primitive action dimensions. Later
+  # dimension heads condition only on already selected earlier dimensions;
+  # false preserves the canonical parallel critic and checkpoint layout.
+  autoregressive_action_dims: false
+  # Two independently initialized direct C51 critics trained by the same
+  # reward Bellman objective. Candidate selection, bootstrap distributions,
+  # and rollout bins use the lower expected value, suppressing unsupported
+  # actions without an imitation or conservative auxiliary loss.
+  pessimistic_twin_critic: false
+  # Optional second reward-only C51 Bellman loss from the same replay start.
+  # With replay.nstep=1 and replay.auxiliary_nstep=N, weight 1 computes the
+  # normalized objective 0.5 * (L_1step + L_Nstep). No action-label loss is
+  # introduced; this is restricted to the isolated twin-C51 path.
+  auxiliary_td_loss_weight: 0.0
+  # Reward-only randomized value-function exploration. During online
+  # collection each environment samples one of the twin critics at episode
+  # reset and follows that head greedily for the entire episode. Evaluation
+  # and Bellman targets remain pessimistic min-Q; no intrinsic reward or
+  # auxiliary/action-imitation loss is introduced.
+  episodic_twin_head_exploration: false
+  # Optional pure-Q rollout maximizer for the isolated twin-head path. At
+  # every C2F level it keeps each factor's top-two reward-Q bins, forms a
+  # joint beam of complete assignments, and reranks complete chunks. Width 1
+  # is the exact legacy action path. It changes no Bellman/MC target or loss.
+  twin_rollout_beam_width: 1
+  # Single dense distributional-Q objective: the replayed bin gets its
+  # reward/Bellman target and all unseen bins get the task-minimum return.
+  dense_return_q_target: false
+  # Apply the all-bin dense target only to transitions from completed
+  # positive-return trajectories. Zero-return transitions use canonical
+  # chosen-action C51 TD, avoiding unsupported negative counterfactuals.
+  # The gate reads reward-to-go only and never demo identity.
+  dense_return_positive_only: false
+  # Regress only the expected return of that same dense target instead of its
+  # full C51 shape. This remains one Q loss; false preserves categorical C51.
+  dense_return_expected_q_loss: false
+  # Baird advantage-learning coefficient inside that same categorical Q
+  # target. Zero is exact legacy C51; [0, 1) devalues each bin by its
+  # stop-gradient disadvantage without adding an auxiliary or imitation loss.
+  dense_return_advantage_alpha: 0.0
+  # Optional clipped-AL ratio: only near-greedy bins above this
+  # support-relative value ratio receive the advantage shift. Null is the
+  # constant advantage-learning operator.
+  dense_return_advantage_clip_ratio: null
+  # Positive affine reward/Q scale inside the Bellman and MC targets. One is
+  # the exact legacy objective; scaling must fit the configured C51 support.
+  q_reward_scale: 1.0
+  dense_return_label_smoothing: 0.0
+  dense_return_floor_satisfaction_margin: null
+  dense_return_relative_floor_margin: null
+  return_gated_margin: null
+  return_gated_margin_weight: 0.0
+  # Optional local-Q kernel inside that same dense target. Immediate neighbor
+  # bins at only the finest C2F level receive this convex weight of the
+  # replayed return distribution; zero preserves the exact dense target.
+  dense_return_finest_neighbor_weight: 0.0
+  # Binary episodic Monte-Carlo control for sparse success tasks. The replayed
+  # bin gets 1 iff its completed trajectory succeeds and 0 otherwise; dense
+  # unseen bins remain 0. This replaces, rather than augments, Bellman/MC
+  # lower-bound targets and never reads demo identity.
+  episodic_success_q_target: false
+  # Convexly lift a positive discounted return toward the completed success
+  # bit before using it as the MC lower-bound target. Zero is canonical; a
+  # positive value is one single ordered reward target, not an auxiliary loss.
+  ordered_success_return_mix: 0.0
+  # Optional exact future-token return alignment for a sparse terminal reward:
+  # token k receives min(G_t / discount^k, 1) inside the same MC/Bellman
+  # categorical target. Null preserves scalar G_t broadcasting.
+  sequence_aligned_mc_discount: null
   # Q-Transformer-style conservative RL term. The replayed action bin is
   # excluded and remains Bellman/return-only; every other bin is regressed to
   # the task's valid minimum return. Zero weight preserves canonical CQN-AS.
   unseen_return_floor_weight: 0.0
   unseen_return_floor_value: 0.0
+  # mean reproduces the Stage-1 average conservative penalty. max trains the
+  # single largest unseen competitor per head to the same reward floor.
+  unseen_return_floor_reduction: mean
+  # Used only by topk reduction; must be smaller than method.bins.
+  unseen_return_floor_topk: 1
   # Diagnostic mode: train a categorical BC policy head and a TD-only critic.
   # The legacy CQN-AS path remains the default for checkpoint compatibility.
   separate_bc_policy: false
@@ -93,18 +174,35 @@ method:
   # strict value/imitation isolation switch; stop-gradient alone is only an
   # encoder-freezing ablation.
   distinct_policy_encoder: false
-  # critic: Double-CQN argmax; replay_next: SARSA target from the next actually
-  # executed action in replay; bc_policy: current BC policy target;
+  # critic: Double-CQN argmax; replay_next: approximate SARSA target from the
+  # shifted current replay sequence; critic_replay_max: compare the ordinary
+  # greedy chunk with the exact action_tp1 replay chunk by deepest-level Q;
+  # bc_policy: current BC policy target;
   # policy_value: online critic regularized by the current BC support prior.
   td_target_action_source: critic
+  # Probability of overriding candidate-max with the exact next behavior
+  # chunk on demonstration samples. This changes only the reward-based
+  # Bellman bootstrap action and adds no imitation or auxiliary objective.
+  demo_behavior_force_probability: 0.0
   # Used only by policy_value target selection. This is independent of the
   # rollout policy_value_beta, so behavior collection may remain exact BC.
   td_target_policy_value_beta: null
   # effective_k0 restricts TD to the first actually executed action token.
   critic_sequence_mode: full
+  # Per-token horizon split (SEAR-inspired, cqn-rline.md): tokens whose
+  # 1-based chunk index exceeds token_split_boundary regress to the
+  # auxiliary_nstep-horizon backup from the same start state; the rest keep
+  # the 1-step backup. False/null is the exact legacy single-horizon target.
+  # Requires replay.auxiliary_nstep > 1 and the canonical critic-source path.
+  token_split_horizon_targets: false
+  token_split_boundary: null
   # Auxiliary C51 cross-entropy to the completed-episode discounted return of
   # the executed action. Zero preserves the legacy replay/update contract.
   mc_return_weight: 0.0
+  # Replace a lower Bellman target with the completed-episode Monte-Carlo
+  # return for the same executed action. This is one Q-learning target (the
+  # Q-Transformer lower bound), not an auxiliary imitation or policy loss.
+  mc_lower_bound_target: false
   # Let the MC loss train the critic head while protecting the policy-trained
   # visual representation. TD and BC retain their existing encoder gradients.
   mc_return_stop_gradient_encoder: false
@@ -174,6 +272,23 @@ method:
   temporal_ensemble_replan_interval: 1
   temporal_ensemble_gain: 0.01
   tie_break_delta: 1e-4
+  # Diagnostic, eval only. Replace the critic bin choice with a uniform
+  # draw at this C2F level and every level below it. null = off.
+  # Measures what the critic's per-level ordering is worth on task
+  # success: the powered sibling probe (08-04) found sign accuracy
+  # 0.571 / 0.521 / 0.491 at levels 0/1/2 (0.50 = chance) while
+  # realized regret stayed 0.125 / 0.086 / 0.052, i.e. the fine
+  # levels carry return the critic does not rank.
+  random_levels_from: null
+  # Train-time exploration applied AFTER temporal ensembling: with prob p per
+  # step (per env), pick ONE action dimension, force ONE alternative L1 bin
+  # inside the current L0 cell (L2 center) and hold it for `horizon` steps.
+  # Post-ensemble placement bypasses the ~15x plan-averaging attenuation;
+  # single-dimension flips keep the return contrast attributable; the flipped
+  # action is executed AND stored, so TD grounds the flipped bin. 0 = off.
+  post_ensemble_l1_flip_prob: 0.0
+  post_ensemble_l2_flip_prob: 0.0
+  post_ensemble_l1_flip_horizon: 4
 
   model:
     hidden_dims: [512, 512]

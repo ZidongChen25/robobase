@@ -1,0 +1,23 @@
+# @package _global_
+
+# Stage 12 matched control: an eight-action plan is executed for eight
+# decisions, but replay still supplies a mismatched one-step Bellman backup.
+defaults:
+  - cqn_as_pixel_bigym_nobc_stage10_discounted_dense_control
+  - _self_
+
+action_sequence: 8
+execution_length: 1
+temporal_ensemble: false
+
+replay:
+  nstep: 1
+
+method:
+  temporal_ensemble: true
+  temporal_ensemble_replan_interval: 8
+  ordered_success_return_mix: 0.0
+
+hydra:
+  run:
+    dir: ./exp_local/cqn_no_bc/stage12_k8_nstep1_${now:%Y%m%d%H%M%S}

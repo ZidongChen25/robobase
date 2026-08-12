@@ -1,0 +1,14 @@
+# @package _global_
+
+# Agent line Stage A9b: the single preregistered dose escalation of the
+# satisficing floor (one full support atom instead of a quarter).
+defaults:
+  - cqn_as_pixel_bigym_nobc_agent_a9_satisfloor_gate
+  - _self_
+
+method:
+  dense_return_floor_satisfaction_margin: 0.08
+
+hydra:
+  run:
+    dir: ./exp_local/cqn_no_bc/agent_a9b_satisfloor8_${now:%Y%m%d%H%M%S}

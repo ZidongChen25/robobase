@@ -1,0 +1,17 @@
+# @package _global_
+
+# Stage 14: the Q action object is exactly the one primitive action executed
+# by each one-step transition. The dense return objective itself is unchanged.
+defaults:
+  - cqn_as_pixel_bigym_nobc_stage10_discounted_dense_control
+  - _self_
+
+action_sequence: 1
+
+method:
+  dense_return_finest_neighbor_weight: 0.0
+  ordered_success_return_mix: 0.0
+
+hydra:
+  run:
+    dir: ./exp_local/cqn_no_bc/stage14_primitive_q_${now:%Y%m%d%H%M%S}

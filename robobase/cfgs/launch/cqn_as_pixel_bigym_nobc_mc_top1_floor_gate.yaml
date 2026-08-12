@@ -1,0 +1,14 @@
+# @package _global_
+
+# Stage 4 matched control: rerun the Stage-3 maximum-unseen-bin floor.
+defaults:
+  - cqn_as_pixel_bigym_nobc_mc_max_floor_gate
+  - _self_
+
+method:
+  unseen_return_floor_reduction: max
+  unseen_return_floor_topk: 1
+
+hydra:
+  run:
+    dir: ./exp_local/cqn_no_bc/stage4_mc_top1_floor_${now:%Y%m%d%H%M%S}

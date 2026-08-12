@@ -1,0 +1,39 @@
+# @package _global_
+
+# Stage 36 treatment: exact official CQN-AS model/optimizer/replay settings and
+# batch sizes, but all imitation gradients are removed. Expert trajectories
+# enter only reward-based replay-continuation Bellman/MC targets.
+defaults:
+  - cqn_as_pixel_bigym_stage36_offline_bc256_control
+  - _self_
+
+replay:
+  include_next_action: true
+
+method:
+  strict_demo_rl_only: true
+  strict_allow_reward_only_success_replay: true
+  bc_lambda: 0.0
+  bc_lambda_schedule: null
+  bc_margin: 0.0
+  demo_fosd: false
+  separate_bc_policy: false
+  bc_policy_stop_gradient: false
+  distinct_policy_encoder: false
+  td_target_action_source: critic_replay_max
+  demo_behavior_force_probability: 0.0
+  td_target_policy_value_beta: null
+  mc_return_weight: 0.0
+  mc_lower_bound_target: true
+  policy_value_beta: null
+  cv_rct_weight: null
+  awr_beta: null
+  flow_policy: false
+  coarse_flow: false
+  coarse_flow_pure: false
+  coarse_flow_selfdistill_weight: null
+  unseen_return_floor_weight: 0.0
+
+hydra:
+  run:
+    dir: ./exp_local/cqn_no_bc/stage36_nobc_candidate256_${now:%Y%m%d%H%M%S}

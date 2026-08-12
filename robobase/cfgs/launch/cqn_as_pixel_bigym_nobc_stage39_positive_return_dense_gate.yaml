@@ -1,0 +1,15 @@
+# @package _global_
+
+# Stage 39: retain all-bin dense reward-Q supervision only when a completed
+# trajectory has positive return. Failed trajectories use canonical
+# chosen-action C51 TD. The gate reads reward-to-go, never demo identity.
+defaults:
+  - cqn_as_pixel_bigym_nobc_stage10_discounted_dense_control
+  - _self_
+
+method:
+  dense_return_positive_only: true
+
+hydra:
+  run:
+    dir: ./exp_local/cqn_no_bc/stage39_positive_return_dense_${now:%Y%m%d%H%M%S}

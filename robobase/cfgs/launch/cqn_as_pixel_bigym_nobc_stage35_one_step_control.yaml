@@ -1,0 +1,21 @@
+# @package _global_
+
+# Stage-35 matched control. Replay exposes both one-step and terminal-truncated
+# four-step transitions from the same sampled start, but the critic optimizes
+# only the existing one-step clipped twin-C51 target.
+defaults:
+  - cqn_as_pixel_bigym_nobc_stage32_offline_pessimistic_twin_gate
+  - _self_
+
+replay:
+  nstep: 1
+  auxiliary_nstep: 4
+
+method:
+  auxiliary_td_loss_weight: 0.0
+  episodic_twin_head_exploration: false
+  twin_rollout_beam_width: 1
+
+hydra:
+  run:
+    dir: ./exp_local/cqn_no_bc/stage35_one_step_control_${now:%Y%m%d%H%M%S}

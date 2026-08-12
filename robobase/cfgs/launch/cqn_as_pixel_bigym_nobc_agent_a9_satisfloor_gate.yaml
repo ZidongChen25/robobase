@@ -1,0 +1,20 @@
+# @package _global_
+
+# Agent line Stage A9: satisficing floor on the de-saturated dense recipe.
+# The floor cross-entropy is suspended on any bin whose target IS the
+# floor distribution and whose expected Q already sits within the margin
+# of the floor — a value-conditioned, margin-style finite optimum for the
+# floor term (training self-terminates once constraints are satisfied),
+# with no entropy injected into the bootstrap path and exact zero-return
+# action-label invariance (the rule is target-conditioned, never
+# label-conditioned). Margin 0.02 = a quarter support atom.
+defaults:
+  - cqn_as_pixel_bigym_nobc_agent_a1_descale_gate
+  - _self_
+
+method:
+  dense_return_floor_satisfaction_margin: 0.02
+
+hydra:
+  run:
+    dir: ./exp_local/cqn_no_bc/agent_a9_satisfloor_${now:%Y%m%d%H%M%S}

@@ -1,0 +1,15 @@
+# @package _global_
+
+# Stage 21: clipped advantage learning prevents far-below-greedy actions from
+# receiving a self-confirming negative shift.
+defaults:
+  - cqn_as_pixel_bigym_nobc_stage20_advantage_gap_gate
+  - _self_
+
+method:
+  dense_return_advantage_alpha: 0.5
+  dense_return_advantage_clip_ratio: 0.9
+
+hydra:
+  run:
+    dir: ./exp_local/cqn_no_bc/stage21_clipped_advantage_${now:%Y%m%d%H%M%S}

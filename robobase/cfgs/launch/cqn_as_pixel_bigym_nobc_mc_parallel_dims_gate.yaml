@@ -1,0 +1,13 @@
+# @package _global_
+
+# Stage 6 matched control: retain the parallel action-dimension critic.
+defaults:
+  - cqn_as_pixel_bigym_nobc_mc_mixed_replay_gate
+  - _self_
+
+method:
+  autoregressive_action_dims: false
+
+hydra:
+  run:
+    dir: ./exp_local/cqn_no_bc/stage6_mc_parallel_dims_${now:%Y%m%d%H%M%S}

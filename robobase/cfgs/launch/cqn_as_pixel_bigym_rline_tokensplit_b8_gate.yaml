@@ -1,0 +1,18 @@
+# @package _global_
+
+# R-line wave-2b arm "tokensplit-b8" (cqn-rline.md): margin-conservative end
+# of the token-split axis. boundary 2 -> 8: tokens 1-8 keep the exact legacy
+# 1-step backup (aux fraction 0.875 -> 0.5). Motivated by the wave-1 autopsy
+# (top2-gap thinning monotonically predicts sealed drop; b2's 87.5% aux
+# fraction is the highest-risk shape). Brackets the aux-fraction axis with
+# the live b2 arm.
+defaults:
+  - cqn_as_pixel_bigym_rline_tokensplit_gate
+  - _self_
+
+method:
+  token_split_boundary: 8
+
+hydra:
+  run:
+    dir: ./exp_local/cqn_rline/tokensplit_b8_${env.task_name}_${now:%Y%m%d%H%M%S}

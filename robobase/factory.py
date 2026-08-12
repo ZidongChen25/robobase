@@ -14,6 +14,7 @@ from robobase.method.flow_matching import (
 from robobase.method.cqn import cqn_spec_from_cfg
 from robobase.method.cqn_as import cqn_as_spec_from_cfg
 from robobase.method.cqn_flow import cqn_flow_spec_from_cfg
+from robobase.method.drqv2 import drqv2_spec_from_cfg
 from robobase.method.ppo import ppo_spec_from_cfg
 from robobase.method.q_chunking import (
     q_chunking_spec_from_cfg,
@@ -78,7 +79,6 @@ def create_agent(
         "alix",
         "dreamerv3",
         "drm",
-        "drqv2",
         "edp",
         "iql_drqv2",
         "mwm",
@@ -89,7 +89,7 @@ def create_agent(
         raise NotImplementedError(
             f"Method '{method_name}' is a historical Torch configuration and "
             "has no implementation in this JAX-only runtime. Supported JAX "
-            "methods: a2a, act, bc, cqn, cqn_as, cqn_flow, diffusion, "
+            "methods: a2a, act, bc, cqn, cqn_as, cqn_flow, diffusion, drqv2, "
             "flow_matching, "
             "legato, ppo, q_chunking, sac."
         )
@@ -98,7 +98,7 @@ def create_agent(
         raise NotImplementedError(
             f"Method '{method_name}' is disabled: {unsupported_reason}. "
             "Supported JAX methods: a2a, act, bc, cqn, cqn_as, cqn_flow, "
-            "diffusion, flow_matching, legato, ppo, q_chunking, sac."
+            "diffusion, drqv2, flow_matching, legato, ppo, q_chunking, sac."
         )
     common_kwargs = dict(
         observation_space=observation_space,
@@ -160,6 +160,36 @@ def create_agent(
             critic_target_tau=spec.critic_target_tau,
             init_temperature=spec.init_temperature,
             target_entropy=spec.target_entropy,
+            actor_grad_clip=spec.actor_grad_clip,
+            critic_grad_clip=spec.critic_grad_clip,
+            weight_decay=spec.weight_decay,
+            model=spec.model,
+            jit=jit,
+            platform=platform,
+            seed=int(cfg.seed),
+            **common_kwargs,
+        )
+
+    if method_name == "drqv2":
+        from robobase.method.drqv2 import DrQV2
+
+        spec = drqv2_spec_from_cfg(cfg)
+        return DrQV2(
+            actor_lr=spec.actor_lr,
+            critic_lr=spec.critic_lr,
+            encoder_lr=spec.encoder_lr,
+            num_train_steps=spec.num_train_steps,
+            num_explore_steps=spec.num_explore_steps,
+            critic_target_tau=spec.critic_target_tau,
+            stddev_schedule=spec.stddev_schedule,
+            stddev_clip=spec.stddev_clip,
+            use_augmentation=spec.use_augmentation,
+            augmentation_pad=spec.augmentation_pad,
+            num_critics=spec.num_critics,
+            feature_dim=spec.feature_dim,
+            actor_uses_time=spec.actor_uses_time,
+            always_bootstrap=spec.always_bootstrap,
+            bc_lambda=spec.bc_lambda,
             actor_grad_clip=spec.actor_grad_clip,
             critic_grad_clip=spec.critic_grad_clip,
             weight_decay=spec.weight_decay,
@@ -322,6 +352,17 @@ def create_agent(
             ),
             temporal_ensemble_gain=spec.temporal_ensemble_gain,
             tie_break_delta=spec.tie_break_delta,
+            random_levels_from=spec.random_levels_from,
+            level_override_mode=spec.level_override_mode,
+            post_ensemble_random_keep_levels=(
+                spec.post_ensemble_random_keep_levels
+            ),
+            post_ensemble_fixed_leaf=spec.post_ensemble_fixed_leaf,
+            post_ensemble_l1_flip_prob=spec.post_ensemble_l1_flip_prob,
+            post_ensemble_l2_flip_prob=spec.post_ensemble_l2_flip_prob,
+            post_ensemble_l1_flip_horizon=(
+                spec.post_ensemble_l1_flip_horizon
+            ),
             structured_exploration_prob=spec.structured_exploration_prob,
             structured_exploration_level=spec.structured_exploration_level,
             structured_exploration_horizon=(
@@ -331,21 +372,77 @@ def create_agent(
             bc_policy_stop_gradient=spec.bc_policy_stop_gradient,
             distinct_policy_encoder=spec.distinct_policy_encoder,
             td_target_action_source=spec.td_target_action_source,
+            demo_behavior_force_probability=(
+                spec.demo_behavior_force_probability
+            ),
             td_target_policy_value_beta=(
                 spec.td_target_policy_value_beta
             ),
             critic_sequence_mode=spec.critic_sequence_mode,
+            token_split_horizon_targets=spec.token_split_horizon_targets,
+            token_split_boundary=spec.token_split_boundary,
             mc_return_weight=spec.mc_return_weight,
+            mc_lower_bound_target=spec.mc_lower_bound_target,
             mc_return_stop_gradient_encoder=(
                 spec.mc_return_stop_gradient_encoder
             ),
             mc_return_value_only=spec.mc_return_value_only,
             policy_value_beta=spec.policy_value_beta,
             strict_demo_rl_only=spec.strict_demo_rl_only,
+                autoregressive_action_dims=(
+                    spec.autoregressive_action_dims
+                ),
+                pessimistic_twin_critic=spec.pessimistic_twin_critic,
+                auxiliary_td_loss_weight=(
+                    spec.auxiliary_td_loss_weight
+                ),
+                episodic_twin_head_exploration=(
+                    spec.episodic_twin_head_exploration
+                ),
+                twin_rollout_beam_width=spec.twin_rollout_beam_width,
+                dense_return_q_target=spec.dense_return_q_target,
+            dense_return_positive_only=(
+                spec.dense_return_positive_only
+            ),
+            dense_return_expected_q_loss=(
+                spec.dense_return_expected_q_loss
+            ),
+            dense_return_advantage_alpha=(
+                spec.dense_return_advantage_alpha
+            ),
+            dense_return_advantage_clip_ratio=(
+                spec.dense_return_advantage_clip_ratio
+            ),
+            q_reward_scale=spec.q_reward_scale,
+            dense_return_label_smoothing=spec.dense_return_label_smoothing,
+            dense_return_floor_satisfaction_margin=(
+                spec.dense_return_floor_satisfaction_margin
+            ),
+            dense_return_relative_floor_margin=(
+                spec.dense_return_relative_floor_margin
+            ),
+            return_gated_margin=spec.return_gated_margin,
+            return_gated_margin_weight=spec.return_gated_margin_weight,
+            dense_return_finest_neighbor_weight=(
+                spec.dense_return_finest_neighbor_weight
+            ),
+            episodic_success_q_target=(
+                spec.episodic_success_q_target
+            ),
+            ordered_success_return_mix=(
+                spec.ordered_success_return_mix
+            ),
+            sequence_aligned_mc_discount=(
+                spec.sequence_aligned_mc_discount
+            ),
             unseen_return_floor_weight=(
                 spec.unseen_return_floor_weight
             ),
             unseen_return_floor_value=spec.unseen_return_floor_value,
+            unseen_return_floor_reduction=(
+                spec.unseen_return_floor_reduction
+            ),
+            unseen_return_floor_topk=spec.unseen_return_floor_topk,
             cv_rct_weight=spec.cv_rct_weight,
             cv_rct_level=spec.cv_rct_level,
             cv_rct_baseline=spec.cv_rct_baseline,
@@ -657,6 +754,6 @@ def create_agent(
 
     raise NotImplementedError(
         f"Unsupported method '{method_name}'. Supported: a2a, act, bc, cqn, "
-        "cqn_as, cqn_flow, diffusion, flow_matching, legato, ppo, "
+        "cqn_as, cqn_flow, diffusion, drqv2, flow_matching, legato, ppo, "
         "q_chunking, sac."
     )

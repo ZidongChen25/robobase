@@ -1,0 +1,16 @@
+# @package _global_
+
+# Stage 26 phase A: exact demonstration trajectory backup. Demonstration
+# transitions always bootstrap through action_tp1 for the first 10.5k steps;
+# phase B resumes with this probability overridden to zero, recovering the
+# ordinary {critic-greedy, replay-continuation} candidate maximum.
+defaults:
+  - cqn_as_pixel_bigym_nobc_stage22_demo_candidate_gate
+  - _self_
+
+method:
+  demo_behavior_force_probability: 1.0
+
+hydra:
+  run:
+    dir: ./exp_local/cqn_no_bc/stage26_demo_trajectory_${now:%Y%m%d%H%M%S}

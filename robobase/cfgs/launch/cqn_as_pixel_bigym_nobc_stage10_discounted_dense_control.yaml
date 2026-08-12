@@ -1,0 +1,15 @@
+# @package _global_
+
+# Stage 10 matched control: repeat the retained discounted MC-lower-bound
+# dense-return objective in a fresh seed-1 run.
+defaults:
+  - cqn_as_pixel_bigym_nobc_mc_stage7_dense_return_gate
+  - _self_
+
+method:
+  mc_lower_bound_target: true
+  episodic_success_q_target: false
+
+hydra:
+  run:
+    dir: ./exp_local/cqn_no_bc/stage10_discounted_dense_${now:%Y%m%d%H%M%S}

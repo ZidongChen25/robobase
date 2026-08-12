@@ -1,0 +1,84 @@
+#!/usr/bin/env python3
+"""Select the Stage-7 dense all-bin categorical return treatment."""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import json
+from pathlib import Path
+
+
+EXPECTED_STEPS = (2500, 5000, 7500, 10000)
+
+
+def _arm(run_dir: Path) -> dict:
+    path = run_dir / "val50_seeds400.csv"
+    curve = {}
+    with path.open(newline="") as handle:
+        for row in csv.DictReader(handle):
+            step = int(float(row["env_steps"]))
+            if step in EXPECTED_STEPS:
+                curve[step] = float(row["episode_success"])
+    missing = sorted(set(EXPECTED_STEPS) - set(curve))
+    if missing:
+        raise ValueError(f"{path} is missing validation steps {missing}")
+    best_step, best_success = max(
+        curve.items(),
+        key=lambda item: (item[1], -item[0]),
+    )
+    return {
+        "run_dir": str(run_dir.resolve()),
+        "curve": {str(step): value for step, value in curve.items()},
+        "best_step": best_step,
+        "best_success": best_success,
+    }
+
+
+def summarize(max_floor_dir: Path, dense_return_dir: Path) -> dict:
+    arms = {
+        "mc_max_floor": _arm(max_floor_dir),
+        "mc_dense_return": _arm(dense_return_dir),
+    }
+    delta = (
+        arms["mc_dense_return"]["best_success"]
+        - arms["mc_max_floor"]["best_success"]
+    )
+    treatment = arms["mc_dense_return"]
+    gate_pass = treatment["best_success"] >= 0.40 and delta >= 0.15
+    treatment_wins = (
+        treatment["best_success"] > arms["mc_max_floor"]["best_success"]
+    )
+    selected_name = "mc_dense_return" if treatment_wins else "mc_max_floor"
+    return {
+        "protocol": {
+            "selection_seeds": [400, 449],
+            "episodes_per_checkpoint": 50,
+            "expected_steps": list(EXPECTED_STEPS),
+            "checkpoint_tie_break": "earliest checkpoint",
+            "gate": "dense-return best >= 40% and improvement >= 15pp",
+        },
+        "arms": arms,
+        "contrasts": {"dense_return_minus_max_floor": delta},
+        "selected_variant": selected_name,
+        "selected_step": arms[selected_name]["best_step"],
+        "selected_success": arms[selected_name]["best_success"],
+        "dense_return_gate": "pass" if gate_pass else "fail",
+    }
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--max-floor-run", type=Path, required=True)
+    parser.add_argument("--dense-return-run", type=Path, required=True)
+    parser.add_argument("--output", type=Path, required=True)
+    args = parser.parse_args()
+    result = summarize(args.max_floor_run, args.dense_return_run)
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+    args.output.write_text(json.dumps(result, indent=2) + "\n")
+    print(json.dumps(result, indent=2))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

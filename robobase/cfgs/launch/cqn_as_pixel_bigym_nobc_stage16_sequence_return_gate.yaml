@@ -1,0 +1,16 @@
+# @package _global_
+
+# Stage 16: recover the discounted sparse return corresponding to every
+# future action token inside the same dense MC/Bellman categorical Q target.
+defaults:
+  - cqn_as_pixel_bigym_nobc_stage10_discounted_dense_control
+  - _self_
+
+method:
+  sequence_aligned_mc_discount: ${replay.gamma}
+  dense_return_finest_neighbor_weight: 0.0
+  ordered_success_return_mix: 0.0
+
+hydra:
+  run:
+    dir: ./exp_local/cqn_no_bc/stage16_sequence_return_${now:%Y%m%d%H%M%S}

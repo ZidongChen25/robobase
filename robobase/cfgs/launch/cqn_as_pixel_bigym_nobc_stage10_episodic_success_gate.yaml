@@ -1,0 +1,16 @@
+# @package _global_
+
+# Stage 10 treatment: one dense categorical Q regression to completed binary
+# task success. Demo identity is never read; successful online trajectories
+# receive the same target and the failed demonstration receives zero.
+defaults:
+  - cqn_as_pixel_bigym_nobc_stage10_discounted_dense_control
+  - _self_
+
+method:
+  mc_lower_bound_target: false
+  episodic_success_q_target: true
+
+hydra:
+  run:
+    dir: ./exp_local/cqn_no_bc/stage10_episodic_success_${now:%Y%m%d%H%M%S}

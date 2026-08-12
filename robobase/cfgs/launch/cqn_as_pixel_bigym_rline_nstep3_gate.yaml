@@ -1,0 +1,33 @@
+# @package _global_
+
+# R-line arm GAMMA (research_paper.md §5 rev.): single-variable multi-step
+# credit propagation on the canonical recipe — replay.nstep 1 -> 3, standard
+# replan-1 + temporal-ensemble execution unchanged.
+# Prior art this arm is calibrated against:
+#   - stage-163c (nstep8 + replan8): +9.4 over official in the OLD regime but
+#     roughly baseline-level in the new truncated regime (qc arm s1 73.0 vs
+#     baseline 77.5) and the source of 38pp seed variance (stage-177);
+#   - stage-177 (nstep3 + replan1): 79.5 on the WORST seed in the old regime
+#     — the variance disappears when the window shrinks and execution stays
+#     standard. nstep=3 under replan-1 in the new regime is untested.
+# Literature: every successful demo-driven value method uses uncorrected
+# multi-step returns on demo data (DQfD n=10, R2D3 n=5, Rainbow n=3);
+# nstep=1 + margin is a known-bad half-recipe (research_paper.md §1.6).
+defaults:
+  - cqn_as_pixel_bigym_demo_driven
+  - _self_
+
+save_csv: true
+eval_every_steps: 1000000
+num_eval_episodes: 0
+num_eval_envs: 0
+save_snapshot: true
+snapshot_every_n: 5000
+log_eval_video: false
+
+replay:
+  nstep: 3
+
+hydra:
+  run:
+    dir: ./exp_local/cqn_rline/nstep3_${env.task_name}_${now:%Y%m%d%H%M%S}

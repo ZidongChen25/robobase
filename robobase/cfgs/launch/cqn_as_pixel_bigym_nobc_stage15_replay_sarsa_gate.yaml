@@ -1,0 +1,16 @@
+# @package _global_
+
+# Stage 15: retain the full K=16 plan and use the next actually executed
+# replay action sequence for the single Bellman/SARSA Q target.
+defaults:
+  - cqn_as_pixel_bigym_nobc_stage10_discounted_dense_control
+  - _self_
+
+method:
+  td_target_action_source: replay_next
+  dense_return_finest_neighbor_weight: 0.0
+  ordered_success_return_mix: 0.0
+
+hydra:
+  run:
+    dir: ./exp_local/cqn_no_bc/stage15_replay_sarsa_${now:%Y%m%d%H%M%S}

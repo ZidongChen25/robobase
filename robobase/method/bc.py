@@ -17,6 +17,7 @@ from robobase.method.jax_base import JaxMethodBase
 from robobase.models.encoder import (
     JaxCQNEncoder,
     JaxDPEarlyFusionEncoder,
+    JaxDrQV2Encoder,
     JaxResNetEncoder,
     normalize_plucker_fusion_mode,
 )
@@ -54,6 +55,35 @@ class BCEncoderModelSpec:
     plucker_hidden_channels: int = 64
     plucker_identity_init: bool = False
     plucker_fusion_mode: str | None = None
+    num_downsample_convs: int = 1
+    num_post_downsample_convs: int = 3
+    channels: int = 32
+    kernel_size: int = 3
+    padding: int = 0
+    channels_multiplier: int = 1
+    activation: str = "relu"
+    norm: str = "none"
+    normalize_inputs: bool = True
+    # Pre-06a61d4 BiGym checkpoints hold encoder params in the jax_resnet
+    # module structure; route them to LegacyJaxResNetEncoder. Set from the
+    # config-era fingerprint by legacy_resnet_encoder_impl().
+    legacy_impl: bool = False
+
+
+def legacy_resnet_encoder_impl(cfg: DictConfig) -> bool:
+    """True when a saved BiGym config predates the 06a61d4 encoder rewrite.
+
+    Era fingerprint: env.truncate_demo_at_success entered the config tree in
+    the same commit as the pure-JAX encoder rewrite (2026-07-30), so a BiGym
+    config lacking it was trained against the jax_resnet/timm encoder.
+    """
+
+    env_cfg = cfg.get("env", None)
+    return bool(
+        env_cfg is not None
+        and str(env_cfg.get("env_name", "")).lower() == "bigym"
+        and "truncate_demo_at_success" not in env_cfg
+    )
 
 
 @dataclass(frozen=True)
@@ -148,9 +178,14 @@ def bc_model_spec_from_cfg(cfg: DictConfig) -> BCModelSpec:
             default="resnet",
             target_to_type={
                 "robobase.models.encoder.JaxResNetEncoder": "resnet",
+                "robobase.models.encoder.JaxDrQV2Encoder": "drqv2",
+                "robobase.models.EncoderCNNMultiViewDownsampleWithStrides": (
+                    "drqv2"
+                ),
             },
         )
         encoder_model_spec = BCEncoderModelSpec(
+            legacy_impl=legacy_resnet_encoder_impl(cfg),
             type=encoder_model_type,
             model=str(encoder_model_cfg.get("model", "resnet18")),
             trainable=bool(encoder_model_cfg.get("trainable", False)),
@@ -171,6 +206,26 @@ def bc_model_spec_from_cfg(cfg: DictConfig) -> BCModelSpec:
                 encoder_model_cfg.get("plucker_identity_init", False)
             ),
             plucker_fusion_mode=encoder_model_cfg.get("plucker_fusion_mode", None),
+            num_downsample_convs=int(
+                encoder_model_cfg.get("num_downsample_convs", 1)
+            ),
+            num_post_downsample_convs=int(
+                encoder_model_cfg.get("num_post_downsample_convs", 3)
+            ),
+            channels=int(encoder_model_cfg.get("channels", 32)),
+            kernel_size=int(encoder_model_cfg.get("kernel_size", 3)),
+            padding=int(encoder_model_cfg.get("padding", 0)),
+            channels_multiplier=int(
+                encoder_model_cfg.get("channels_multiplier", 1)
+            ),
+            activation=str(encoder_model_cfg.get("activation", "relu")).lower(),
+            norm=str(encoder_model_cfg.get("norm", "none")).lower(),
+            normalize_inputs=bool(
+                encoder_model_cfg.get(
+                    "normalize_inputs",
+                    encoder_model_cfg.get("normalise_inputs", True),
+                )
+            ),
         )
 
     view_fusion_model_cfg = method_cfg.get("view_fusion_model", None)
@@ -217,7 +272,13 @@ def bc_spec_from_cfg(cfg: DictConfig) -> BCSpec:
 @dataclass(frozen=True)
 class _BuiltBCModel:
     actor_model: JaxMLPWithSequenceOutput
-    encoder_model: JaxResNetEncoder | JaxDPEarlyFusionEncoder | None
+    encoder_model: (
+        JaxCQNEncoder
+        | JaxDPEarlyFusionEncoder
+        | JaxDrQV2Encoder
+        | JaxResNetEncoder
+        | None
+    )
     view_fusion_model: JaxFusionMultiCamFeature | None
 
 
@@ -251,7 +312,12 @@ def _build_model(
     if obs_layout.use_pixels:
         if model_spec.encoder_model is None:
             raise ValueError("Pixel BC requires encoder_model in the model spec.")
-        if model_spec.encoder_model.type not in {"resnet", "dp_resnet", "cqn"}:
+        if model_spec.encoder_model.type not in {
+            "resnet",
+            "dp_resnet",
+            "cqn",
+            "drqv2",
+        }:
             raise NotImplementedError(
                 f"Unsupported BC encoder model type '{model_spec.encoder_model.type}'."
             )
@@ -275,6 +341,15 @@ def _build_model(
                 raise ValueError("encoder type 'cqn' does not support Plucker inputs.")
             encoder_cls = JaxCQNEncoder
             plucker_fusion_mode = "none"
+        elif model_spec.encoder_model.type == "drqv2":
+            if model_spec.encoder_model.pretrained:
+                raise ValueError("encoder type 'drqv2' requires pretrained=false.")
+            if model_spec.encoder_model.use_plucker:
+                raise ValueError(
+                    "encoder type 'drqv2' does not support Plucker inputs."
+                )
+            encoder_cls = JaxDrQV2Encoder
+            plucker_fusion_mode = "none"
         elif model_spec.encoder_model.type == "dp_resnet":
             if model_spec.encoder_model.pretrained:
                 raise ValueError("encoder type 'dp_resnet' requires pretrained=false.")
@@ -295,6 +370,10 @@ def _build_model(
                 )
         else:
             encoder_cls = JaxResNetEncoder
+            if getattr(model_spec.encoder_model, "legacy_impl", False):
+                from robobase.models.encoder import LegacyJaxResNetEncoder
+
+                encoder_cls = LegacyJaxResNetEncoder
             plucker_fusion_mode = normalize_plucker_fusion_mode(
                 model_spec.encoder_model.plucker_fusion_mode,
                 use_plucker=model_spec.encoder_model.use_plucker,
@@ -308,12 +387,28 @@ def _build_model(
             jit=encoder_jit,
             seed=encoder_seed,
         )
-        if encoder_cls is not JaxCQNEncoder:
+        if encoder_cls not in {JaxCQNEncoder, JaxDrQV2Encoder}:
             encoder_kwargs.update(
                 model=model_spec.encoder_model.model,
                 pretrained=model_spec.encoder_model.pretrained,
                 use_plucker=model_spec.encoder_model.use_plucker,
                 plucker_fusion_mode=plucker_fusion_mode,
+            )
+        if encoder_cls is JaxDrQV2Encoder:
+            encoder_kwargs.update(
+                num_downsample_convs=(
+                    model_spec.encoder_model.num_downsample_convs
+                ),
+                num_post_downsample_convs=(
+                    model_spec.encoder_model.num_post_downsample_convs
+                ),
+                channels=model_spec.encoder_model.channels,
+                kernel_size=model_spec.encoder_model.kernel_size,
+                padding=model_spec.encoder_model.padding,
+                channels_multiplier=model_spec.encoder_model.channels_multiplier,
+                activation=model_spec.encoder_model.activation,
+                norm=model_spec.encoder_model.norm,
+                normalize_inputs=model_spec.encoder_model.normalize_inputs,
             )
         if encoder_cls is JaxResNetEncoder:
             encoder_kwargs.update(
@@ -344,6 +439,7 @@ def _build_model(
         "resnet",
         "dp_resnet",
         "cqn",
+        "drqv2",
     }:
         raise NotImplementedError(
             f"Unsupported BC encoder model type '{model_spec.encoder_model.type}'."

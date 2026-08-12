@@ -1,0 +1,15 @@
+# @package _global_
+
+# Stage 33: keep the Stage-32 twin-C51 objective and pessimistic evaluation,
+# but collect online data with one episode-persistent sampled critic head.
+# This is randomized value-function exploration, not an imitation/policy loss.
+defaults:
+  - cqn_as_pixel_bigym_nobc_stage32_offline_pessimistic_twin_gate
+  - _self_
+
+method:
+  episodic_twin_head_exploration: true
+
+hydra:
+  run:
+    dir: ./exp_local/cqn_no_bc/stage33_episodic_twin_explore_${now:%Y%m%d%H%M%S}

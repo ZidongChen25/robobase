@@ -1,0 +1,14 @@
+# @package _global_
+
+# Stage 2 interaction arm: the MC lower-bound target plus the Stage-1
+# unseen-action return floor. It differs from MC-only by one coefficient.
+defaults:
+  - cqn_as_pixel_bigym_nobc_mc_gate
+  - _self_
+
+method:
+  unseen_return_floor_weight: 1.0
+
+hydra:
+  run:
+    dir: ./exp_local/cqn_no_bc/stage2_mc_floor_${now:%Y%m%d%H%M%S}

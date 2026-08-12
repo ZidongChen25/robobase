@@ -1,0 +1,16 @@
+# @package _global_
+
+# Agent line Stage A12: combination arm — satisficing floor (0.02, the
+# only positive-mean retention lever) x reduced online learning rate.
+# The lr override is applied at the online invocation only; the shared
+# offline checkpoints were trained at 5e-5.
+defaults:
+  - cqn_as_pixel_bigym_nobc_agent_a9_satisfloor_gate
+  - _self_
+
+method:
+  critic_lr: 2e-5
+
+hydra:
+  run:
+    dir: ./exp_local/cqn_no_bc/agent_a12_combo_${now:%Y%m%d%H%M%S}

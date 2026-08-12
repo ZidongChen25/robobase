@@ -1,0 +1,17 @@
+# @package _global_
+
+# Stage 17: corrected no-policy replay-SARSA.  The configuration is the same
+# one-key contrast as Stage 15, but the no-policy parent update now actually
+# consumes the shifted consecutive replay actions at the bootstrap state.
+defaults:
+  - cqn_as_pixel_bigym_nobc_stage10_discounted_dense_control
+  - _self_
+
+method:
+  td_target_action_source: replay_next
+  dense_return_finest_neighbor_weight: 0.0
+  ordered_success_return_mix: 0.0
+
+hydra:
+  run:
+    dir: ./exp_local/cqn_no_bc/stage17_effective_replay_sarsa_${now:%Y%m%d%H%M%S}

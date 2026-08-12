@@ -1,0 +1,10 @@
+{
+  "root": "/home/zc1525/robobase_jaxflat",
+  "group": "exp_local",
+  "min_age_hours": 48.0,
+  "snapshots_considered": 1215,
+  "snapshots_failed": 0,
+  "reclaimed_bytes": 234493944101,
+  "failures": [],
+  "completed_unix_ns": 1786049991444528714
+}

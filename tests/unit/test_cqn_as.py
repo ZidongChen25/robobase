@@ -5,6 +5,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from flax.core import freeze, unfreeze
 from flax.traverse_util import flatten_dict
 from gymnasium import spaces
 from hydra import compose, initialize_config_dir
@@ -13,13 +14,31 @@ from omegaconf import OmegaConf
 
 from robobase.envs.wrappers import RecedingHorizonControl
 from robobase.factory import create_agent
-from robobase.method.cqn import unseen_return_floor_loss
-from robobase.method.cqn_as import C2FSequenceDistributionalCritic
+from robobase.method.cqn import (
+    advantage_learning_target_shift,
+    categorical_point_mass,
+    dense_return_distributional_loss,
+    dense_return_expected_q_loss,
+    episodic_success_returns,
+    ordered_success_returns,
+    sequence_aligned_sparse_returns,
+    shift_categorical_distribution,
+    unseen_return_floor_loss,
+)
+from robobase.method.cqn_as import (
+    AutoregressiveActionCorrection,
+    C2FSequenceDistributionalCritic,
+    pessimistic_categorical_q,
+    select_episodic_twin_actions,
+    shift_replay_action_sequence,
+    top2_joint_beam,
+)
 from robobase.models.encoder import JaxCQNEncoder
 from robobase.replay_buffer.vision_feature_cache import JAX_CQN_AS_FEATURE_KEY
 from robobase.workspace import (
     Workspace,
     _effective_episode_length,
+    _mc_return_anchor_enabled,
     _replay_action_from_step,
 )
 from tests.unit.wrappers.utils import DummyEnv
@@ -97,6 +116,176 @@ def _tree_changed(before, after):
     )
 
 
+def test_cqn_as_replay_sarsa_shifts_consecutive_actions_exactly():
+    actions = jnp.asarray(
+        [
+            [[1.0, 10.0], [2.0, 20.0], [3.0, 30.0]],
+            [[4.0, 40.0], [5.0, 50.0], [6.0, 60.0]],
+        ],
+        dtype=jnp.float32,
+    )
+    shifted = shift_replay_action_sequence(actions, 3, 2)
+    np.testing.assert_array_equal(
+        shifted,
+        np.asarray(
+            [
+                [[2.0, 20.0], [3.0, 30.0], [3.0, 30.0]],
+                [[5.0, 50.0], [6.0, 60.0], [6.0, 60.0]],
+            ],
+            dtype=np.float32,
+        ),
+    )
+
+
+def test_sequence_aligned_sparse_returns_recovers_each_token_return():
+    gamma = 0.99
+    returns = jnp.asarray([0.0, gamma**3], dtype=jnp.float32)
+    aligned = sequence_aligned_sparse_returns(
+        returns,
+        action_sequence=4,
+        action_dim=2,
+        discount=gamma,
+    )
+    np.testing.assert_array_equal(aligned[0], np.zeros(8, dtype=np.float32))
+    np.testing.assert_allclose(
+        aligned[1],
+        np.repeat(
+            np.asarray([gamma**3, gamma**2, gamma, 1.0], dtype=np.float32),
+            2,
+        ),
+        rtol=1e-6,
+    )
+
+
+def test_categorical_point_mass_projects_per_token_values():
+    support = jnp.asarray([0.0, 0.5, 1.0], dtype=jnp.float32)
+    values = jnp.asarray([[0.0, 0.25, 1.0]], dtype=jnp.float32)
+    projected = categorical_point_mass(values, support)
+    np.testing.assert_allclose(
+        projected,
+        np.asarray(
+            [[[1.0, 0.0, 0.0], [0.5, 0.5, 0.0], [0.0, 0.0, 1.0]]],
+            dtype=np.float32,
+        ),
+    )
+
+
+def test_sequence_aligned_zero_return_has_no_action_label_signal():
+    support = jnp.asarray([0.0, 0.5, 1.0], dtype=jnp.float32)
+    logits = jax.random.normal(
+        jax.random.PRNGKey(21),
+        (2, 2, 6, 5, 3),
+    )
+    aligned = sequence_aligned_sparse_returns(
+        jnp.zeros((2,), dtype=jnp.float32),
+        action_sequence=3,
+        action_dim=2,
+        discount=0.99,
+    )
+    target = categorical_point_mass(aligned[:, None, :], support)
+    target = jnp.broadcast_to(target, (2, 2, 6, 3))
+    first_actions = jnp.zeros((2, 2, 6), dtype=jnp.int32)
+    last_actions = jnp.full((2, 2, 6), 4, dtype=jnp.int32)
+
+    def objective(value, actions):
+        per_sample, _, _ = dense_return_distributional_loss(
+            value,
+            actions,
+            target,
+            support,
+            0.0,
+        )
+        return per_sample.mean()
+
+    first_loss, first_grad = jax.value_and_grad(objective)(
+        logits,
+        first_actions,
+    )
+    last_loss, last_grad = jax.value_and_grad(objective)(
+        logits,
+        last_actions,
+    )
+    np.testing.assert_array_equal(first_loss, last_loss)
+    np.testing.assert_array_equal(first_grad, last_grad)
+
+
+def test_dense_expected_q_loss_matches_exact_all_bin_regression():
+    support = jnp.asarray([-1.0, 0.0, 1.0], dtype=jnp.float32)
+    logits = jnp.asarray(
+        [
+            [
+                [
+                    [
+                        [0.0, 0.0, 0.0],
+                        [-1.0, 0.0, 1.0],
+                        [1.0, 0.0, -1.0],
+                    ]
+                ]
+            ]
+        ],
+        dtype=jnp.float32,
+    )
+    actions = jnp.asarray([[[1]]], dtype=jnp.int32)
+    target = jnp.asarray([[[[0.0, 0.25, 0.75]]]], dtype=jnp.float32)
+    per_sample, chosen_q, unseen_q = dense_return_expected_q_loss(
+        logits,
+        actions,
+        target,
+        support,
+        floor_value=0.0,
+    )
+
+    all_q = np.sum(
+        np.asarray(jax.nn.softmax(logits, axis=-1))
+        * np.asarray(support),
+        axis=-1,
+    )
+    targets = np.zeros_like(all_q)
+    targets[..., 1] = 0.75
+    expected_loss = 0.5 * np.square(all_q - targets).sum(axis=-1).mean(
+        axis=(1, 2)
+    )
+    np.testing.assert_allclose(per_sample, expected_loss, rtol=1e-6)
+    np.testing.assert_allclose(chosen_q, all_q[..., 1].mean(axis=(1, 2)))
+    np.testing.assert_allclose(
+        unseen_q,
+        np.asarray([(all_q[..., 0].sum() + all_q[..., 2].sum()) / 2.0]),
+    )
+
+
+def test_dense_expected_q_zero_return_has_no_action_label_signal():
+    support = jnp.asarray([-1.0, 0.0, 1.0], dtype=jnp.float32)
+    logits = jax.random.normal(
+        jax.random.PRNGKey(22),
+        (2, 2, 6, 5, 3),
+    )
+    zero_target = jnp.zeros((2, 2, 6, 3), dtype=jnp.float32)
+    zero_target = zero_target.at[..., 1].set(1.0)
+    first_actions = jnp.zeros((2, 2, 6), dtype=jnp.int32)
+    last_actions = jnp.full((2, 2, 6), 4, dtype=jnp.int32)
+
+    def objective(value, actions):
+        per_sample, _, _ = dense_return_expected_q_loss(
+            value,
+            actions,
+            zero_target,
+            support,
+            floor_value=0.0,
+        )
+        return per_sample.mean()
+
+    first_loss, first_grad = jax.value_and_grad(objective)(
+        logits,
+        first_actions,
+    )
+    last_loss, last_grad = jax.value_and_grad(objective)(
+        logits,
+        last_actions,
+    )
+    np.testing.assert_array_equal(first_loss, last_loss)
+    np.testing.assert_array_equal(first_grad, last_grad)
+
+
 def test_cqn_as_sequence_critic_outputs_all_steps_and_streams():
     critic = C2FSequenceDistributionalCritic(
         hidden_dims=(16, 16),
@@ -131,6 +320,62 @@ def test_cqn_as_sequence_critic_outputs_all_steps_and_streams():
         np.asarray(centered_advantages).mean(axis=-2),
         0.0,
         atol=1e-7,
+    )
+
+
+def test_autoregressive_action_correction_uses_only_strict_prefix():
+    correction = AutoregressiveActionCorrection(
+        hidden_dim=8,
+        action_sequence=3,
+        action_dim=3,
+        bins=5,
+        atoms=7,
+    )
+    base_logits = jax.random.normal(
+        jax.random.PRNGKey(1),
+        (2, 3, 3, 5, 7),
+    )
+    features = jax.random.normal(jax.random.PRNGKey(2), (2, 4))
+    action_context = jnp.zeros((2, 3, 3), dtype=jnp.float32)
+    params = correction.init(
+        jax.random.PRNGKey(3),
+        base_logits,
+        features,
+        action_context,
+    )
+    mutable_params = unfreeze(params)
+    output_kernel = mutable_params["params"]["output_projection"]["kernel"]
+    mutable_params["params"]["output_projection"]["kernel"] = (
+        0.1
+        * jax.random.normal(
+            jax.random.PRNGKey(4),
+            output_kernel.shape,
+        )
+    )
+    params = freeze(mutable_params)
+
+    baseline = correction.apply(
+        params,
+        base_logits,
+        features,
+        action_context,
+    )
+    changed_context = action_context.at[:, :, 0].set(0.75)
+    changed = correction.apply(
+        params,
+        base_logits,
+        features,
+        changed_context,
+    )
+
+    # Dimension zero is evaluated before action_context[..., 0] is consumed.
+    np.testing.assert_array_equal(
+        np.asarray(baseline[:, :, 0]),
+        np.asarray(changed[:, :, 0]),
+    )
+    assert not np.allclose(
+        np.asarray(baseline[:, :, 1]),
+        np.asarray(changed[:, :, 1]),
     )
 
 
@@ -616,6 +861,7 @@ def test_cqn_as_bigym_launch_has_official_sequence_replay_contract():
     assert cfg.replay.action_padding == "edge"
     assert cfg.replay.nstep == 1
     assert cfg.replay.include_tp1
+    assert cfg.replay.compression == "zip"
     assert cfg.method.encoder_model.type == "cqn"
     assert cfg.env.episode_length == 3000
     assert not cfg.env.filter_successful_demos
@@ -1363,7 +1609,14 @@ def _strict_demo_rl_cfg(*overrides):
     )
 
 
-def test_unseen_return_floor_has_no_gradient_on_replayed_bin():
+@pytest.mark.parametrize(
+    ("reduction", "topk"),
+    (("mean", 1), ("max", 1), ("topk", 2)),
+)
+def test_unseen_return_floor_has_no_gradient_on_replayed_bin(
+    reduction,
+    topk,
+):
     support = jnp.asarray([-1.0, 0.0, 1.0], dtype=jnp.float32)
     logits = jnp.asarray(
         [[[[[0.0, 0.0, 4.0], [0.0, 0.0, 3.0], [3.0, 0.0, 0.0]]]]],
@@ -1377,6 +1630,8 @@ def test_unseen_return_floor_has_no_gradient_on_replayed_bin():
             replayed_bin,
             support,
             0.0,
+            reduction=reduction,
+            topk=topk,
         )
         return per_sample.mean()
 
@@ -1385,7 +1640,14 @@ def test_unseen_return_floor_has_no_gradient_on_replayed_bin():
     assert np.linalg.norm(np.asarray(grads[0, 0, 0, 1:])) > 0.0
 
 
-def test_unseen_return_floor_cannot_clone_actions_without_return_signal():
+@pytest.mark.parametrize(
+    ("reduction", "topk"),
+    (("mean", 1), ("max", 1), ("topk", 2)),
+)
+def test_unseen_return_floor_cannot_clone_actions_without_return_signal(
+    reduction,
+    topk,
+):
     support = jnp.asarray([-1.0, 0.0, 1.0], dtype=jnp.float32)
     logits = jnp.zeros((1, 1, 1, 5, 3), dtype=jnp.float32)
 
@@ -1400,6 +1662,8 @@ def test_unseen_return_floor_cannot_clone_actions_without_return_signal():
                 bins,
                 support,
                 0.0,
+                reduction=reduction,
+                topk=topk,
             )
             return per_sample.mean()
 
@@ -1410,9 +1674,203 @@ def test_unseen_return_floor_cannot_clone_actions_without_return_signal():
     np.testing.assert_array_equal(gradients, np.zeros_like(gradients))
 
 
-def test_cqn_as_strict_demo_rl_ignores_demo_identity_and_has_no_policy():
+def test_unseen_return_max_floor_targets_largest_competing_bin_per_head():
+    support = jnp.asarray([-1.0, 0.0, 1.0], dtype=jnp.float32)
+    logits = jnp.asarray(
+        [[[[[0.0, 0.0, 4.0], [0.0, 0.0, 2.0], [4.0, 0.0, 0.0]]]]],
+        dtype=jnp.float32,
+    )
+    replayed_bin = jnp.asarray([[[0]]], dtype=jnp.int32)
+
+    def objective(value):
+        per_sample, max_unseen_q = unseen_return_floor_loss(
+            value,
+            replayed_bin,
+            support,
+            0.0,
+            reduction="max",
+        )
+        return per_sample.mean(), max_unseen_q
+
+    (loss, max_unseen_q), grads = jax.value_and_grad(
+        objective,
+        has_aux=True,
+    )(logits)
+    assert loss == pytest.approx(float(max_unseen_q[0] ** 2))
+    assert max_unseen_q[0] > 0.0
+    np.testing.assert_array_equal(np.asarray(grads[0, 0, 0, 0]), 0.0)
+    assert np.linalg.norm(np.asarray(grads[0, 0, 0, 1])) > 0.0
+    np.testing.assert_array_equal(np.asarray(grads[0, 0, 0, 2]), 0.0)
+
+
+def test_unseen_return_topk_floor_targets_upper_competing_tail():
+    support = jnp.asarray([-1.0, 0.0, 1.0], dtype=jnp.float32)
+    logits = jnp.asarray(
+        [
+            [
+                [
+                    [
+                        [0.0, 0.0, 4.0],
+                        [0.0, 0.0, 3.0],
+                        [0.0, 0.0, 2.0],
+                        [3.0, 0.0, 0.0],
+                    ]
+                ]
+            ]
+        ],
+        dtype=jnp.float32,
+    )
+    replayed_bin = jnp.asarray([[[0]]], dtype=jnp.int32)
+
+    def objective(value):
+        per_sample, _ = unseen_return_floor_loss(
+            value,
+            replayed_bin,
+            support,
+            0.0,
+            reduction="topk",
+            topk=2,
+        )
+        return per_sample.mean()
+
+    grads = jax.grad(objective)(logits)
+    np.testing.assert_array_equal(np.asarray(grads[0, 0, 0, 0]), 0.0)
+    assert np.linalg.norm(np.asarray(grads[0, 0, 0, 1])) > 0.0
+    assert np.linalg.norm(np.asarray(grads[0, 0, 0, 2])) > 0.0
+    np.testing.assert_array_equal(np.asarray(grads[0, 0, 0, 3]), 0.0)
+
+
+@pytest.mark.parametrize("finest_neighbor_weight", (0.0, 0.5))
+def test_dense_return_q_is_action_invariant_without_return_difference(
+    finest_neighbor_weight,
+):
+    support = jnp.asarray([0.0, 0.5, 1.0], dtype=jnp.float32)
+    logits = jax.random.normal(
+        jax.random.PRNGKey(20),
+        (2, 2, 3, 5, 3),
+    )
+    floor_target = jnp.zeros((2, 2, 3, 3), dtype=jnp.float32)
+    floor_target = floor_target.at[..., 0].set(1.0)
+    first_actions = jnp.zeros((2, 2, 3), dtype=jnp.int32)
+    last_actions = jnp.full((2, 2, 3), 4, dtype=jnp.int32)
+
+    def objective(value, actions):
+        per_sample, _, _ = dense_return_distributional_loss(
+            value,
+            actions,
+            floor_target,
+            support,
+            0.0,
+            finest_neighbor_weight,
+        )
+        return per_sample.mean()
+
+    first_loss, first_grad = jax.value_and_grad(objective)(
+        logits,
+        first_actions,
+    )
+    last_loss, last_grad = jax.value_and_grad(objective)(
+        logits,
+        last_actions,
+    )
+    np.testing.assert_array_equal(first_loss, last_loss)
+    np.testing.assert_array_equal(first_grad, last_grad)
+
+
+def test_dense_return_q_kernel_targets_only_finest_immediate_neighbors():
+    support = jnp.asarray([0.0, 0.5, 1.0], dtype=jnp.float32)
+    logits = jnp.zeros((1, 2, 1, 5, 3), dtype=jnp.float32)
+    high_return_target = jnp.zeros((1, 2, 1, 3), dtype=jnp.float32)
+    high_return_target = high_return_target.at[..., -1].set(1.0)
+    replayed_bin = jnp.full((1, 2, 1), 2, dtype=jnp.int32)
+
+    def objective(value):
+        per_sample, _, _ = dense_return_distributional_loss(
+            value,
+            replayed_bin,
+            high_return_target,
+            support,
+            0.0,
+            0.5,
+        )
+        return per_sample.mean()
+
+    grads = np.asarray(jax.grad(objective)(logits))
+    floor_grad = np.asarray([-2.0 / 3.0, 1.0 / 3.0, 1.0 / 3.0])
+    chosen_grad = np.asarray([1.0 / 3.0, 1.0 / 3.0, -2.0 / 3.0])
+    neighbor_grad = np.asarray([-1.0 / 6.0, 1.0 / 3.0, -1.0 / 6.0])
+    # The loss averages over two levels, so compare normalized directions.
+    np.testing.assert_allclose(grads[0, 0, 0, 1], floor_grad / 2.0)
+    np.testing.assert_allclose(grads[0, 0, 0, 2], chosen_grad / 2.0)
+    np.testing.assert_allclose(grads[0, 1, 0, 0], floor_grad / 2.0)
+    np.testing.assert_allclose(grads[0, 1, 0, 1], neighbor_grad / 2.0)
+    np.testing.assert_allclose(grads[0, 1, 0, 2], chosen_grad / 2.0)
+    np.testing.assert_allclose(grads[0, 1, 0, 3], neighbor_grad / 2.0)
+    np.testing.assert_allclose(grads[0, 1, 0, 4], floor_grad / 2.0)
+
+
+def test_dense_return_q_separation_is_created_only_by_return_target():
+    support = jnp.asarray([0.0, 0.5, 1.0], dtype=jnp.float32)
+    logits = jnp.zeros((1, 1, 1, 5, 3), dtype=jnp.float32)
+    high_return_target = jnp.zeros((1, 1, 1, 3), dtype=jnp.float32)
+    high_return_target = high_return_target.at[..., -1].set(1.0)
+    replayed_bin = jnp.asarray([[[2]]], dtype=jnp.int32)
+
+    def objective(value):
+        per_sample, _, _ = dense_return_distributional_loss(
+            value,
+            replayed_bin,
+            high_return_target,
+            support,
+            0.0,
+        )
+        return per_sample.mean()
+
+    grads = jax.grad(objective)(logits)
+    assert grads[0, 0, 0, 2, -1] < 0.0
+    assert grads[0, 0, 0, 0, 0] < 0.0
+    assert grads[0, 0, 0, 2, 0] > 0.0
+    assert grads[0, 0, 0, 0, -1] > 0.0
+
+
+def test_episodic_success_return_recovers_completed_outcome_bit():
+    discounted_returns = jnp.asarray(
+        [-1.0, 0.0, 1e-6, 0.217, 0.448, 1.0],
+        dtype=jnp.float32,
+    )
+    np.testing.assert_array_equal(
+        episodic_success_returns(discounted_returns),
+        np.asarray([0.0, 0.0, 1.0, 1.0, 1.0, 1.0]),
+    )
+
+
+def test_ordered_success_return_lifts_but_preserves_positive_order():
+    discounted_returns = jnp.asarray(
+        [-1.0, 0.0, 0.2, 0.6, 1.0],
+        dtype=jnp.float32,
+    )
+    targets = ordered_success_returns(discounted_returns, 0.5)
+    np.testing.assert_allclose(
+        targets,
+        np.asarray([0.0, 0.0, 0.6, 0.8, 1.0]),
+    )
+    assert bool(jnp.all(jnp.diff(targets[2:]) > 0.0))
+
+
+@pytest.mark.parametrize(
+    ("floor_reduction", "floor_topk"),
+    (("mean", 1), ("max", 1), ("topk", 2)),
+)
+def test_cqn_as_strict_demo_rl_ignores_demo_identity_and_has_no_policy(
+    floor_reduction,
+    floor_topk,
+):
     observation_space, action_space = _spaces()
-    cfg = _strict_demo_rl_cfg("method.weight_decay=0.0")
+    cfg = _strict_demo_rl_cfg(
+        "method.weight_decay=0.0",
+        f"method.unseen_return_floor_reduction={floor_reduction}",
+        f"method.unseen_return_floor_topk={floor_topk}",
+    )
     demo_agent = create_agent(
         cfg,
         observation_space=observation_space,
@@ -1448,7 +1906,1483 @@ def test_cqn_as_strict_demo_rl_ignores_demo_identity_and_has_no_policy():
     assert demo_metrics["unseen_return_floor_loss"] >= 0.0
     demo_metrics.pop("backend/update_time_sec")
     online_metrics.pop("backend/update_time_sec")
+    # The BC-anchor diagnostics (cqn-flow.md sec 64) summarise the demo and
+    # online halves of the batch separately, so relabelling moves rows between
+    # them by construction. They are observational only -- the guarantee this
+    # test protects is that the update itself is blind to demo identity, which
+    # the parameter-level comparison above already establishes bit-for-bit.
+    for key in (
+        "bc_agreement",
+        "bc_online_agreement",
+        "bc_binding_rate",
+        "bc_margin_gap",
+        "bc_sibling_q_span",
+    ):
+        demo_metrics.pop(key, None)
+        online_metrics.pop(key, None)
     assert demo_metrics == pytest.approx(online_metrics)
+
+
+def test_cqn_as_mc_lower_bound_is_reward_only_and_not_an_auxiliary_loss():
+    observation_space, action_space = _spaces()
+    cfg = _strict_demo_rl_cfg(
+        "method.unseen_return_floor_weight=0.0",
+        "method.mc_lower_bound_target=true",
+        "method.weight_decay=0.0",
+    )
+    demo_agent = create_agent(
+        cfg,
+        observation_space=observation_space,
+        action_space=action_space,
+    )
+    online_agent = create_agent(
+        cfg,
+        observation_space=observation_space,
+        action_space=action_space,
+    )
+    assert not demo_agent._canonical_mc_anchor
+    assert demo_agent._uses_canonical_mc_returns
+    assert _mc_return_anchor_enabled(cfg)
+    assert "policy" not in demo_agent.params
+
+    demo_batch = _batch()
+    demo_batch["reward"][:] = 0.0
+    demo_batch["mc_return"] = np.linspace(0.2, 0.8, 4).astype(np.float32)
+    online_batch = {
+        key: np.array(value, copy=True) for key, value in demo_batch.items()
+    }
+    online_batch["demo"][:] = 0
+    demo_agent.logging = True
+    online_agent.logging = True
+    demo_metrics = demo_agent.update(iter([demo_batch]), step=1)
+    online_metrics = online_agent.update(iter([online_batch]), step=1)
+
+    demo_leaves, demo_tree = jax.tree.flatten(demo_agent.params)
+    online_leaves, online_tree = jax.tree.flatten(online_agent.params)
+    assert demo_tree == online_tree
+    for demo_value, online_value in zip(
+        demo_leaves,
+        online_leaves,
+        strict=True,
+    ):
+        np.testing.assert_array_equal(demo_value, online_value)
+    assert demo_metrics["mc_lower_bound_fraction"] == pytest.approx(1.0)
+    assert demo_metrics["mc_return_mean"] == pytest.approx(0.5)
+    assert "mc_return_loss" not in demo_metrics
+    demo_metrics.pop("backend/update_time_sec")
+    online_metrics.pop("backend/update_time_sec")
+    assert demo_metrics == pytest.approx(online_metrics)
+
+
+def test_cqn_as_autoregressive_q_has_no_demo_identity_branch():
+    observation_space, action_space = _spaces()
+    cfg = _strict_demo_rl_cfg(
+        "method.autoregressive_action_dims=true",
+        "method.mc_lower_bound_target=true",
+        "method.unseen_return_floor_reduction=max",
+        "method.weight_decay=0.0",
+    )
+    demo_agent = create_agent(
+        cfg,
+        observation_space=observation_space,
+        action_space=action_space,
+    )
+    online_agent = create_agent(
+        cfg,
+        observation_space=observation_space,
+        action_space=action_space,
+    )
+    assert demo_agent.autoregressive_action_dims
+    assert "policy" not in demo_agent.params
+    assert "flow_policy" not in demo_agent.params
+
+    demo_batch = _batch()
+    demo_batch["mc_return"] = np.linspace(0.2, 0.8, 4).astype(np.float32)
+    online_batch = {
+        key: np.array(value, copy=True) for key, value in demo_batch.items()
+    }
+    online_batch["demo"][:] = 0
+    demo_agent.update(iter([demo_batch]), step=1)
+    online_agent.update(iter([online_batch]), step=1)
+
+    demo_leaves, demo_tree = jax.tree.flatten(demo_agent.params)
+    online_leaves, online_tree = jax.tree.flatten(online_agent.params)
+    assert demo_tree == online_tree
+    for demo_value, online_value in zip(
+        demo_leaves,
+        online_leaves,
+        strict=True,
+    ):
+        np.testing.assert_array_equal(demo_value, online_value)
+
+
+def test_cqn_as_dense_return_q_is_single_strict_rl_update():
+    observation_space, action_space = _spaces()
+    cfg = _strict_demo_rl_cfg(
+        "method.dense_return_q_target=true",
+        "method.unseen_return_floor_weight=0.0",
+        "method.mc_lower_bound_target=true",
+        "method.weight_decay=0.0",
+    )
+    agent = create_agent(
+        cfg,
+        observation_space=observation_space,
+        action_space=action_space,
+    )
+    assert agent.dense_return_q_target
+    assert "policy" not in agent.params
+    assert "flow_policy" not in agent.params
+
+    batch = _batch()
+    batch["mc_return"] = np.linspace(0.2, 0.8, 4).astype(np.float32)
+    agent.logging = True
+    metrics = agent.update(iter([batch]), step=1)
+
+    assert np.isfinite(metrics["critic_loss"])
+    assert metrics["dense_return_q_loss"] == pytest.approx(
+        metrics["critic_loss"]
+    )
+    assert "unseen_return_floor_loss" not in metrics
+    assert "mc_return_loss" not in metrics
+
+
+def test_cqn_as_positive_only_dense_uses_canonical_q_on_failed_trajectories():
+    observation_space, action_space = _spaces()
+    common = (
+        "method.mc_lower_bound_target=true",
+        "method.unseen_return_floor_weight=0.0",
+        "method.weight_decay=0.0",
+    )
+    gated_agent = create_agent(
+        _strict_demo_rl_cfg(
+            *common,
+            "method.dense_return_q_target=true",
+            "method.dense_return_positive_only=true",
+        ),
+        observation_space=observation_space,
+        action_space=action_space,
+    )
+    canonical_agent = create_agent(
+        _strict_demo_rl_cfg(
+            *common,
+            "method.dense_return_q_target=false",
+            "method.dense_return_positive_only=false",
+        ),
+        observation_space=observation_space,
+        action_space=action_space,
+    )
+    batch = _batch()
+    batch["reward"][:] = 0.0
+    batch["mc_return"] = np.zeros((4,), dtype=np.float32)
+    gated_agent.logging = True
+    gated_metrics = gated_agent.update(iter([batch]), step=1)
+    canonical_agent.update(iter([batch]), step=1)
+
+    gated_leaves, gated_tree = jax.tree.flatten(gated_agent.params)
+    canonical_leaves, canonical_tree = jax.tree.flatten(canonical_agent.params)
+    assert gated_tree == canonical_tree
+    for gated, canonical in zip(gated_leaves, canonical_leaves, strict=True):
+        np.testing.assert_array_equal(gated, canonical)
+    assert gated_metrics["dense_return_positive_fraction"] == pytest.approx(0.0)
+
+
+def test_cqn_as_positive_only_dense_matches_dense_q_on_success_trajectories():
+    observation_space, action_space = _spaces()
+    common = (
+        "method.dense_return_q_target=true",
+        "method.mc_lower_bound_target=true",
+        "method.unseen_return_floor_weight=0.0",
+        "method.weight_decay=0.0",
+    )
+    gated_agent = create_agent(
+        _strict_demo_rl_cfg(
+            *common,
+            "method.dense_return_positive_only=true",
+        ),
+        observation_space=observation_space,
+        action_space=action_space,
+    )
+    dense_agent = create_agent(
+        _strict_demo_rl_cfg(
+            *common,
+            "method.dense_return_positive_only=false",
+        ),
+        observation_space=observation_space,
+        action_space=action_space,
+    )
+    batch = _batch()
+    batch["reward"][:] = 0.0
+    batch["mc_return"] = np.linspace(0.2, 0.8, 4).astype(np.float32)
+    gated_agent.logging = True
+    gated_metrics = gated_agent.update(iter([batch]), step=1)
+    dense_agent.update(iter([batch]), step=1)
+
+    gated_leaves, gated_tree = jax.tree.flatten(gated_agent.params)
+    dense_leaves, dense_tree = jax.tree.flatten(dense_agent.params)
+    assert gated_tree == dense_tree
+    for gated, dense in zip(gated_leaves, dense_leaves, strict=True):
+        np.testing.assert_array_equal(gated, dense)
+    assert gated_metrics["dense_return_positive_fraction"] == pytest.approx(1.0)
+
+
+def test_cqn_as_positive_only_dense_requires_dense_mc_target():
+    observation_space, action_space = _spaces()
+    with pytest.raises(ValueError, match="requires dense_return_q_target=true"):
+        create_agent(
+            _strict_demo_rl_cfg(
+                "method.dense_return_q_target=false",
+                "method.dense_return_positive_only=true",
+                "method.mc_lower_bound_target=true",
+            ),
+            observation_space=observation_space,
+            action_space=action_space,
+        )
+    with pytest.raises(ValueError, match="requires mc_lower_bound_target=true"):
+        create_agent(
+            _strict_demo_rl_cfg(
+                "method.dense_return_q_target=true",
+                "method.dense_return_positive_only=true",
+                "method.mc_lower_bound_target=false",
+            ),
+            observation_space=observation_space,
+            action_space=action_space,
+        )
+
+
+def test_cqn_as_dense_return_q_rejects_second_floor_objective():
+    with pytest.raises(
+        ValueError,
+        match="requires unseen_return_floor_weight=0",
+    ):
+        create_agent(
+            _strict_demo_rl_cfg(
+                "method.dense_return_q_target=true",
+                "method.unseen_return_floor_weight=1.0",
+            ),
+            observation_space=_spaces()[0],
+            action_space=_spaces()[1],
+        )
+
+
+def test_cqn_as_dense_return_q_kernel_is_one_demo_agnostic_update():
+    observation_space, action_space = _spaces()
+    cfg = _strict_demo_rl_cfg(
+        "method.dense_return_q_target=true",
+        "method.dense_return_finest_neighbor_weight=0.5",
+        "method.unseen_return_floor_weight=0.0",
+        "method.mc_lower_bound_target=true",
+        "method.weight_decay=0.0",
+    )
+    demo_agent = create_agent(
+        cfg,
+        observation_space=observation_space,
+        action_space=action_space,
+    )
+    online_agent = create_agent(
+        cfg,
+        observation_space=observation_space,
+        action_space=action_space,
+    )
+    assert demo_agent.dense_return_finest_neighbor_weight == pytest.approx(0.5)
+    assert "policy" not in demo_agent.params
+    assert "flow_policy" not in demo_agent.params
+
+    demo_batch = _batch()
+    demo_batch["reward"][:] = 0.0
+    demo_batch["mc_return"] = np.linspace(0.2, 0.8, 4).astype(np.float32)
+    online_batch = {
+        key: np.array(value, copy=True) for key, value in demo_batch.items()
+    }
+    online_batch["demo"][:] = 0
+    demo_agent.logging = True
+    online_agent.logging = True
+    demo_metrics = demo_agent.update(iter([demo_batch]), step=1)
+    online_metrics = online_agent.update(iter([online_batch]), step=1)
+
+    demo_leaves, demo_tree = jax.tree.flatten(demo_agent.params)
+    online_leaves, online_tree = jax.tree.flatten(online_agent.params)
+    assert demo_tree == online_tree
+    for demo_value, online_value in zip(
+        demo_leaves,
+        online_leaves,
+        strict=True,
+    ):
+        np.testing.assert_array_equal(demo_value, online_value)
+    assert demo_metrics["dense_return_q_loss"] == pytest.approx(
+        demo_metrics["critic_loss"]
+    )
+    assert "mc_return_loss" not in demo_metrics
+    assert "unseen_return_floor_loss" not in demo_metrics
+    demo_metrics.pop("backend/update_time_sec")
+    online_metrics.pop("backend/update_time_sec")
+    assert demo_metrics == pytest.approx(online_metrics)
+
+
+def test_cqn_as_dense_return_q_kernel_requires_dense_target():
+    with pytest.raises(
+        ValueError,
+        match="requires dense_return_q_target=true",
+    ):
+        create_agent(
+            _strict_demo_rl_cfg(
+                "method.dense_return_q_target=false",
+                "method.dense_return_finest_neighbor_weight=0.5",
+            ),
+            observation_space=_spaces()[0],
+            action_space=_spaces()[1],
+        )
+
+
+def test_cqn_as_dense_expected_q_is_one_demo_agnostic_update():
+    observation_space, action_space = _spaces()
+    cfg = _strict_demo_rl_cfg(
+        "method.dense_return_q_target=true",
+        "method.dense_return_expected_q_loss=true",
+        "method.dense_return_finest_neighbor_weight=0.0",
+        "method.unseen_return_floor_weight=0.0",
+        "method.mc_lower_bound_target=true",
+        "method.weight_decay=0.0",
+    )
+    demo_agent = create_agent(
+        cfg,
+        observation_space=observation_space,
+        action_space=action_space,
+    )
+    online_agent = create_agent(
+        cfg,
+        observation_space=observation_space,
+        action_space=action_space,
+    )
+    assert demo_agent.dense_return_expected_q_loss
+    assert "policy" not in demo_agent.params
+    assert "policy_encoder" not in demo_agent.params
+    assert "flow_policy" not in demo_agent.params
+
+    demo_batch = _batch()
+    demo_batch["reward"][:] = 0.0
+    demo_batch["mc_return"] = np.linspace(0.2, 0.8, 4).astype(np.float32)
+    online_batch = {
+        key: np.array(value, copy=True) for key, value in demo_batch.items()
+    }
+    online_batch["demo"][:] = 0
+    demo_agent.logging = True
+    online_agent.logging = True
+    demo_metrics = demo_agent.update(iter([demo_batch]), step=1)
+    online_metrics = online_agent.update(iter([online_batch]), step=1)
+
+    demo_leaves, demo_tree = jax.tree.flatten(demo_agent.params)
+    online_leaves, online_tree = jax.tree.flatten(online_agent.params)
+    assert demo_tree == online_tree
+    for demo_value, online_value in zip(
+        demo_leaves,
+        online_leaves,
+        strict=True,
+    ):
+        np.testing.assert_array_equal(demo_value, online_value)
+    assert demo_metrics["dense_return_q_loss"] == pytest.approx(
+        demo_metrics["critic_loss"]
+    )
+    assert demo_metrics["dense_return_expected_q_target"] == pytest.approx(1.0)
+    assert "policy_bc_loss" not in demo_metrics
+    assert "mc_return_loss" not in demo_metrics
+    assert "unseen_return_floor_loss" not in demo_metrics
+    demo_metrics.pop("backend/update_time_sec")
+    online_metrics.pop("backend/update_time_sec")
+    assert demo_metrics == pytest.approx(online_metrics)
+
+
+def test_cqn_as_dense_expected_q_rejects_incompatible_modes():
+    with pytest.raises(
+        ValueError,
+        match="requires dense_return_q_target=true",
+    ):
+        create_agent(
+            _strict_demo_rl_cfg(
+                "method.dense_return_q_target=false",
+                "method.dense_return_expected_q_loss=true",
+            ),
+            observation_space=_spaces()[0],
+            action_space=_spaces()[1],
+        )
+    with pytest.raises(
+        ValueError,
+        match="dense_return_finest_neighbor_weight=0",
+    ):
+        create_agent(
+            _strict_demo_rl_cfg(
+                "method.dense_return_q_target=true",
+                "method.dense_return_expected_q_loss=true",
+                "method.dense_return_finest_neighbor_weight=0.5",
+                "method.unseen_return_floor_weight=0.0",
+            ),
+            observation_space=_spaces()[0],
+            action_space=_spaces()[1],
+        )
+
+
+def test_cqn_as_q_reward_scale_is_one_demo_agnostic_q_update():
+    observation_space, action_space = _spaces()
+    common = (
+        "method.dense_return_q_target=true",
+        "method.dense_return_expected_q_loss=false",
+        "method.dense_return_finest_neighbor_weight=0.0",
+        "method.unseen_return_floor_weight=0.0",
+        "method.mc_lower_bound_target=true",
+        "method.weight_decay=0.0",
+    )
+    unit_agent = create_agent(
+        _strict_demo_rl_cfg(*common, "method.q_reward_scale=1.0"),
+        observation_space=observation_space,
+        action_space=action_space,
+    )
+    demo_agent = create_agent(
+        _strict_demo_rl_cfg(*common, "method.q_reward_scale=2.0"),
+        observation_space=observation_space,
+        action_space=action_space,
+    )
+    online_agent = create_agent(
+        _strict_demo_rl_cfg(*common, "method.q_reward_scale=2.0"),
+        observation_space=observation_space,
+        action_space=action_space,
+    )
+    assert demo_agent.q_reward_scale == pytest.approx(2.0)
+    assert "policy" not in demo_agent.params
+    assert "policy_encoder" not in demo_agent.params
+    assert "flow_policy" not in demo_agent.params
+
+    demo_batch = _batch()
+    demo_batch["reward"][:] = 0.0
+    demo_batch["mc_return"] = np.linspace(0.2, 0.8, 4).astype(np.float32)
+    online_batch = {
+        key: np.array(value, copy=True) for key, value in demo_batch.items()
+    }
+    online_batch["demo"][:] = 0
+    unit_agent.logging = True
+    demo_agent.logging = True
+    online_agent.logging = True
+    unit_agent.update(iter([demo_batch]), step=1)
+    demo_metrics = demo_agent.update(iter([demo_batch]), step=1)
+    online_metrics = online_agent.update(iter([online_batch]), step=1)
+
+    assert _tree_changed(unit_agent.params, demo_agent.params)
+    demo_leaves, demo_tree = jax.tree.flatten(demo_agent.params)
+    online_leaves, online_tree = jax.tree.flatten(online_agent.params)
+    assert demo_tree == online_tree
+    for demo_value, online_value in zip(
+        demo_leaves,
+        online_leaves,
+        strict=True,
+    ):
+        np.testing.assert_array_equal(demo_value, online_value)
+    assert demo_metrics["q_reward_scale"] == pytest.approx(2.0)
+    assert demo_metrics["scaled_mc_return_mean"] == pytest.approx(
+        2.0 * demo_metrics["mc_return_mean"]
+    )
+    assert demo_metrics["dense_return_q_loss"] == pytest.approx(
+        demo_metrics["critic_loss"]
+    )
+    assert "policy_bc_loss" not in demo_metrics
+    assert "mc_return_loss" not in demo_metrics
+    assert "unseen_return_floor_loss" not in demo_metrics
+    demo_metrics.pop("backend/update_time_sec")
+    online_metrics.pop("backend/update_time_sec")
+    assert demo_metrics == pytest.approx(online_metrics)
+
+
+def test_cqn_as_q_reward_scale_changes_terminal_bellman_target():
+    observation_space, action_space = _spaces()
+    common = (
+        "method.dense_return_q_target=true",
+        "method.dense_return_expected_q_loss=false",
+        "method.dense_return_finest_neighbor_weight=0.0",
+        "method.unseen_return_floor_weight=0.0",
+        "method.mc_lower_bound_target=true",
+        "method.weight_decay=0.0",
+    )
+    unit_agent = create_agent(
+        _strict_demo_rl_cfg(*common, "method.q_reward_scale=1.0"),
+        observation_space=observation_space,
+        action_space=action_space,
+    )
+    scaled_agent = create_agent(
+        _strict_demo_rl_cfg(*common, "method.q_reward_scale=2.0"),
+        observation_space=observation_space,
+        action_space=action_space,
+    )
+    batch = _batch()
+    batch["reward"][:] = 0.5
+    batch["terminal"][:] = True
+    batch["mc_return"] = np.zeros(4, dtype=np.float32)
+    unit_agent.logging = True
+    scaled_agent.logging = True
+    unit_metrics = unit_agent.update(iter([batch]), step=1)
+    scaled_metrics = scaled_agent.update(iter([batch]), step=1)
+
+    # MC=0 never overrides the positive terminal Bellman target, so the
+    # distinct update proves that the immediate reward path is scaled too.
+    assert unit_metrics["mc_lower_bound_fraction"] == pytest.approx(0.0)
+    assert scaled_metrics["mc_lower_bound_fraction"] == pytest.approx(0.0)
+    assert scaled_metrics["q_reward_scale"] == pytest.approx(2.0)
+    assert scaled_metrics["scaled_mc_return_mean"] == pytest.approx(0.0)
+    assert _tree_changed(unit_agent.params, scaled_agent.params)
+
+
+def test_cqn_as_q_reward_scale_requires_supported_dense_mc_target():
+    common = (
+        "method.unseen_return_floor_weight=0.0",
+        "method.q_reward_scale=2.0",
+    )
+    with pytest.raises(
+        ValueError,
+        match="requires dense_return_q_target=true",
+    ):
+        create_agent(
+            _strict_demo_rl_cfg(
+                *common,
+                "method.dense_return_q_target=false",
+            ),
+            observation_space=_spaces()[0],
+            action_space=_spaces()[1],
+        )
+    with pytest.raises(
+        ValueError,
+        match="requires mc_lower_bound_target=true",
+    ):
+        create_agent(
+            _strict_demo_rl_cfg(
+                *common,
+                "method.dense_return_q_target=true",
+                "method.mc_lower_bound_target=false",
+            ),
+            observation_space=_spaces()[0],
+            action_space=_spaces()[1],
+        )
+    with pytest.raises(
+        ValueError,
+        match="terminal target must lie on the C51 support",
+    ):
+        create_agent(
+            _strict_demo_rl_cfg(
+                "method.unseen_return_floor_weight=0.0",
+                "method.dense_return_q_target=true",
+                "method.mc_lower_bound_target=true",
+                "method.q_reward_scale=2.1",
+            ),
+            observation_space=_spaces()[0],
+            action_space=_spaces()[1],
+        )
+
+
+def test_shift_categorical_distribution_translates_and_clips_exactly():
+    support = jnp.linspace(-2.0, 2.0, 5)
+    probabilities = categorical_point_mass(
+        jnp.asarray([[0.0, 1.0, -1.0]], dtype=jnp.float32),
+        support,
+    )
+    shifted = shift_categorical_distribution(
+        probabilities,
+        jnp.asarray([[-0.5, 0.5, -2.0]], dtype=jnp.float32),
+        support,
+    )
+    np.testing.assert_allclose(shifted.sum(axis=-1), 1.0, atol=1e-7)
+    np.testing.assert_allclose(
+        jnp.sum(shifted * support, axis=-1),
+        [[-0.5, 1.5, -2.0]],
+        atol=1e-7,
+    )
+
+
+def test_clipped_advantage_shift_only_changes_near_greedy_bins():
+    q_values = jnp.asarray([[1.0, 0.9, 0.0, -1.0]], dtype=jnp.float32)
+    constant_shift, constant_active = advantage_learning_target_shift(
+        q_values,
+        q_lower=-2.0,
+        alpha=0.5,
+    )
+    clipped_shift, clipped_active = advantage_learning_target_shift(
+        q_values,
+        q_lower=-2.0,
+        alpha=0.5,
+        clip_ratio=0.9,
+    )
+    np.testing.assert_array_equal(
+        constant_active,
+        np.ones_like(q_values, dtype=bool),
+    )
+    np.testing.assert_allclose(
+        constant_shift,
+        [[0.0, -0.05, -0.5, -1.0]],
+        atol=1e-7,
+    )
+    np.testing.assert_array_equal(
+        clipped_active,
+        [[True, True, False, False]],
+    )
+    np.testing.assert_allclose(
+        clipped_shift,
+        [[0.0, -0.05, 0.0, 0.0]],
+        atol=1e-7,
+    )
+
+
+def test_dense_advantage_target_is_default_identical_and_zero_label_invariant():
+    rng = np.random.default_rng(29)
+    all_logits = jnp.asarray(
+        rng.normal(size=(2, 2, 3, 5, 11)),
+        dtype=jnp.float32,
+    )
+    support = jnp.linspace(-2.0, 2.0, 11)
+    positive_target = categorical_point_mass(
+        jnp.full((2, 2, 3), 0.7, dtype=jnp.float32),
+        support,
+    )
+    action_a = jnp.zeros((2, 2, 3), dtype=jnp.int32)
+    action_b = jnp.full((2, 2, 3), 4, dtype=jnp.int32)
+
+    legacy = dense_return_distributional_loss(
+        all_logits,
+        action_a,
+        positive_target,
+        support,
+        0.0,
+    )
+    explicit_zero = dense_return_distributional_loss(
+        all_logits,
+        action_a,
+        positive_target,
+        support,
+        0.0,
+        advantage_alpha=0.0,
+    )
+    for left, right in zip(legacy, explicit_zero, strict=True):
+        np.testing.assert_array_equal(left, right)
+
+    zero_target = categorical_point_mass(
+        jnp.zeros((2, 2, 3), dtype=jnp.float32),
+        support,
+    )
+
+    def loss(logits, action):
+        return dense_return_distributional_loss(
+            logits,
+            action,
+            zero_target,
+            support,
+            0.0,
+            advantage_alpha=0.5,
+        )[0].sum()
+
+    value_a, grad_a = jax.value_and_grad(loss)(all_logits, action_a)
+    value_b, grad_b = jax.value_and_grad(loss)(all_logits, action_b)
+    np.testing.assert_allclose(value_a, value_b, atol=1e-7)
+    np.testing.assert_allclose(grad_a, grad_b, atol=1e-7)
+
+    def clipped_loss(logits, action):
+        return dense_return_distributional_loss(
+            logits,
+            action,
+            zero_target,
+            support,
+            0.0,
+            advantage_alpha=0.5,
+            advantage_clip_ratio=0.9,
+        )[0].sum()
+
+    clipped_value_a, clipped_grad_a = jax.value_and_grad(clipped_loss)(
+        all_logits,
+        action_a,
+    )
+    clipped_value_b, clipped_grad_b = jax.value_and_grad(clipped_loss)(
+        all_logits,
+        action_b,
+    )
+    np.testing.assert_allclose(clipped_value_a, clipped_value_b, atol=1e-7)
+    np.testing.assert_allclose(clipped_grad_a, clipped_grad_b, atol=1e-7)
+
+
+def test_cqn_as_dense_advantage_is_one_demo_agnostic_q_update():
+    observation_space, action_space = _spaces()
+    cfg = _strict_demo_rl_cfg(
+        "method.dense_return_q_target=true",
+        "method.dense_return_expected_q_loss=false",
+        "method.dense_return_advantage_alpha=0.5",
+        "method.dense_return_finest_neighbor_weight=0.0",
+        "method.unseen_return_floor_weight=0.0",
+        "method.mc_lower_bound_target=true",
+        "method.weight_decay=0.0",
+    )
+    demo_agent = create_agent(
+        cfg,
+        observation_space=observation_space,
+        action_space=action_space,
+    )
+    online_agent = create_agent(
+        cfg,
+        observation_space=observation_space,
+        action_space=action_space,
+    )
+    assert demo_agent.dense_return_advantage_alpha == pytest.approx(0.5)
+    assert "policy" not in demo_agent.params
+    assert "policy_encoder" not in demo_agent.params
+    assert "flow_policy" not in demo_agent.params
+
+    demo_batch = _batch()
+    demo_batch["reward"][:] = 0.0
+    demo_batch["mc_return"] = np.linspace(0.2, 0.8, 4).astype(np.float32)
+    online_batch = {
+        key: np.array(value, copy=True) for key, value in demo_batch.items()
+    }
+    online_batch["demo"][:] = 0
+    demo_agent.logging = True
+    online_agent.logging = True
+    demo_metrics = demo_agent.update(iter([demo_batch]), step=1)
+    online_metrics = online_agent.update(iter([online_batch]), step=1)
+
+    demo_leaves, demo_tree = jax.tree.flatten(demo_agent.params)
+    online_leaves, online_tree = jax.tree.flatten(online_agent.params)
+    assert demo_tree == online_tree
+    for demo_value, online_value in zip(
+        demo_leaves,
+        online_leaves,
+        strict=True,
+    ):
+        np.testing.assert_array_equal(demo_value, online_value)
+    assert demo_metrics["dense_return_advantage_alpha"] == pytest.approx(0.5)
+    assert demo_metrics["dense_return_q_loss"] == pytest.approx(
+        demo_metrics["critic_loss"]
+    )
+    assert "policy_bc_loss" not in demo_metrics
+    assert "mc_return_loss" not in demo_metrics
+    assert "unseen_return_floor_loss" not in demo_metrics
+    demo_metrics.pop("backend/update_time_sec")
+    online_metrics.pop("backend/update_time_sec")
+    assert demo_metrics == pytest.approx(online_metrics)
+
+
+def test_cqn_as_clipped_advantage_is_one_demo_agnostic_q_update():
+    observation_space, action_space = _spaces()
+    cfg = _strict_demo_rl_cfg(
+        "method.dense_return_q_target=true",
+        "method.dense_return_expected_q_loss=false",
+        "method.dense_return_advantage_alpha=0.5",
+        "method.dense_return_advantage_clip_ratio=0.9",
+        "method.dense_return_finest_neighbor_weight=0.0",
+        "method.unseen_return_floor_weight=0.0",
+        "method.mc_lower_bound_target=true",
+        "method.weight_decay=0.0",
+    )
+    demo_agent = create_agent(
+        cfg,
+        observation_space=observation_space,
+        action_space=action_space,
+    )
+    online_agent = create_agent(
+        cfg,
+        observation_space=observation_space,
+        action_space=action_space,
+    )
+    demo_batch = _batch()
+    demo_batch["reward"][:] = 0.0
+    demo_batch["mc_return"] = np.linspace(0.2, 0.8, 4).astype(np.float32)
+    online_batch = {
+        key: np.array(value, copy=True) for key, value in demo_batch.items()
+    }
+    online_batch["demo"][:] = 0
+    demo_agent.logging = True
+    online_agent.logging = True
+    demo_metrics = demo_agent.update(iter([demo_batch]), step=1)
+    online_metrics = online_agent.update(iter([online_batch]), step=1)
+
+    demo_leaves, demo_tree = jax.tree.flatten(demo_agent.params)
+    online_leaves, online_tree = jax.tree.flatten(online_agent.params)
+    assert demo_tree == online_tree
+    for demo_value, online_value in zip(
+        demo_leaves,
+        online_leaves,
+        strict=True,
+    ):
+        np.testing.assert_array_equal(demo_value, online_value)
+    assert demo_metrics["dense_return_advantage_alpha"] == pytest.approx(0.5)
+    assert demo_metrics[
+        "dense_return_advantage_clip_ratio"
+    ] == pytest.approx(0.9)
+    assert demo_metrics["dense_return_q_loss"] == pytest.approx(
+        demo_metrics["critic_loss"]
+    )
+    assert "policy_bc_loss" not in demo_metrics
+    assert "mc_return_loss" not in demo_metrics
+    assert "unseen_return_floor_loss" not in demo_metrics
+    demo_metrics.pop("backend/update_time_sec")
+    online_metrics.pop("backend/update_time_sec")
+    assert demo_metrics == pytest.approx(online_metrics)
+
+
+def test_cqn_as_dense_advantage_rejects_incompatible_modes():
+    with pytest.raises(
+        ValueError,
+        match=r"dense_return_advantage_alpha must be in \[0, 1\)",
+    ):
+        create_agent(
+            _strict_demo_rl_cfg("method.dense_return_advantage_alpha=1.0"),
+            observation_space=_spaces()[0],
+            action_space=_spaces()[1],
+        )
+    with pytest.raises(
+        ValueError,
+        match="requires dense_return_q_target=true",
+    ):
+        create_agent(
+            _strict_demo_rl_cfg("method.dense_return_advantage_alpha=0.5"),
+            observation_space=_spaces()[0],
+            action_space=_spaces()[1],
+        )
+    with pytest.raises(
+        ValueError,
+        match="requires dense_return_expected_q_loss=false",
+    ):
+        create_agent(
+            _strict_demo_rl_cfg(
+                "method.dense_return_q_target=true",
+                "method.dense_return_expected_q_loss=true",
+                "method.dense_return_advantage_alpha=0.5",
+                "method.unseen_return_floor_weight=0.0",
+            ),
+            observation_space=_spaces()[0],
+            action_space=_spaces()[1],
+        )
+    with pytest.raises(
+        ValueError,
+        match=r"dense_return_advantage_clip_ratio must be in \(0, 1\)",
+    ):
+        create_agent(
+            _strict_demo_rl_cfg(
+                "method.dense_return_q_target=true",
+                "method.dense_return_advantage_alpha=0.5",
+                "method.dense_return_advantage_clip_ratio=1.0",
+                "method.unseen_return_floor_weight=0.0",
+            ),
+            observation_space=_spaces()[0],
+            action_space=_spaces()[1],
+        )
+    with pytest.raises(
+        ValueError,
+        match="requires dense_return_advantage_alpha > 0",
+    ):
+        create_agent(
+            _strict_demo_rl_cfg(
+                "method.dense_return_q_target=true",
+                "method.dense_return_advantage_clip_ratio=0.9",
+                "method.unseen_return_floor_weight=0.0",
+            ),
+            observation_space=_spaces()[0],
+            action_space=_spaces()[1],
+        )
+
+
+def test_cqn_as_replay_sarsa_is_one_demo_agnostic_q_update():
+    observation_space, action_space = _spaces()
+    cfg = _strict_demo_rl_cfg(
+        "method.dense_return_q_target=true",
+        "method.dense_return_finest_neighbor_weight=0.0",
+        "method.unseen_return_floor_weight=0.0",
+        "method.mc_lower_bound_target=true",
+        "method.td_target_action_source=replay_next",
+        "method.weight_decay=0.0",
+    )
+    demo_agent = create_agent(
+        cfg,
+        observation_space=observation_space,
+        action_space=action_space,
+    )
+    online_agent = create_agent(
+        cfg,
+        observation_space=observation_space,
+        action_space=action_space,
+    )
+    assert demo_agent.td_target_action_source == "replay_next"
+    assert not demo_agent.separate_bc_policy
+    assert "policy" not in demo_agent.params
+    assert "policy_encoder" not in demo_agent.params
+    assert "flow_policy" not in demo_agent.params
+
+    demo_batch = _batch()
+    selected_action, selected_info = (
+        demo_agent._td_target_action_for_update(
+            demo_agent.params["critic"],
+            None,
+            jnp.asarray(demo_batch["action"]),
+            jnp.asarray(demo_batch["action"]),
+            jnp.asarray(demo_batch["demo"]),
+            jax.random.PRNGKey(0),
+        )
+    )
+    np.testing.assert_array_equal(
+        selected_action,
+        shift_replay_action_sequence(
+            jnp.asarray(demo_batch["action"]),
+            demo_agent.action_sequence,
+            demo_agent.action_dim,
+        ),
+    )
+    assert selected_info == {}
+
+    hook_calls = {"count": 0}
+    original_target_action = demo_agent._td_target_action_for_update
+
+    def counted_target_action(*args, **kwargs):
+        hook_calls["count"] += 1
+        return original_target_action(*args, **kwargs)
+
+    demo_agent._td_target_action_for_update = counted_target_action
+    demo_agent._update_impl = demo_agent._build_update_fn()
+    demo_batch["reward"][:] = 0.0
+    demo_batch["mc_return"] = np.linspace(0.2, 0.8, 4).astype(np.float32)
+    online_batch = {
+        key: np.array(value, copy=True) for key, value in demo_batch.items()
+    }
+    online_batch["demo"][:] = 0
+    demo_agent.logging = True
+    online_agent.logging = True
+    demo_metrics = demo_agent.update(iter([demo_batch]), step=1)
+    online_metrics = online_agent.update(iter([online_batch]), step=1)
+    assert hook_calls["count"] == 1
+
+    demo_leaves, demo_tree = jax.tree.flatten(demo_agent.params)
+    online_leaves, online_tree = jax.tree.flatten(online_agent.params)
+    assert demo_tree == online_tree
+    for demo_value, online_value in zip(
+        demo_leaves,
+        online_leaves,
+        strict=True,
+    ):
+        np.testing.assert_array_equal(demo_value, online_value)
+    assert demo_metrics["dense_return_q_loss"] == pytest.approx(
+        demo_metrics["critic_loss"]
+    )
+    assert "policy_bc_loss" not in demo_metrics
+    assert "mc_return_loss" not in demo_metrics
+    assert "unseen_return_floor_loss" not in demo_metrics
+    assert demo_metrics["td_target_replay_next"] == pytest.approx(1.0)
+    demo_metrics.pop("backend/update_time_sec")
+    online_metrics.pop("backend/update_time_sec")
+    assert demo_metrics == pytest.approx(online_metrics)
+
+
+def test_cqn_as_candidate_backup_selects_true_next_chunk_by_deepest_q():
+    observation_space, action_space = _spaces()
+    cfg = _strict_demo_rl_cfg(
+        "replay.include_next_action=true",
+        "method.td_target_action_source=critic_replay_max",
+        "method.weight_decay=0.0",
+    )
+    agent = create_agent(
+        cfg,
+        observation_space=observation_space,
+        action_space=action_space,
+    )
+    batch_size = 3
+    greedy = jnp.zeros(
+        (batch_size, agent.action_sequence, agent.action_dim),
+        dtype=jnp.float32,
+    )
+    behavior = jnp.arange(
+        batch_size * agent.action_sequence * agent.action_dim,
+        dtype=jnp.float32,
+    ).reshape(greedy.shape)
+    score_calls = {"count": 0}
+
+    def fake_greedy(*_args, **_kwargs):
+        return greedy, {}
+
+    def fake_score(*_args, **_kwargs):
+        score_calls["count"] += 1
+        if score_calls["count"] == 1:
+            return jnp.asarray([0.2, 0.8, 0.5], dtype=jnp.float32)
+        return jnp.asarray([0.3, 0.7, 0.5], dtype=jnp.float32)
+
+    agent._greedy_action_for_update = fake_greedy
+    agent._score_action_sequence_for_backup = fake_score
+    selected, info = agent._td_target_action_for_update(
+        agent.params["critic"],
+        None,
+        jnp.zeros_like(behavior),
+        behavior,
+        jnp.zeros((batch_size,), dtype=jnp.float32),
+        jax.random.PRNGKey(0),
+    )
+
+    np.testing.assert_array_equal(selected[0], behavior[0])
+    np.testing.assert_array_equal(selected[1], greedy[1])
+    np.testing.assert_array_equal(selected[2], behavior[2])
+    np.testing.assert_array_equal(
+        info["behavior_selected"],
+        [True, False, True],
+    )
+    np.testing.assert_allclose(
+        info["behavior_score"] - info["greedy_score"],
+        [0.1, -0.1, 0.0],
+        atol=1e-7,
+    )
+
+
+def test_cqn_as_demo_trajectory_force_overrides_only_demo_candidates():
+    observation_space, action_space = _spaces()
+    cfg = _strict_demo_rl_cfg(
+        "replay.include_next_action=true",
+        "method.td_target_action_source=critic_replay_max",
+        "method.demo_behavior_force_probability=1.0",
+        "method.weight_decay=0.0",
+    )
+    agent = create_agent(
+        cfg,
+        observation_space=observation_space,
+        action_space=action_space,
+    )
+    batch_size = 3
+    greedy = jnp.zeros(
+        (batch_size, agent.action_sequence, agent.action_dim),
+        dtype=jnp.float32,
+    )
+    behavior = jnp.ones_like(greedy)
+    score_calls = {"count": 0}
+
+    def fake_greedy(*_args, **_kwargs):
+        return greedy, {}
+
+    def fake_score(*_args, **_kwargs):
+        score_calls["count"] += 1
+        if score_calls["count"] == 1:
+            return jnp.full((batch_size,), 0.8, dtype=jnp.float32)
+        return jnp.full((batch_size,), 0.2, dtype=jnp.float32)
+
+    agent._greedy_action_for_update = fake_greedy
+    agent._score_action_sequence_for_backup = fake_score
+    demos = jnp.asarray([1.0, 0.0, 1.0], dtype=jnp.float32)
+    selected, info = agent._td_target_action_for_update(
+        agent.params["critic"],
+        None,
+        jnp.zeros_like(behavior),
+        behavior,
+        demos,
+        jax.random.PRNGKey(7),
+    )
+
+    np.testing.assert_array_equal(selected[0], behavior[0])
+    np.testing.assert_array_equal(selected[1], greedy[1])
+    np.testing.assert_array_equal(selected[2], behavior[2])
+    np.testing.assert_array_equal(
+        info["demo_behavior_forced"],
+        [True, False, True],
+    )
+    np.testing.assert_array_equal(
+        info["behavior_selected"],
+        [True, False, True],
+    )
+
+
+def test_cqn_as_demo_trajectory_force_remains_one_reward_q_loss():
+    observation_space, action_space = _spaces()
+    agent = create_agent(
+        _strict_demo_rl_cfg(
+            "replay.include_next_action=true",
+            "method.td_target_action_source=critic_replay_max",
+            "method.demo_behavior_force_probability=1.0",
+            "method.dense_return_q_target=true",
+            "method.unseen_return_floor_weight=0.0",
+            "method.mc_lower_bound_target=true",
+            "method.weight_decay=0.0",
+        ),
+        observation_space=observation_space,
+        action_space=action_space,
+    )
+    batch = _batch()
+    batch["action_tp1"] = np.roll(batch["action"], shift=-1, axis=1)
+    batch["demo"] = np.asarray([1.0, 0.0, 1.0, 0.0], dtype=np.float32)
+    batch["mc_return"] = np.linspace(0.2, 0.8, 4).astype(np.float32)
+    agent.logging = True
+    metrics = agent.update(iter([batch]), step=1)
+
+    assert metrics["critic_loss"] == pytest.approx(
+        metrics["dense_return_q_loss"]
+    )
+    assert metrics["demo_behavior_force_probability"] == pytest.approx(1.0)
+    assert metrics["demo_behavior_force_fraction"] == pytest.approx(0.5)
+    assert "policy" not in agent.params
+    assert "flow_policy" not in agent.params
+    assert "policy_bc_loss" not in metrics
+    assert "mc_return_loss" not in metrics
+
+
+def test_cqn_as_demo_trajectory_force_requires_candidate_backup():
+    with pytest.raises(
+        ValueError,
+        match="demo_behavior_force_probability > 0 requires",
+    ):
+        create_agent(
+            _strict_demo_rl_cfg(
+                "method.demo_behavior_force_probability=1.0"
+            ),
+            observation_space=_spaces()[0],
+            action_space=_spaces()[1],
+        )
+
+
+def test_cqn_as_candidate_score_uses_only_deepest_level_mean():
+    observation_space, action_space = _spaces()
+    agent = create_agent(
+        _strict_demo_rl_cfg("method.weight_decay=0.0"),
+        observation_space=observation_space,
+        action_space=action_space,
+    )
+    batch_size = 2
+    flat_dim = agent.action_sequence * agent.action_dim
+    logits = jnp.full(
+        (
+            batch_size,
+            agent.levels,
+            flat_dim,
+            agent.atoms,
+        ),
+        -30.0,
+        dtype=jnp.float32,
+    )
+    # Earlier levels deliberately prefer the largest support atom. The
+    # deepest level identifies the expected scores that must be returned.
+    logits = logits.at[:, :-1, :, -1].set(30.0)
+    deepest_atoms = (2, agent.atoms - 3)
+    for row, atom in enumerate(deepest_atoms):
+        logits = logits.at[row, -1, :, atom].set(30.0)
+
+    def fake_logits(*_args, **_kwargs):
+        return logits, None
+
+    agent._critic_logits_per_level = fake_logits
+    scores = agent._score_action_sequence_for_backup(
+        agent.params["critic"],
+        jnp.zeros((batch_size, 5), dtype=jnp.float32),
+        jnp.zeros(
+            (batch_size, agent.action_sequence, agent.action_dim),
+            dtype=jnp.float32,
+        ),
+    )
+    np.testing.assert_allclose(
+        scores,
+        np.asarray(agent.support)[list(deepest_atoms)],
+        atol=1e-6,
+    )
+
+
+def test_cqn_as_candidate_backup_is_one_demo_agnostic_q_update():
+    observation_space, action_space = _spaces()
+    cfg = _strict_demo_rl_cfg(
+        "replay.include_next_action=true",
+        "method.td_target_action_source=critic_replay_max",
+        "method.dense_return_q_target=true",
+        "method.unseen_return_floor_weight=0.0",
+        "method.mc_lower_bound_target=true",
+        "method.weight_decay=0.0",
+    )
+    demo_agent = create_agent(
+        cfg,
+        observation_space=observation_space,
+        action_space=action_space,
+    )
+    online_agent = create_agent(
+        cfg,
+        observation_space=observation_space,
+        action_space=action_space,
+    )
+    assert demo_agent.td_target_action_source == "critic_replay_max"
+    assert "policy" not in demo_agent.params
+    assert "flow_policy" not in demo_agent.params
+
+    demo_batch = _batch()
+    demo_batch["action_tp1"] = np.roll(
+        demo_batch["action"],
+        shift=-1,
+        axis=1,
+    )
+    demo_batch["mc_return"] = np.linspace(0.2, 0.8, 4).astype(np.float32)
+    online_batch = {
+        key: np.array(value, copy=True) for key, value in demo_batch.items()
+    }
+    online_batch["demo"][:] = 0
+    demo_agent.logging = True
+    online_agent.logging = True
+    demo_metrics = demo_agent.update(iter([demo_batch]), step=1)
+    online_metrics = online_agent.update(iter([online_batch]), step=1)
+
+    demo_leaves, demo_tree = jax.tree.flatten(demo_agent.params)
+    online_leaves, online_tree = jax.tree.flatten(online_agent.params)
+    assert demo_tree == online_tree
+    for demo_value, online_value in zip(
+        demo_leaves,
+        online_leaves,
+        strict=True,
+    ):
+        np.testing.assert_array_equal(demo_value, online_value)
+    assert demo_metrics["dense_return_q_loss"] == pytest.approx(
+        demo_metrics["critic_loss"]
+    )
+    assert 0.0 <= demo_metrics["behavior_candidate_fraction"] <= 1.0
+    assert np.isfinite(demo_metrics["behavior_minus_greedy_q"])
+    assert "policy_bc_loss" not in demo_metrics
+    assert "mc_return_loss" not in demo_metrics
+    assert "unseen_return_floor_loss" not in demo_metrics
+    demo_metrics.pop("backend/update_time_sec")
+    online_metrics.pop("backend/update_time_sec")
+    assert demo_metrics == pytest.approx(online_metrics)
+
+
+def test_cqn_as_candidate_backup_requires_next_action_replay():
+    with pytest.raises(
+        ValueError,
+        match="replay.include_next_action must be true",
+    ):
+        create_agent(
+            _strict_demo_rl_cfg(
+                "method.td_target_action_source=critic_replay_max"
+            ),
+            observation_space=_spaces()[0],
+            action_space=_spaces()[1],
+        )
+
+
+def test_cqn_as_sequence_aligned_return_is_one_demo_agnostic_q_update():
+    observation_space, action_space = _spaces()
+    cfg = _strict_demo_rl_cfg(
+        "method.dense_return_q_target=true",
+        "method.dense_return_finest_neighbor_weight=0.0",
+        "method.unseen_return_floor_weight=0.0",
+        "method.mc_lower_bound_target=true",
+        "method.sequence_aligned_mc_discount=0.99",
+        "method.weight_decay=0.0",
+    )
+    demo_agent = create_agent(
+        cfg,
+        observation_space=observation_space,
+        action_space=action_space,
+    )
+    online_agent = create_agent(
+        cfg,
+        observation_space=observation_space,
+        action_space=action_space,
+    )
+    assert demo_agent.sequence_aligned_mc_discount == pytest.approx(0.99)
+    assert "policy" not in demo_agent.params
+    assert "flow_policy" not in demo_agent.params
+
+    demo_batch = _batch()
+    demo_batch["reward"][:] = 0.0
+    demo_batch["mc_return"] = np.asarray(
+        [0.0, 0.2, 0.4, 0.8],
+        dtype=np.float32,
+    )
+    online_batch = {
+        key: np.array(value, copy=True) for key, value in demo_batch.items()
+    }
+    online_batch["demo"][:] = 0
+    demo_agent.logging = True
+    online_agent.logging = True
+    demo_metrics = demo_agent.update(iter([demo_batch]), step=1)
+    online_metrics = online_agent.update(iter([online_batch]), step=1)
+
+    demo_leaves, demo_tree = jax.tree.flatten(demo_agent.params)
+    online_leaves, online_tree = jax.tree.flatten(online_agent.params)
+    assert demo_tree == online_tree
+    for demo_value, online_value in zip(
+        demo_leaves,
+        online_leaves,
+        strict=True,
+    ):
+        np.testing.assert_array_equal(demo_value, online_value)
+    assert demo_metrics["sequence_aligned_mc_return_mean"] > np.mean(
+        demo_batch["mc_return"]
+    )
+    assert demo_metrics["dense_return_q_loss"] == pytest.approx(
+        demo_metrics["critic_loss"]
+    )
+    assert "mc_return_loss" not in demo_metrics
+    assert "unseen_return_floor_loss" not in demo_metrics
+    demo_metrics.pop("backend/update_time_sec")
+    online_metrics.pop("backend/update_time_sec")
+    assert demo_metrics == pytest.approx(online_metrics)
+
+
+def test_cqn_as_sequence_aligned_return_requires_full_sequence_q():
+    with pytest.raises(
+        ValueError,
+        match="requires critic_sequence_mode=full",
+    ):
+        create_agent(
+            _strict_demo_rl_cfg(
+                "method.dense_return_q_target=true",
+                "method.unseen_return_floor_weight=0.0",
+                "method.mc_lower_bound_target=true",
+                "method.sequence_aligned_mc_discount=0.99",
+                "method.critic_sequence_mode=effective_k0",
+            ),
+            observation_space=_spaces()[0],
+            action_space=_spaces()[1],
+        )
+
+
+def test_cqn_as_episodic_success_q_is_reward_gated_and_demo_agnostic():
+    observation_space, action_space = _spaces()
+    cfg = _strict_demo_rl_cfg(
+        "method.dense_return_q_target=true",
+        "method.episodic_success_q_target=true",
+        "method.mc_lower_bound_target=false",
+        "method.unseen_return_floor_weight=0.0",
+        "method.weight_decay=0.0",
+    )
+    demo_agent = create_agent(
+        cfg,
+        observation_space=observation_space,
+        action_space=action_space,
+    )
+    online_agent = create_agent(
+        cfg,
+        observation_space=observation_space,
+        action_space=action_space,
+    )
+    assert demo_agent.episodic_success_q_target
+    assert demo_agent._uses_canonical_mc_returns
+    assert not demo_agent.mc_lower_bound_target
+    assert _mc_return_anchor_enabled(cfg)
+    assert "policy" not in demo_agent.params
+    assert "flow_policy" not in demo_agent.params
+
+    demo_batch = _batch()
+    demo_batch["reward"][:] = 0.0
+    demo_batch["mc_return"] = np.asarray(
+        [0.0, 0.2, 0.8, 0.0],
+        dtype=np.float32,
+    )
+    online_batch = {
+        key: np.array(value, copy=True) for key, value in demo_batch.items()
+    }
+    online_batch["demo"][:] = 0
+    demo_agent.logging = True
+    online_agent.logging = True
+    demo_metrics = demo_agent.update(iter([demo_batch]), step=1)
+    online_metrics = online_agent.update(iter([online_batch]), step=1)
+
+    demo_leaves, demo_tree = jax.tree.flatten(demo_agent.params)
+    online_leaves, online_tree = jax.tree.flatten(online_agent.params)
+    assert demo_tree == online_tree
+    for demo_value, online_value in zip(
+        demo_leaves,
+        online_leaves,
+        strict=True,
+    ):
+        np.testing.assert_array_equal(demo_value, online_value)
+    assert demo_metrics["episodic_success_fraction"] == pytest.approx(0.5)
+    assert demo_metrics["dense_return_q_loss"] == pytest.approx(
+        demo_metrics["critic_loss"]
+    )
+    assert "mc_lower_bound_fraction" not in demo_metrics
+    assert "mc_return_loss" not in demo_metrics
+    assert "unseen_return_floor_loss" not in demo_metrics
+    demo_metrics.pop("backend/update_time_sec")
+    online_metrics.pop("backend/update_time_sec")
+    assert demo_metrics == pytest.approx(online_metrics)
+
+
+def test_cqn_as_episodic_success_q_rejects_a_second_mc_target():
+    with pytest.raises(
+        ValueError,
+        match="replaces the discounted MC-lower-bound",
+    ):
+        create_agent(
+            _strict_demo_rl_cfg(
+                "method.dense_return_q_target=true",
+                "method.episodic_success_q_target=true",
+                "method.mc_lower_bound_target=true",
+                "method.unseen_return_floor_weight=0.0",
+            ),
+            observation_space=_spaces()[0],
+            action_space=_spaces()[1],
+        )
+
+
+def test_cqn_as_ordered_success_q_is_one_demo_agnostic_target():
+    observation_space, action_space = _spaces()
+    cfg = _strict_demo_rl_cfg(
+        "method.dense_return_q_target=true",
+        "method.episodic_success_q_target=false",
+        "method.mc_lower_bound_target=true",
+        "method.ordered_success_return_mix=0.5",
+        "method.unseen_return_floor_weight=0.0",
+        "method.weight_decay=0.0",
+    )
+    demo_agent = create_agent(
+        cfg,
+        observation_space=observation_space,
+        action_space=action_space,
+    )
+    online_agent = create_agent(
+        cfg,
+        observation_space=observation_space,
+        action_space=action_space,
+    )
+    assert demo_agent.ordered_success_return_mix == pytest.approx(0.5)
+    assert demo_agent.mc_lower_bound_target
+    assert "policy" not in demo_agent.params
+    assert "flow_policy" not in demo_agent.params
+
+    demo_batch = _batch()
+    demo_batch["reward"][:] = 0.0
+    demo_batch["mc_return"] = np.asarray(
+        [0.0, 0.2, 0.8, 0.0],
+        dtype=np.float32,
+    )
+    online_batch = {
+        key: np.array(value, copy=True) for key, value in demo_batch.items()
+    }
+    online_batch["demo"][:] = 0
+    demo_agent.logging = True
+    online_agent.logging = True
+    demo_metrics = demo_agent.update(iter([demo_batch]), step=1)
+    online_metrics = online_agent.update(iter([online_batch]), step=1)
+
+    demo_leaves, demo_tree = jax.tree.flatten(demo_agent.params)
+    online_leaves, online_tree = jax.tree.flatten(online_agent.params)
+    assert demo_tree == online_tree
+    for demo_value, online_value in zip(
+        demo_leaves,
+        online_leaves,
+        strict=True,
+    ):
+        np.testing.assert_array_equal(demo_value, online_value)
+    assert demo_metrics["ordered_success_return_mean"] == pytest.approx(
+        0.375
+    )
+    assert demo_metrics["dense_return_q_loss"] == pytest.approx(
+        demo_metrics["critic_loss"]
+    )
+    assert "mc_return_loss" not in demo_metrics
+    assert "episodic_success_fraction" not in demo_metrics
+    demo_metrics.pop("backend/update_time_sec")
+    online_metrics.pop("backend/update_time_sec")
+    assert demo_metrics == pytest.approx(online_metrics)
+
+
+def test_cqn_as_ordered_success_q_requires_mc_lower_bound():
+    with pytest.raises(
+        ValueError,
+        match="requires mc_lower_bound_target=true",
+    ):
+        create_agent(
+            _strict_demo_rl_cfg(
+                "method.dense_return_q_target=true",
+                "method.mc_lower_bound_target=false",
+                "method.ordered_success_return_mix=0.5",
+                "method.unseen_return_floor_weight=0.0",
+            ),
+            observation_space=_spaces()[0],
+            action_space=_spaces()[1],
+        )
 
 
 @pytest.mark.parametrize(
@@ -1459,7 +3393,7 @@ def test_cqn_as_strict_demo_rl_ignores_demo_identity_and_has_no_policy():
         "method.demo_fosd=true",
         "method.separate_bc_policy=true",
         "method.flow_policy=true",
-        "num_pretrain_steps=1",
+        "method.td_target_action_source=bc_policy",
         "use_self_imitation=true",
     ],
 )
@@ -1470,6 +3404,1008 @@ def test_cqn_as_strict_demo_rl_rejects_imitation_paths(override):
             observation_space=_spaces()[0],
             action_space=_spaces()[1],
         )
+
+
+def test_cqn_as_strict_demo_rl_allows_reward_only_offline_critic_updates():
+    agent = create_agent(
+        _strict_demo_rl_cfg(
+            "num_pretrain_steps=10",
+            "method.dense_return_q_target=false",
+            "method.mc_lower_bound_target=true",
+            "method.unseen_return_floor_weight=0",
+            "method.td_target_action_source=critic_replay_max",
+            "replay.include_next_action=true",
+        ),
+        observation_space=_spaces()[0],
+        action_space=_spaces()[1],
+    )
+
+    assert agent.strict_demo_rl_only
+    assert agent.bc_lambda == 0.0
+    assert agent.bc_margin == 0.0
+    assert not agent.separate_bc_policy
+    assert agent.mc_lower_bound_target
+    assert agent.td_target_action_source == "critic_replay_max"
+
+
+def test_cqn_as_strict_demo_rl_explicitly_allows_reward_only_success_replay():
+    agent = create_agent(
+        _strict_demo_rl_cfg(
+            "use_self_imitation=true",
+            "method.strict_allow_reward_only_success_replay=true",
+        ),
+        observation_space=_spaces()[0],
+        action_space=_spaces()[1],
+    )
+
+    assert agent.strict_demo_rl_only
+    assert agent.bc_lambda == 0.0
+    assert agent.bc_margin == 0.0
+    assert not agent.demo_fosd
+
+
+def test_cqn_as_stage30_launch_is_canonical_reward_only_offline_rl():
+    GlobalHydra.instance().clear()
+    with initialize_config_dir(config_dir=CONFIG_DIR, version_base=None):
+        cfg = compose(
+            config_name="robobase_config",
+            overrides=[
+                "launch=cqn_as_pixel_bigym_nobc_stage30_offline_then_online_gate",
+                "env=bigym/move_plate",
+            ],
+        )
+
+    assert cfg.num_pretrain_steps == 10_000
+    assert cfg.method.strict_demo_rl_only
+    assert cfg.method.bc_lambda == 0.0
+    assert cfg.method.bc_margin == 0.0
+    assert not cfg.method.demo_fosd
+    assert not cfg.method.separate_bc_policy
+    assert not cfg.method.flow_policy
+    assert not cfg.method.dense_return_q_target
+    assert cfg.method.mc_lower_bound_target
+    assert cfg.method.td_target_action_source == "critic_replay_max"
+    assert cfg.replay.include_next_action
+
+
+def test_cqn_as_stage31_direct_head_changes_only_q_factorization():
+    configs = []
+    for launch in (
+        "cqn_as_pixel_bigym_nobc_stage30_offline_then_online_gate",
+        "cqn_as_pixel_bigym_nobc_stage31_offline_direct_head_gate",
+    ):
+        GlobalHydra.instance().clear()
+        with initialize_config_dir(config_dir=CONFIG_DIR, version_base=None):
+            configs.append(
+                compose(
+                    config_name="robobase_config",
+                    overrides=[f"launch={launch}", "env=bigym/move_plate"],
+                )
+            )
+
+    dueling, direct = configs
+    assert dueling.method.use_dueling
+    assert not direct.method.use_dueling
+    assert not direct.method.mc_return_value_only
+    for key in (
+        "strict_demo_rl_only",
+        "bc_lambda",
+        "bc_margin",
+        "demo_fosd",
+        "dense_return_q_target",
+        "mc_lower_bound_target",
+        "td_target_action_source",
+        "demo_behavior_force_probability",
+    ):
+        assert direct.method[key] == dueling.method[key]
+    assert direct.num_pretrain_steps == dueling.num_pretrain_steps == 10_000
+    assert direct.replay.include_next_action == dueling.replay.include_next_action
+
+
+def test_cqn_as_stage31_direct_head_runs_reward_only_update():
+    cfg = _strict_demo_rl_cfg(
+        "method.use_dueling=false",
+        "method.mc_return_value_only=false",
+        "method.mc_lower_bound_target=true",
+        "method.td_target_action_source=critic_replay_max",
+        "replay.include_next_action=true",
+    )
+    agent = create_agent(
+        cfg,
+        observation_space=_spaces()[0],
+        action_space=_spaces()[1],
+    )
+    flat_critic = flatten_dict(agent.params["critic"])
+    assert not any("value_head" in part for key in flat_critic for part in key)
+
+    batch = _batch()
+    batch["action_tp1"] = np.roll(batch["action"], shift=-1, axis=1)
+    batch["mc_return"] = np.linspace(0.2, 0.8, 4).astype(np.float32)
+    agent.logging = True
+    metrics = agent.update(iter([batch]), step=1)
+
+    assert np.isfinite(metrics["critic_loss"])
+    assert "bc_loss" not in metrics
+
+
+def test_pessimistic_categorical_q_requires_both_critics_to_be_high():
+    support = jnp.asarray([-1.0, 0.0, 1.0], dtype=jnp.float32)
+    logits1 = jnp.asarray(
+        [[[[-8.0, -8.0, 8.0], [-8.0, 8.0, -8.0]]]],
+        dtype=jnp.float32,
+    )
+    logits2 = jnp.asarray(
+        [[[[8.0, -8.0, -8.0], [-8.0, 8.0, -8.0]]]],
+        dtype=jnp.float32,
+    )
+
+    q = pessimistic_categorical_q(logits1, logits2, support)
+
+    assert int(jnp.argmax(q, axis=-1)[0, 0]) == 1
+    assert float(q[0, 0, 0]) < -0.99
+    assert abs(float(q[0, 0, 1])) < 1e-6
+
+
+@pytest.mark.parametrize("jit", [False, True])
+def test_cqn_as_pessimistic_twin_runs_one_reward_only_update_and_act(jit):
+    cfg = _strict_demo_rl_cfg(
+        f"backend.jit={str(jit).lower()}",
+        "method.use_dueling=false",
+        "method.pessimistic_twin_critic=true",
+        "method.mc_return_value_only=false",
+        "method.mc_lower_bound_target=true",
+        "method.td_target_action_source=critic_replay_max",
+        "replay.include_next_action=true",
+        "method.weight_decay=0.0",
+        "method.unseen_return_floor_weight=0.0",
+    )
+    observation_space, action_space = _spaces()
+    agent = create_agent(
+        cfg,
+        observation_space=observation_space,
+        action_space=action_space,
+    )
+    assert "critic2" in agent.params
+    assert isinstance(agent.target_critic_params, tuple)
+    first = flatten_dict(agent.params["critic"])
+    second = flatten_dict(agent.params["critic2"])
+    assert any(
+        not np.array_equal(np.asarray(first[key]), np.asarray(second[key]))
+        for key in first
+        if key[-1] == "kernel" and first[key].size > 1
+    )
+    critic1_before = jax.tree.map(np.asarray, agent.params["critic"])
+    critic2_before = jax.tree.map(np.asarray, agent.params["critic2"])
+    batch = _batch()
+    batch["action_tp1"] = np.roll(batch["action"], shift=-1, axis=1)
+    batch["mc_return"] = np.linspace(0.2, 0.8, 4).astype(np.float32)
+    agent.logging = True
+
+    metrics = agent.update(iter([batch]), step=1)
+
+    assert _tree_changed(critic1_before, agent.params["critic"])
+    assert _tree_changed(critic2_before, agent.params["critic2"])
+    assert np.isfinite(metrics["critic_loss"])
+    assert np.isfinite(metrics["twin_q_disagreement"])
+    assert metrics["demo_behavior_force_fraction"] == pytest.approx(0.0)
+    assert "bc_loss" not in metrics
+    observations = {
+        "low_dim_state": np.zeros((1, 1, 5), dtype=np.float32),
+    }
+    action = agent.act(observations, step=3000, eval_mode=True)
+    assert np.all(np.isfinite(np.asarray(action)))
+
+    # Both learned critics, both target critics, and the matching optimizer
+    # state must survive the offline -> online workspace resume boundary.
+    state = agent.state_dict()
+    checkpoint_state = agent.checkpoint_state_dict()
+    restored = create_agent(
+        cfg,
+        observation_space=observation_space,
+        action_space=action_space,
+    )
+    restored.load_state_dict(state)
+    restored.load_checkpoint_state_dict(checkpoint_state)
+    assert isinstance(restored.target_critic_params, tuple)
+    for name in ("critic", "critic2"):
+        for left, right in zip(
+            jax.tree.leaves(agent.params[name]),
+            jax.tree.leaves(restored.params[name]),
+        ):
+            np.testing.assert_allclose(left, right)
+    for original_target, restored_target in zip(
+        agent.target_critic_params,
+        restored.target_critic_params,
+    ):
+        for left, right in zip(
+            jax.tree.leaves(original_target),
+            jax.tree.leaves(restored_target),
+        ):
+            np.testing.assert_allclose(left, right)
+    restored_action = restored.act(observations, step=3000, eval_mode=True)
+    assert np.all(np.isfinite(np.asarray(restored_action)))
+
+
+def test_cqn_as_pessimistic_twin_rejects_dueling_path():
+    with pytest.raises(ValueError, match="use_dueling=false"):
+        create_agent(
+            _strict_demo_rl_cfg(
+                "method.pessimistic_twin_critic=true",
+                "method.mc_lower_bound_target=true",
+                "method.td_target_action_source=critic_replay_max",
+                "replay.include_next_action=true",
+                "method.unseen_return_floor_weight=0.0",
+            ),
+            observation_space=_spaces()[0],
+            action_space=_spaces()[1],
+        )
+
+
+@pytest.mark.parametrize("jit", [False, True])
+def test_cqn_as_auxiliary_td_is_normalized_reward_only_twin_update(jit):
+    cfg = _strict_demo_rl_cfg(
+        f"backend.jit={str(jit).lower()}",
+        "method.use_dueling=false",
+        "method.pessimistic_twin_critic=true",
+        "method.auxiliary_td_loss_weight=1.0",
+        "method.mc_return_value_only=false",
+        "method.mc_lower_bound_target=true",
+        "method.td_target_action_source=critic_replay_max",
+        "replay.nstep=1",
+        "replay.auxiliary_nstep=4",
+        "replay.include_tp1=true",
+        "replay.include_next_action=true",
+        "method.weight_decay=0.0",
+        "method.unseen_return_floor_weight=0.0",
+    )
+    observation_space, action_space = _spaces()
+    agent = create_agent(
+        cfg,
+        observation_space=observation_space,
+        action_space=action_space,
+    )
+    batch = _batch()
+    batch["action_tp1"] = np.roll(batch["action"], shift=-1, axis=1)
+    batch["low_dim_state_tp_aux"] = np.flip(
+        batch["low_dim_state_tp1"], axis=-1
+    ).copy()
+    batch["action_tp_aux"] = np.roll(batch["action"], shift=-2, axis=1)
+    batch["reward_aux"] = np.asarray([0.1, 0.2, 0.3, 0.4], dtype=np.float32)
+    batch["discount_aux"] = np.full(4, 0.99**4, dtype=np.float32)
+    batch["terminal_aux"] = np.zeros(4, dtype=bool)
+    batch["mc_return"] = np.asarray([0.2, 0.4, 0.6, 0.8], dtype=np.float32)
+    agent.logging = True
+
+    metrics = agent.update(iter([batch]), step=1)
+
+    assert np.isfinite(metrics["critic_loss"])
+    assert metrics["auxiliary_td_loss_weight"] == pytest.approx(1.0)
+    assert metrics["critic_loss"] == pytest.approx(
+        0.5
+        * (
+            metrics["one_step_critic_loss"]
+            + metrics["auxiliary_critic_loss"]
+        ),
+        rel=1e-5,
+    )
+    assert np.isfinite(metrics["auxiliary_behavior_minus_greedy_q"])
+    assert "bc_loss" not in metrics
+    assert "policy_bc_loss" not in metrics
+    assert "margin_loss" not in metrics
+    assert "mc_return_loss" not in metrics
+    assert "policy" not in agent.params
+    assert "flow_policy" not in agent.params
+
+
+def test_cqn_as_auxiliary_td_requires_complete_matched_replay_contract():
+    common = (
+        "method.use_dueling=false",
+        "method.pessimistic_twin_critic=true",
+        "method.auxiliary_td_loss_weight=1.0",
+        "method.mc_return_value_only=false",
+        "method.mc_lower_bound_target=true",
+        "method.td_target_action_source=critic_replay_max",
+        "replay.include_next_action=true",
+        "method.unseen_return_floor_weight=0.0",
+    )
+    with pytest.raises(ValueError, match="replay.auxiliary_nstep > 1"):
+        create_agent(
+            _strict_demo_rl_cfg(*common),
+            observation_space=_spaces()[0],
+            action_space=_spaces()[1],
+        )
+    with pytest.raises(ValueError, match="must be non-negative"):
+        create_agent(
+            _strict_demo_rl_cfg(
+                "method.auxiliary_td_loss_weight=-0.1"
+            ),
+            observation_space=_spaces()[0],
+            action_space=_spaces()[1],
+        )
+
+
+def test_cqn_as_stage32_launch_adds_only_pessimistic_twin():
+    configs = []
+    for launch in (
+        "cqn_as_pixel_bigym_nobc_stage31_offline_direct_head_gate",
+        "cqn_as_pixel_bigym_nobc_stage32_offline_pessimistic_twin_gate",
+    ):
+        GlobalHydra.instance().clear()
+        with initialize_config_dir(config_dir=CONFIG_DIR, version_base=None):
+            configs.append(
+                compose(
+                    config_name="robobase_config",
+                    overrides=[f"launch={launch}", "env=bigym/move_plate"],
+                )
+            )
+
+    direct, twin = configs
+    assert not direct.method.pessimistic_twin_critic
+    assert twin.method.pessimistic_twin_critic
+    assert not twin.method.use_dueling
+    assert twin.method.strict_demo_rl_only
+    assert twin.method.bc_lambda == 0.0
+    assert twin.method.bc_margin == 0.0
+    assert not twin.method.demo_fosd
+    assert twin.method.mc_lower_bound_target
+    assert twin.method.td_target_action_source == "critic_replay_max"
+    direct_values = flatten_dict(OmegaConf.to_container(direct, resolve=False))
+    twin_values = flatten_dict(OmegaConf.to_container(twin, resolve=False))
+    changed = {
+        ".".join(key)
+        for key in set(direct_values) | set(twin_values)
+        if direct_values.get(key) != twin_values.get(key)
+    }
+    assert changed == {"method.pessimistic_twin_critic"}
+
+
+def test_cqn_as_stage35_launches_differ_only_by_auxiliary_td_weight():
+    configs = []
+    for launch in (
+        "cqn_as_pixel_bigym_nobc_stage35_one_step_control",
+        "cqn_as_pixel_bigym_nobc_stage35_one_plus_four_gate",
+    ):
+        GlobalHydra.instance().clear()
+        with initialize_config_dir(config_dir=CONFIG_DIR, version_base=None):
+            configs.append(
+                compose(
+                    config_name="robobase_config",
+                    overrides=[f"launch={launch}", "env=bigym/move_plate"],
+                )
+            )
+
+    control, treatment = configs
+    for cfg in configs:
+        assert cfg.replay.nstep == 1
+        assert cfg.replay.auxiliary_nstep == 4
+        assert cfg.replay.include_tp1
+        assert cfg.replay.include_next_action
+        assert cfg.method.strict_demo_rl_only
+        assert cfg.method.pessimistic_twin_critic
+        assert not cfg.method.episodic_twin_head_exploration
+        assert cfg.method.twin_rollout_beam_width == 1
+        assert cfg.method.bc_lambda == 0.0
+        assert cfg.method.bc_margin == 0.0
+        assert not cfg.method.demo_fosd
+    assert control.method.auxiliary_td_loss_weight == 0.0
+    assert treatment.method.auxiliary_td_loss_weight == 1.0
+    control_values = flatten_dict(
+        OmegaConf.to_container(control, resolve=True)
+    )
+    treatment_values = flatten_dict(
+        OmegaConf.to_container(treatment, resolve=True)
+    )
+    changed = {
+        ".".join(key)
+        for key in set(control_values) | set(treatment_values)
+        if control_values.get(key) != treatment_values.get(key)
+    }
+    assert changed == {"method.auxiliary_td_loss_weight"}
+
+
+def test_cqn_as_stage36_uses_official_batch_and_isolates_reward_target():
+    configs = []
+    for launch in (
+        "cqn_as_pixel_bigym_stage36_offline_bc256_control",
+        "cqn_as_pixel_bigym_stage36_offline_nobc_candidate256_gate",
+    ):
+        GlobalHydra.instance().clear()
+        with initialize_config_dir(config_dir=CONFIG_DIR, version_base=None):
+            configs.append(
+                compose(
+                    config_name="robobase_config",
+                    overrides=[f"launch={launch}", "env=bigym/move_plate"],
+                )
+            )
+
+    control, treatment = configs
+    for cfg in configs:
+        assert cfg.batch_size == 256
+        assert cfg.demo_batch_size == 256
+        assert cfg.batch_size + cfg.demo_batch_size == 512
+        assert cfg.num_pretrain_steps == 10000
+        assert cfg.action_sequence == 16
+        assert cfg.replay.nstep == 1
+        assert cfg.method.critic_lr == pytest.approx(5e-5)
+        assert cfg.method.critic_target_tau == pytest.approx(0.02)
+        assert cfg.method.critic_lambda == pytest.approx(0.1)
+        assert cfg.method.use_dueling
+        assert not cfg.method.pessimistic_twin_critic
+        assert cfg.method.stddev_schedule == "0.01"
+        assert cfg.method.num_update_steps == 1
+        assert cfg.use_self_imitation
+
+    assert control.method.bc_lambda == pytest.approx(1.0)
+    assert control.method.bc_margin == pytest.approx(0.1)
+    assert control.method.demo_fosd
+    assert not control.method.strict_demo_rl_only
+    assert treatment.method.bc_lambda == 0.0
+    assert treatment.method.bc_margin == 0.0
+    assert not treatment.method.demo_fosd
+    assert treatment.method.strict_demo_rl_only
+    assert treatment.method.strict_allow_reward_only_success_replay
+    assert treatment.method.td_target_action_source == "critic_replay_max"
+    assert treatment.method.mc_lower_bound_target
+    assert treatment.replay.include_next_action
+
+    control_values = flatten_dict(OmegaConf.to_container(control, resolve=True))
+    treatment_values = flatten_dict(OmegaConf.to_container(treatment, resolve=True))
+    changed = {
+        ".".join(key)
+        for key in set(control_values) | set(treatment_values)
+        if control_values.get(key) != treatment_values.get(key)
+    }
+    assert changed == {
+        "method.bc_lambda",
+        "method.bc_margin",
+        "method.demo_fosd",
+        "method.mc_lower_bound_target",
+        "method.strict_allow_reward_only_success_replay",
+        "method.strict_demo_rl_only",
+        "method.td_target_action_source",
+        "replay.include_next_action",
+    }
+
+
+def test_cqn_as_stage38_adds_only_dense_reward_q_to_stage36_treatment():
+    configs = []
+    for launch in (
+        "cqn_as_pixel_bigym_stage36_offline_nobc_candidate256_gate",
+        "cqn_as_pixel_bigym_stage38_offline_nobc_dense256_gate",
+    ):
+        GlobalHydra.instance().clear()
+        with initialize_config_dir(config_dir=CONFIG_DIR, version_base=None):
+            configs.append(
+                compose(
+                    config_name="robobase_config",
+                    overrides=[f"launch={launch}", "env=bigym/move_plate"],
+                )
+            )
+
+    control, treatment = configs
+    for cfg in configs:
+        assert cfg.batch_size == 256
+        assert cfg.demo_batch_size == 256
+        assert cfg.num_pretrain_steps == 10000
+        assert cfg.action_sequence == 16
+        assert cfg.replay.nstep == 1
+        assert cfg.replay.include_next_action
+        assert cfg.method.critic_lambda == pytest.approx(0.1)
+        assert cfg.method.critic_lr == pytest.approx(5e-5)
+        assert cfg.method.critic_target_tau == pytest.approx(0.02)
+        assert cfg.method.use_dueling
+        assert not cfg.method.pessimistic_twin_critic
+        assert cfg.method.num_update_steps == 1
+        assert cfg.method.stddev_schedule == "0.01"
+        assert cfg.method.strict_demo_rl_only
+        assert cfg.method.strict_allow_reward_only_success_replay
+        assert cfg.method.bc_lambda == 0.0
+        assert cfg.method.bc_margin == 0.0
+        assert not cfg.method.demo_fosd
+        assert cfg.method.mc_lower_bound_target
+        assert cfg.method.td_target_action_source == "critic_replay_max"
+        assert cfg.method.unseen_return_floor_weight == 0.0
+        assert not cfg.method.separate_bc_policy
+        assert not cfg.method.flow_policy
+    assert not control.method.dense_return_q_target
+    assert treatment.method.dense_return_q_target
+
+    control_values = flatten_dict(OmegaConf.to_container(control, resolve=True))
+    treatment_values = flatten_dict(OmegaConf.to_container(treatment, resolve=True))
+    changed = {
+        ".".join(key)
+        for key in set(control_values) | set(treatment_values)
+        if control_values.get(key) != treatment_values.get(key)
+    }
+    assert changed == {"method.dense_return_q_target"}
+
+
+def test_cqn_as_stage40_online_handoff_changes_only_dense_target_from_stage38():
+    configs = []
+    for launch in (
+        "cqn_as_pixel_bigym_stage38_offline_nobc_dense256_gate",
+        "cqn_as_pixel_bigym_stage40_online_canonical_handoff_gate",
+    ):
+        GlobalHydra.instance().clear()
+        with initialize_config_dir(config_dir=CONFIG_DIR, version_base=None):
+            configs.append(
+                compose(
+                    config_name="robobase_config",
+                    overrides=[f"launch={launch}", "env=bigym/move_plate"],
+                )
+            )
+
+    offline_dense, online_canonical = configs
+    for cfg in configs:
+        assert cfg.batch_size == 256
+        assert cfg.demo_batch_size == 256
+        assert cfg.num_pretrain_steps == 10000
+        assert cfg.action_sequence == 16
+        assert cfg.replay.nstep == 1
+        assert cfg.replay.include_next_action
+        assert cfg.method.critic_lambda == pytest.approx(0.1)
+        assert cfg.method.critic_lr == pytest.approx(5e-5)
+        assert cfg.method.critic_target_tau == pytest.approx(0.02)
+        assert cfg.method.use_dueling
+        assert not cfg.method.pessimistic_twin_critic
+        assert cfg.method.num_update_steps == 1
+        assert cfg.method.stddev_schedule == "0.01"
+        assert cfg.method.strict_demo_rl_only
+        assert cfg.method.bc_lambda == 0.0
+        assert cfg.method.bc_margin == 0.0
+        assert not cfg.method.demo_fosd
+        assert cfg.method.mc_lower_bound_target
+        assert cfg.method.td_target_action_source == "critic_replay_max"
+    assert offline_dense.method.dense_return_q_target
+    assert not online_canonical.method.dense_return_q_target
+
+    dense_values = flatten_dict(
+        OmegaConf.to_container(offline_dense, resolve=True)
+    )
+    canonical_values = flatten_dict(
+        OmegaConf.to_container(online_canonical, resolve=True)
+    )
+    changed = {
+        ".".join(key)
+        for key in set(dense_values) | set(canonical_values)
+        if dense_values.get(key) != canonical_values.get(key)
+    }
+    assert changed == {"method.dense_return_q_target"}
+
+
+def test_cqn_as_stage41_handoff_changes_only_positive_return_gate_from_stage38():
+    configs = []
+    for launch in (
+        "cqn_as_pixel_bigym_stage38_offline_nobc_dense256_gate",
+        "cqn_as_pixel_bigym_stage41_online_positive_dense_handoff_gate",
+    ):
+        GlobalHydra.instance().clear()
+        with initialize_config_dir(config_dir=CONFIG_DIR, version_base=None):
+            configs.append(
+                compose(
+                    config_name="robobase_config",
+                    overrides=[f"launch={launch}", "env=bigym/move_plate"],
+                )
+            )
+
+    full_dense, positive_dense = configs
+    for cfg in configs:
+        assert cfg.batch_size == 256
+        assert cfg.demo_batch_size == 256
+        assert cfg.num_pretrain_steps == 10000
+        assert cfg.action_sequence == 16
+        assert cfg.replay.nstep == 1
+        assert cfg.method.critic_lambda == pytest.approx(0.1)
+        assert cfg.method.critic_lr == pytest.approx(5e-5)
+        assert cfg.method.critic_target_tau == pytest.approx(0.02)
+        assert cfg.method.num_update_steps == 1
+        assert cfg.method.stddev_schedule == "0.01"
+        assert cfg.method.strict_demo_rl_only
+        assert cfg.method.dense_return_q_target
+        assert cfg.method.bc_lambda == 0.0
+        assert cfg.method.bc_margin == 0.0
+        assert not cfg.method.demo_fosd
+        assert not cfg.method.separate_bc_policy
+        assert not cfg.method.flow_policy
+    assert not full_dense.method.dense_return_positive_only
+    assert positive_dense.method.dense_return_positive_only
+
+    control_values = flatten_dict(
+        OmegaConf.to_container(full_dense, resolve=True)
+    )
+    treatment_values = flatten_dict(
+        OmegaConf.to_container(positive_dense, resolve=True)
+    )
+    changed = {
+        ".".join(key)
+        for key in set(control_values) | set(treatment_values)
+        if control_values.get(key) != treatment_values.get(key)
+    }
+    assert changed == {"method.dense_return_positive_only"}
+
+
+def test_cqn_as_stage42_only_disables_success_relabeling_from_stage41():
+    configs = []
+    for launch in (
+        "cqn_as_pixel_bigym_stage41_online_positive_dense_handoff_gate",
+        "cqn_as_pixel_bigym_stage42_fixed_expert_replay_gate",
+    ):
+        GlobalHydra.instance().clear()
+        with initialize_config_dir(config_dir=CONFIG_DIR, version_base=None):
+            configs.append(
+                compose(
+                    config_name="robobase_config",
+                    overrides=[f"launch={launch}", "env=bigym/move_plate"],
+                )
+            )
+
+    growing, fixed = configs
+    for cfg in configs:
+        assert cfg.batch_size == 256
+        assert cfg.demo_batch_size == 256
+        assert cfg.num_pretrain_steps == 10000
+        assert cfg.action_sequence == 16
+        assert cfg.replay.nstep == 1
+        assert cfg.method.strict_demo_rl_only
+        assert cfg.method.dense_return_q_target
+        assert cfg.method.dense_return_positive_only
+        assert cfg.method.bc_lambda == 0.0
+        assert cfg.method.bc_margin == 0.0
+        assert not cfg.method.demo_fosd
+        assert not cfg.method.separate_bc_policy
+        assert not cfg.method.flow_policy
+    assert growing.use_self_imitation
+    assert growing.method.strict_allow_reward_only_success_replay
+    assert not fixed.use_self_imitation
+    assert not fixed.method.strict_allow_reward_only_success_replay
+
+    growing_values = flatten_dict(
+        OmegaConf.to_container(growing, resolve=True)
+    )
+    fixed_values = flatten_dict(OmegaConf.to_container(fixed, resolve=True))
+    changed = {
+        ".".join(key)
+        for key in set(growing_values) | set(fixed_values)
+        if growing_values.get(key) != fixed_values.get(key)
+    }
+    assert changed == {
+        "use_self_imitation",
+        "method.strict_allow_reward_only_success_replay",
+    }
+
+
+def test_cqn_as_stage39_changes_only_dense_positive_return_gate():
+    configs = []
+    for launch in (
+        "cqn_as_pixel_bigym_nobc_stage10_discounted_dense_control",
+        "cqn_as_pixel_bigym_nobc_stage39_positive_return_dense_gate",
+    ):
+        GlobalHydra.instance().clear()
+        with initialize_config_dir(config_dir=CONFIG_DIR, version_base=None):
+            configs.append(
+                compose(
+                    config_name="robobase_config",
+                    overrides=[f"launch={launch}", "env=bigym/move_plate"],
+                )
+            )
+
+    control, treatment = configs
+    for cfg in configs:
+        assert cfg.method.strict_demo_rl_only
+        assert cfg.method.dense_return_q_target
+        assert cfg.method.mc_lower_bound_target
+        assert cfg.method.bc_lambda == 0.0
+        assert cfg.method.bc_margin == 0.0
+        assert not cfg.method.demo_fosd
+        assert not cfg.method.separate_bc_policy
+        assert not cfg.method.flow_policy
+        assert cfg.method.unseen_return_floor_weight == 0.0
+    assert not control.method.dense_return_positive_only
+    assert treatment.method.dense_return_positive_only
+
+    control_values = flatten_dict(OmegaConf.to_container(control, resolve=True))
+    treatment_values = flatten_dict(OmegaConf.to_container(treatment, resolve=True))
+    changed = {
+        ".".join(key)
+        for key in set(control_values) | set(treatment_values)
+        if control_values.get(key) != treatment_values.get(key)
+    }
+    assert changed == {"method.dense_return_positive_only"}
+
+
+def test_select_episodic_twin_actions_keeps_each_environment_on_one_head():
+    action1 = jnp.zeros((3, 2, 2), dtype=jnp.float32)
+    action2 = jnp.ones((3, 2, 2), dtype=jnp.float32)
+
+    selected = select_episodic_twin_actions(
+        action1,
+        action2,
+        jnp.asarray([0, 1, 0]),
+    )
+
+    np.testing.assert_array_equal(np.asarray(selected[0]), 0.0)
+    np.testing.assert_array_equal(np.asarray(selected[1]), 1.0)
+    np.testing.assert_array_equal(np.asarray(selected[2]), 0.0)
+
+
+def test_top2_joint_beam_keeps_best_complete_assignments_jitted():
+    # Only parent zero is live. The exact best assignment uses every top-1
+    # bin; the runner-up flips either of the two equal-regret first factors.
+    q_values = jnp.asarray(
+        [
+            [
+                [[10.0, 9.0, 0.0], [10.0, 9.0, 0.0], [10.0, 0.0, -1.0]],
+                [[0.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 0.0, 0.0]],
+            ]
+        ],
+        dtype=jnp.float32,
+    )
+    scores, parents, assignments = jax.jit(top2_joint_beam)(
+        jnp.asarray([[0.0, -jnp.inf]], dtype=jnp.float32),
+        q_values,
+    )
+    np.testing.assert_allclose(np.asarray(scores), [[10.0, 29.0 / 3.0]])
+    np.testing.assert_array_equal(np.asarray(parents), [[0, 0]])
+    np.testing.assert_array_equal(np.asarray(assignments[0, 0]), [0, 0, 0])
+    assert tuple(np.asarray(assignments[0, 1])) in {(1, 0, 0), (0, 1, 0)}
+
+
+def test_top2_joint_beam_rejects_invalid_shapes():
+    with pytest.raises(ValueError, match="shape"):
+        top2_joint_beam(jnp.zeros((1, 1)), jnp.zeros((1, 1, 3)))
+    with pytest.raises(ValueError, match="at least two bins"):
+        top2_joint_beam(jnp.zeros((1, 1)), jnp.zeros((1, 1, 3, 1)))
+
+
+def test_cqn_as_episodic_twin_head_is_stable_until_train_episode_reset():
+    cfg = _strict_demo_rl_cfg(
+        "num_train_envs=2",
+        "num_explore_steps=0",
+        "method.use_dueling=false",
+        "method.pessimistic_twin_critic=true",
+        "method.episodic_twin_head_exploration=true",
+        "method.mc_return_value_only=false",
+        "method.mc_lower_bound_target=true",
+        "method.td_target_action_source=critic_replay_max",
+        "replay.include_next_action=true",
+        "method.weight_decay=0.0",
+        "method.unseen_return_floor_weight=0.0",
+    )
+    observation_space, action_space = _spaces()
+    agent = create_agent(
+        cfg,
+        observation_space=observation_space,
+        action_space=action_space,
+    )
+    captured = []
+
+    def fake_action(
+        params,
+        target_critic_params,
+        obs_inputs,
+        use_target,
+        key,
+        twin_head_indices,
+    ):
+        del params, target_critic_params, obs_inputs, use_target, key
+        captured.append(np.asarray(twin_head_indices).copy())
+        return jnp.zeros((2, agent.action_sequence, agent.action_dim))
+
+    agent._greedy_action_impl = fake_action
+    observations = {
+        "low_dim_state": np.zeros((2, 1, 5), dtype=np.float32),
+    }
+    agent.act(observations, step=1, eval_mode=False)
+    first_heads = captured[-1].copy()
+    agent.act(observations, step=2, eval_mode=False)
+    np.testing.assert_array_equal(captured[-1], first_heads)
+    assert np.all(np.isin(first_heads, [0, 1]))
+
+    assignments_before = agent._episodic_twin_head_assignments.sum()
+    unchanged_head = int(agent._episodic_twin_heads[1])
+    agent.reset(step=3, agents_to_reset=[0])
+    assert agent._episodic_twin_head_assignments.sum() == assignments_before + 1
+    assert int(agent._episodic_twin_heads[1]) == unchanged_head
+    diagnostics = agent.rollout_diagnostics()
+    assert diagnostics["episodic_twin_head_assignments"] == 3.0
+    assert diagnostics["episodic_twin_head0_rate"] + diagnostics[
+        "episodic_twin_head1_rate"
+    ] == pytest.approx(1.0)
+
+
+def test_cqn_as_episodic_twin_head_runs_jitted_train_and_pessimistic_eval():
+    cfg = _strict_demo_rl_cfg(
+        "num_train_envs=2",
+        "num_explore_steps=0",
+        "backend.jit=true",
+        "method.use_dueling=false",
+        "method.pessimistic_twin_critic=true",
+        "method.episodic_twin_head_exploration=true",
+        "method.mc_return_value_only=false",
+        "method.mc_lower_bound_target=true",
+        "method.td_target_action_source=critic_replay_max",
+        "replay.include_next_action=true",
+        "method.weight_decay=0.0",
+        "method.unseen_return_floor_weight=0.0",
+    )
+    observation_space, action_space = _spaces()
+    agent = create_agent(
+        cfg,
+        observation_space=observation_space,
+        action_space=action_space,
+    )
+
+    train_action = agent.act(
+        {"low_dim_state": np.zeros((2, 1, 5), dtype=np.float32)},
+        step=1,
+        eval_mode=False,
+    )
+    assert np.all(np.isfinite(np.asarray(train_action)))
+    assert np.all(np.isin(agent._episodic_twin_heads, [0, 1]))
+
+    eval_action = agent.act(
+        {"low_dim_state": np.zeros((1, 1, 5), dtype=np.float32)},
+        step=1,
+        eval_mode=True,
+    )
+    assert np.asarray(eval_action).shape == (1, 3, 2)
+    assert np.all(np.isfinite(np.asarray(eval_action)))
+
+
+def test_cqn_as_joint_beam_runs_jitted_for_sampled_head_and_twin_eval():
+    cfg = _strict_demo_rl_cfg(
+        "num_train_envs=2",
+        "num_explore_steps=0",
+        "backend.jit=true",
+        "method.use_dueling=false",
+        "method.pessimistic_twin_critic=true",
+        "method.episodic_twin_head_exploration=true",
+        "method.twin_rollout_beam_width=3",
+        "method.mc_return_value_only=false",
+        "method.mc_lower_bound_target=true",
+        "method.td_target_action_source=critic_replay_max",
+        "replay.include_next_action=true",
+        "method.weight_decay=0.0",
+        "method.unseen_return_floor_weight=0.0",
+    )
+    observation_space, action_space = _spaces()
+    agent = create_agent(
+        cfg,
+        observation_space=observation_space,
+        action_space=action_space,
+    )
+    assert agent.twin_rollout_beam_width == 3
+
+    train_action = agent.act(
+        {"low_dim_state": np.zeros((2, 1, 5), dtype=np.float32)},
+        step=1,
+        eval_mode=False,
+    )
+    eval_action = agent.act(
+        {"low_dim_state": np.zeros((1, 1, 5), dtype=np.float32)},
+        step=1,
+        eval_mode=True,
+    )
+    for action in (train_action, eval_action):
+        assert np.all(np.isfinite(np.asarray(action)))
+        assert np.all(np.asarray(action) >= -1.0)
+        assert np.all(np.asarray(action) <= 1.0)
+
+
+def test_cqn_as_joint_beam_allows_single_critic_and_gates_twin_path():
+    observation_space, action_space = _spaces()
+    common = (
+        "method.use_dueling=false",
+        "method.mc_return_value_only=false",
+        "method.mc_lower_bound_target=true",
+        "method.td_target_action_source=critic_replay_max",
+        "replay.include_next_action=true",
+        "method.weight_decay=0.0",
+        "method.unseen_return_floor_weight=0.0",
+        "method.twin_rollout_beam_width=2",
+    )
+    single_critic = create_agent(
+        _strict_demo_rl_cfg(*common),
+        observation_space=observation_space,
+        action_space=action_space,
+    )
+    assert single_critic.twin_rollout_beam_width == 2
+    assert not single_critic.pessimistic_twin_critic
+    with pytest.raises(
+        ValueError, match="episodic_twin_head_exploration=true"
+    ):
+        create_agent(
+            _strict_demo_rl_cfg(
+                *common,
+                "method.pessimistic_twin_critic=true",
+            ),
+            observation_space=observation_space,
+            action_space=action_space,
+        )
+    with pytest.raises(ValueError, match="autoregressive_action_dims=false"):
+        create_agent(
+            _strict_demo_rl_cfg(
+                *common,
+                "method.pessimistic_twin_critic=true",
+                "method.episodic_twin_head_exploration=true",
+                "method.autoregressive_action_dims=true",
+            ),
+            observation_space=observation_space,
+            action_space=action_space,
+        )
+
+
+def test_cqn_as_stage33_launch_changes_only_online_exploration_policy():
+    configs = []
+    for launch in (
+        "cqn_as_pixel_bigym_nobc_stage32_offline_pessimistic_twin_gate",
+        "cqn_as_pixel_bigym_nobc_stage33_episodic_twin_explore_gate",
+    ):
+        GlobalHydra.instance().clear()
+        with initialize_config_dir(config_dir=CONFIG_DIR, version_base=None):
+            configs.append(
+                compose(
+                    config_name="robobase_config",
+                    overrides=[f"launch={launch}", "env=bigym/move_plate"],
+                )
+            )
+
+    baseline, exploration = configs
+    assert not baseline.method.episodic_twin_head_exploration
+    assert exploration.method.episodic_twin_head_exploration
+    assert exploration.method.pessimistic_twin_critic
+    assert exploration.method.strict_demo_rl_only
+    assert exploration.method.bc_lambda == 0.0
+    assert exploration.method.bc_margin == 0.0
+    assert not exploration.method.demo_fosd
+    baseline_values = flatten_dict(
+        OmegaConf.to_container(baseline, resolve=False)
+    )
+    exploration_values = flatten_dict(
+        OmegaConf.to_container(exploration, resolve=False)
+    )
+    changed = {
+        ".".join(key)
+        for key in set(baseline_values) | set(exploration_values)
+        if baseline_values.get(key) != exploration_values.get(key)
+    }
+    assert changed == {"method.episodic_twin_head_exploration"}
+
+
+def test_cqn_as_stage34_launch_changes_only_rollout_beam_width():
+    configs = []
+    for launch in (
+        "cqn_as_pixel_bigym_nobc_stage33_episodic_twin_explore_gate",
+        "cqn_as_pixel_bigym_nobc_stage34_joint_beam_gate",
+    ):
+        GlobalHydra.instance().clear()
+        with initialize_config_dir(config_dir=CONFIG_DIR, version_base=None):
+            configs.append(
+                compose(
+                    config_name="robobase_config",
+                    overrides=[f"launch={launch}", "env=bigym/move_plate"],
+                )
+            )
+
+    baseline, beam = configs
+    assert baseline.method.twin_rollout_beam_width == 1
+    assert beam.method.twin_rollout_beam_width == 8
+    assert beam.method.episodic_twin_head_exploration
+    assert beam.method.pessimistic_twin_critic
+    assert beam.method.strict_demo_rl_only
+    assert beam.method.bc_lambda == 0.0
+    assert beam.method.bc_margin == 0.0
+    assert not beam.method.demo_fosd
+    baseline_values = flatten_dict(
+        OmegaConf.to_container(baseline, resolve=False)
+    )
+    beam_values = flatten_dict(OmegaConf.to_container(beam, resolve=False))
+    changed = {
+        ".".join(key)
+        for key in set(baseline_values) | set(beam_values)
+        if baseline_values.get(key) != beam_values.get(key)
+    }
+    assert changed == {"method.twin_rollout_beam_width"}
 
 
 def test_cqn_as_no_bc_stage1_launches_are_strict_and_matched():
@@ -1505,6 +4441,992 @@ def test_cqn_as_no_bc_stage1_launches_are_strict_and_matched():
     assert treatment.method.unseen_return_floor_weight == 1.0
     assert control.num_eval_episodes == treatment.num_eval_episodes == 0
     assert control.snapshot_every_n == treatment.snapshot_every_n == 2500
+
+
+def test_cqn_as_no_bc_stage2_launches_complete_mc_floor_factorial():
+    configs = []
+    for launch in (
+        "cqn_as_pixel_bigym_nobc_mc_gate",
+        "cqn_as_pixel_bigym_nobc_mc_floor_gate",
+    ):
+        GlobalHydra.instance().clear()
+        with initialize_config_dir(config_dir=CONFIG_DIR, version_base=None):
+            configs.append(
+                compose(
+                    config_name="robobase_config",
+                    overrides=[
+                        f"launch={launch}",
+                        "env=bigym/move_plate",
+                    ],
+                )
+            )
+
+    mc_only, mc_floor = configs
+    for cfg in configs:
+        assert cfg.method.strict_demo_rl_only
+        assert cfg.method.mc_lower_bound_target
+        assert cfg.method.mc_return_weight == 0.0
+        assert cfg.method.bc_lambda == 0.0
+        assert cfg.method.bc_margin == 0.0
+        assert not cfg.method.demo_fosd
+        assert cfg.num_pretrain_steps == 0
+        assert not cfg.use_self_imitation
+    assert mc_only.method.unseen_return_floor_weight == 0.0
+    assert mc_floor.method.unseen_return_floor_weight == 1.0
+
+
+def test_cqn_as_no_bc_stage3_changes_only_unseen_floor_reduction():
+    configs = []
+    for launch in (
+        "cqn_as_pixel_bigym_nobc_mc_mean_floor_gate",
+        "cqn_as_pixel_bigym_nobc_mc_max_floor_gate",
+    ):
+        GlobalHydra.instance().clear()
+        with initialize_config_dir(config_dir=CONFIG_DIR, version_base=None):
+            configs.append(
+                compose(
+                    config_name="robobase_config",
+                    overrides=[
+                        f"launch={launch}",
+                        "env=bigym/move_plate",
+                    ],
+                )
+            )
+
+    mean_floor, max_floor = configs
+    for cfg in configs:
+        assert cfg.method.strict_demo_rl_only
+        assert cfg.method.mc_lower_bound_target
+        assert cfg.method.mc_return_weight == 0.0
+        assert cfg.method.unseen_return_floor_weight == 1.0
+        assert cfg.method.unseen_return_floor_value == 0.0
+        assert cfg.method.bc_lambda == 0.0
+        assert cfg.method.bc_margin == 0.0
+        assert not cfg.method.demo_fosd
+        assert cfg.num_pretrain_steps == 0
+        assert not cfg.use_self_imitation
+    assert mean_floor.method.unseen_return_floor_reduction == "mean"
+    assert max_floor.method.unseen_return_floor_reduction == "max"
+
+
+def test_cqn_as_no_bc_stage4_changes_only_conservative_tail_width():
+    configs = []
+    for launch in (
+        "cqn_as_pixel_bigym_nobc_mc_top1_floor_gate",
+        "cqn_as_pixel_bigym_nobc_mc_top2_floor_gate",
+    ):
+        GlobalHydra.instance().clear()
+        with initialize_config_dir(config_dir=CONFIG_DIR, version_base=None):
+            configs.append(
+                compose(
+                    config_name="robobase_config",
+                    overrides=[
+                        f"launch={launch}",
+                        "env=bigym/move_plate",
+                    ],
+                )
+            )
+
+    top1, top2 = configs
+    for cfg in configs:
+        assert cfg.method.strict_demo_rl_only
+        assert cfg.method.mc_lower_bound_target
+        assert cfg.method.mc_return_weight == 0.0
+        assert cfg.method.unseen_return_floor_weight == 1.0
+        assert cfg.method.unseen_return_floor_value == 0.0
+        assert cfg.method.bc_lambda == 0.0
+        assert cfg.method.bc_margin == 0.0
+        assert not cfg.method.demo_fosd
+        assert cfg.num_pretrain_steps == 0
+        assert not cfg.use_self_imitation
+    assert top1.method.unseen_return_floor_reduction == "max"
+    assert top1.method.unseen_return_floor_topk == 1
+    assert top2.method.unseen_return_floor_reduction == "topk"
+    assert top2.method.unseen_return_floor_topk == 2
+
+
+def test_cqn_as_no_bc_stage5_preserves_batch_size_and_changes_replay_source():
+    configs = []
+    for launch in (
+        "cqn_as_pixel_bigym_nobc_mc_mixed_replay_gate",
+        "cqn_as_pixel_bigym_nobc_mc_demo_only_gate",
+    ):
+        GlobalHydra.instance().clear()
+        with initialize_config_dir(config_dir=CONFIG_DIR, version_base=None):
+            configs.append(
+                compose(
+                    config_name="robobase_config",
+                    overrides=[
+                        f"launch={launch}",
+                        "env=bigym/move_plate",
+                    ],
+                )
+            )
+
+    mixed, demo_only = configs
+    for cfg in configs:
+        assert cfg.method.strict_demo_rl_only
+        assert cfg.method.mc_lower_bound_target
+        assert cfg.method.unseen_return_floor_reduction == "max"
+        assert cfg.method.unseen_return_floor_topk == 1
+        assert cfg.method.bc_lambda == 0.0
+        assert cfg.method.bc_margin == 0.0
+        assert cfg.num_pretrain_steps == 0
+        assert not cfg.use_self_imitation
+    assert mixed.batch_size + mixed.demo_batch_size == 32
+    assert not mixed.replay.demo_only_updates
+    assert demo_only.demo_batch_size == 32
+    assert demo_only.replay.demo_only_updates
+
+
+def test_cqn_as_no_bc_stage6_changes_only_action_dimension_factorization():
+    configs = []
+    for launch in (
+        "cqn_as_pixel_bigym_nobc_mc_parallel_dims_gate",
+        "cqn_as_pixel_bigym_nobc_mc_autoregressive_dims_gate",
+    ):
+        GlobalHydra.instance().clear()
+        with initialize_config_dir(config_dir=CONFIG_DIR, version_base=None):
+            configs.append(
+                compose(
+                    config_name="robobase_config",
+                    overrides=[
+                        f"launch={launch}",
+                        "env=bigym/move_plate",
+                    ],
+                )
+            )
+
+    parallel, autoregressive = configs
+    for cfg in configs:
+        assert cfg.method.strict_demo_rl_only
+        assert cfg.method.mc_lower_bound_target
+        assert cfg.method.unseen_return_floor_reduction == "max"
+        assert cfg.method.unseen_return_floor_topk == 1
+        assert cfg.method.bc_lambda == 0.0
+        assert cfg.method.bc_margin == 0.0
+        assert not cfg.method.demo_fosd
+        assert cfg.batch_size == 16
+        assert cfg.demo_batch_size == 16
+        assert not cfg.replay.demo_only_updates
+        assert cfg.num_pretrain_steps == 0
+        assert not cfg.use_self_imitation
+    assert not parallel.method.autoregressive_action_dims
+    assert autoregressive.method.autoregressive_action_dims
+
+
+def test_cqn_as_no_bc_stage7_changes_only_dense_return_objective():
+    configs = []
+    for launch in (
+        "cqn_as_pixel_bigym_nobc_mc_stage7_max_floor_gate",
+        "cqn_as_pixel_bigym_nobc_mc_stage7_dense_return_gate",
+    ):
+        GlobalHydra.instance().clear()
+        with initialize_config_dir(config_dir=CONFIG_DIR, version_base=None):
+            configs.append(
+                compose(
+                    config_name="robobase_config",
+                    overrides=[
+                        f"launch={launch}",
+                        "env=bigym/move_plate",
+                    ],
+                )
+            )
+
+    max_floor, dense_return = configs
+    for cfg in configs:
+        assert cfg.method.strict_demo_rl_only
+        assert cfg.method.mc_lower_bound_target
+        assert not cfg.method.autoregressive_action_dims
+        assert cfg.method.bc_lambda == 0.0
+        assert cfg.method.bc_margin == 0.0
+        assert not cfg.method.demo_fosd
+        assert cfg.batch_size == 16
+        assert cfg.demo_batch_size == 16
+        assert not cfg.replay.demo_only_updates
+        assert cfg.num_pretrain_steps == 0
+        assert not cfg.use_self_imitation
+    assert max_floor.method.unseen_return_floor_weight == 1.0
+    assert max_floor.method.unseen_return_floor_reduction == "max"
+    assert not max_floor.method.dense_return_q_target
+    assert dense_return.method.unseen_return_floor_weight == 0.0
+    assert dense_return.method.dense_return_q_target
+
+
+def test_cqn_as_no_bc_stage10_changes_only_return_target_mode():
+    configs = []
+    for launch in (
+        "cqn_as_pixel_bigym_nobc_stage10_discounted_dense_control",
+        "cqn_as_pixel_bigym_nobc_stage10_episodic_success_gate",
+    ):
+        GlobalHydra.instance().clear()
+        with initialize_config_dir(config_dir=CONFIG_DIR, version_base=None):
+            configs.append(
+                compose(
+                    config_name="robobase_config",
+                    overrides=[
+                        f"launch={launch}",
+                        "env=bigym/move_plate",
+                    ],
+                )
+            )
+
+    control, treatment = configs
+    for cfg in configs:
+        assert cfg.method.strict_demo_rl_only
+        assert cfg.method.dense_return_q_target
+        assert cfg.method.unseen_return_floor_weight == 0.0
+        assert cfg.method.unseen_return_floor_value == 0.0
+        assert cfg.method.bc_lambda == 0.0
+        assert cfg.method.bc_margin == 0.0
+        assert not cfg.method.demo_fosd
+        assert not cfg.method.separate_bc_policy
+        assert not cfg.method.flow_policy
+        assert not cfg.method.coarse_flow
+        assert cfg.batch_size == 16
+        assert cfg.demo_batch_size == 16
+        assert not cfg.replay.demo_only_updates
+        assert cfg.num_pretrain_steps == 0
+        assert not cfg.use_self_imitation
+    assert control.method.mc_lower_bound_target
+    assert not control.method.episodic_success_q_target
+    assert not treatment.method.mc_lower_bound_target
+    assert treatment.method.episodic_success_q_target
+
+
+def test_cqn_as_no_bc_stage11_is_ordered_single_q_target():
+    GlobalHydra.instance().clear()
+    with initialize_config_dir(config_dir=CONFIG_DIR, version_base=None):
+        cfg = compose(
+            config_name="robobase_config",
+            overrides=[
+                "launch=cqn_as_pixel_bigym_nobc_stage11_ordered_success_gate",
+                "env=bigym/move_plate",
+            ],
+        )
+
+    assert cfg.method.strict_demo_rl_only
+    assert cfg.method.dense_return_q_target
+    assert cfg.method.mc_lower_bound_target
+    assert not cfg.method.episodic_success_q_target
+    assert cfg.method.ordered_success_return_mix == pytest.approx(0.5)
+    assert cfg.method.unseen_return_floor_weight == 0.0
+    assert cfg.method.mc_return_weight == 0.0
+    assert cfg.method.bc_lambda == 0.0
+    assert cfg.method.bc_margin == 0.0
+    assert not cfg.method.demo_fosd
+    assert not cfg.method.separate_bc_policy
+    assert not cfg.method.flow_policy
+    assert not cfg.method.coarse_flow
+    assert cfg.batch_size == 16
+    assert cfg.demo_batch_size == 16
+    assert not cfg.replay.demo_only_updates
+    assert cfg.num_pretrain_steps == 0
+    assert not cfg.use_self_imitation
+
+
+def test_cqn_as_no_bc_stage12_changes_only_chunk_return_horizon():
+    configs = []
+    for launch in (
+        "cqn_as_pixel_bigym_nobc_stage12_k8_nstep1_control",
+        "cqn_as_pixel_bigym_nobc_stage12_k8_nstep8_gate",
+    ):
+        GlobalHydra.instance().clear()
+        with initialize_config_dir(config_dir=CONFIG_DIR, version_base=None):
+            configs.append(
+                compose(
+                    config_name="robobase_config",
+                    overrides=[
+                        f"launch={launch}",
+                        "env=bigym/move_plate",
+                    ],
+                )
+            )
+
+    control, treatment = configs
+    for cfg in configs:
+        assert cfg.action_sequence == 8
+        assert cfg.execution_length == 1
+        assert not cfg.temporal_ensemble
+        assert cfg.method.temporal_ensemble
+        assert cfg.method.temporal_ensemble_replan_interval == 8
+        assert cfg.method.strict_demo_rl_only
+        assert cfg.method.dense_return_q_target
+        assert cfg.method.mc_lower_bound_target
+        assert cfg.method.ordered_success_return_mix == 0.0
+        assert cfg.method.bc_lambda == 0.0
+        assert cfg.method.bc_margin == 0.0
+        assert not cfg.method.demo_fosd
+        assert not cfg.method.separate_bc_policy
+        assert not cfg.method.flow_policy
+        assert not cfg.method.coarse_flow
+        assert cfg.num_pretrain_steps == 0
+        assert not cfg.use_self_imitation
+    assert control.replay.nstep == 1
+    assert treatment.replay.nstep == treatment.action_sequence == 8
+
+    control_values = flatten_dict(
+        OmegaConf.to_container(control, resolve=False)
+    )
+    treatment_values = flatten_dict(
+        OmegaConf.to_container(treatment, resolve=False)
+    )
+    differences = {
+        key
+        for key in set(control_values) | set(treatment_values)
+        if control_values.get(key) != treatment_values.get(key)
+    }
+    assert differences == {("replay", "nstep")}
+
+
+def test_cqn_as_no_bc_stage13_changes_only_finest_neighbor_target():
+    configs = []
+    for launch in (
+        "cqn_as_pixel_bigym_nobc_stage10_discounted_dense_control",
+        "cqn_as_pixel_bigym_nobc_stage13_finest_neighbor_gate",
+    ):
+        GlobalHydra.instance().clear()
+        with initialize_config_dir(config_dir=CONFIG_DIR, version_base=None):
+            configs.append(
+                compose(
+                    config_name="robobase_config",
+                    overrides=[
+                        f"launch={launch}",
+                        "env=bigym/move_plate",
+                    ],
+                )
+            )
+
+    control, treatment = configs
+    for cfg in configs:
+        assert cfg.action_sequence == 16
+        assert cfg.replay.nstep == 1
+        assert cfg.method.temporal_ensemble
+        assert cfg.method.temporal_ensemble_replan_interval == 1
+        assert cfg.method.strict_demo_rl_only
+        assert cfg.method.dense_return_q_target
+        assert cfg.method.mc_lower_bound_target
+        assert cfg.method.ordered_success_return_mix == 0.0
+        assert cfg.method.unseen_return_floor_weight == 0.0
+        assert cfg.method.bc_lambda == 0.0
+        assert cfg.method.bc_margin == 0.0
+        assert not cfg.method.demo_fosd
+        assert not cfg.method.separate_bc_policy
+        assert not cfg.method.flow_policy
+        assert not cfg.method.coarse_flow
+        assert cfg.num_pretrain_steps == 0
+        assert not cfg.use_self_imitation
+    assert control.method.dense_return_finest_neighbor_weight == 0.0
+    assert treatment.method.dense_return_finest_neighbor_weight == pytest.approx(
+        0.5
+    )
+
+    control_values = flatten_dict(
+        OmegaConf.to_container(control, resolve=False)
+    )
+    treatment_values = flatten_dict(
+        OmegaConf.to_container(treatment, resolve=False)
+    )
+    differences = {
+        key
+        for key in set(control_values) | set(treatment_values)
+        if control_values.get(key) != treatment_values.get(key)
+    }
+    assert differences == {
+        ("method", "dense_return_finest_neighbor_weight")
+    }
+
+
+def test_cqn_as_no_bc_stage14_changes_only_to_executed_primitive_action():
+    configs = []
+    for launch in (
+        "cqn_as_pixel_bigym_nobc_stage10_discounted_dense_control",
+        "cqn_as_pixel_bigym_nobc_stage14_primitive_q_gate",
+    ):
+        GlobalHydra.instance().clear()
+        with initialize_config_dir(config_dir=CONFIG_DIR, version_base=None):
+            configs.append(
+                compose(
+                    config_name="robobase_config",
+                    overrides=[
+                        f"launch={launch}",
+                        "env=bigym/move_plate",
+                    ],
+                )
+            )
+
+    control, treatment = configs
+    for cfg in configs:
+        assert cfg.execution_length == 1
+        assert cfg.replay.nstep == 1
+        assert cfg.method.temporal_ensemble
+        assert cfg.method.temporal_ensemble_replan_interval == 1
+        assert cfg.method.strict_demo_rl_only
+        assert cfg.method.dense_return_q_target
+        assert cfg.method.dense_return_finest_neighbor_weight == 0.0
+        assert cfg.method.mc_lower_bound_target
+        assert cfg.method.ordered_success_return_mix == 0.0
+        assert cfg.method.unseen_return_floor_weight == 0.0
+        assert cfg.method.bc_lambda == 0.0
+        assert cfg.method.bc_margin == 0.0
+        assert not cfg.method.demo_fosd
+        assert not cfg.method.separate_bc_policy
+        assert not cfg.method.flow_policy
+        assert not cfg.method.coarse_flow
+        assert cfg.num_pretrain_steps == 0
+        assert not cfg.use_self_imitation
+    assert control.action_sequence == 16
+    assert treatment.action_sequence == 1
+
+    control_values = flatten_dict(
+        OmegaConf.to_container(control, resolve=False)
+    )
+    treatment_values = flatten_dict(
+        OmegaConf.to_container(treatment, resolve=False)
+    )
+    differences = {
+        key
+        for key in set(control_values) | set(treatment_values)
+        if control_values.get(key) != treatment_values.get(key)
+    }
+    assert differences == {("action_sequence",)}
+
+
+def test_cqn_as_primitive_dense_q_runs_one_strict_rl_update():
+    observation_space, action_space = _spaces(action_sequence=1)
+    cfg = _strict_demo_rl_cfg(
+        "action_sequence=1",
+        "method.dense_return_q_target=true",
+        "method.dense_return_finest_neighbor_weight=0.0",
+        "method.unseen_return_floor_weight=0.0",
+        "method.mc_lower_bound_target=true",
+        "method.weight_decay=0.0",
+    )
+    agent = create_agent(
+        cfg,
+        observation_space=observation_space,
+        action_space=action_space,
+    )
+    assert agent.action_sequence == 1
+    assert agent._flat_action_dim == agent.action_dim
+    assert "policy" not in agent.params
+    assert "flow_policy" not in agent.params
+    chunk = np.asarray([[[0.25, -0.5]]], dtype=np.float32)
+    np.testing.assert_allclose(
+        agent._ensemble_current_action(chunk, eval_mode=False),
+        chunk[:, 0],
+    )
+    np.testing.assert_array_equal(
+        agent._temporal_replan_mask(eval_mode=False, batch_size=1),
+        [True],
+    )
+
+    batch = _batch(action_sequence=1)
+    batch["reward"][:] = 0.0
+    batch["mc_return"] = np.linspace(0.2, 0.8, 4).astype(np.float32)
+    agent.logging = True
+    metrics = agent.update(iter([batch]), step=1)
+    assert np.isfinite(metrics["critic_loss"])
+    assert metrics["dense_return_q_loss"] == pytest.approx(
+        metrics["critic_loss"]
+    )
+    assert "mc_return_loss" not in metrics
+    assert "unseen_return_floor_loss" not in metrics
+
+
+@pytest.mark.parametrize(
+    "treatment_launch",
+    (
+        "cqn_as_pixel_bigym_nobc_stage15_replay_sarsa_gate",
+        "cqn_as_pixel_bigym_nobc_stage17_effective_replay_sarsa_gate",
+    ),
+)
+def test_cqn_as_no_bc_replay_sarsa_changes_only_bellman_action_source(
+    treatment_launch,
+):
+    configs = []
+    for launch in (
+        "cqn_as_pixel_bigym_nobc_stage10_discounted_dense_control",
+        treatment_launch,
+    ):
+        GlobalHydra.instance().clear()
+        with initialize_config_dir(config_dir=CONFIG_DIR, version_base=None):
+            configs.append(
+                compose(
+                    config_name="robobase_config",
+                    overrides=[
+                        f"launch={launch}",
+                        "env=bigym/move_plate",
+                    ],
+                )
+            )
+
+    control, treatment = configs
+    for cfg in configs:
+        assert cfg.action_sequence == 16
+        assert cfg.execution_length == 1
+        assert cfg.replay.nstep == 1
+        assert cfg.method.temporal_ensemble
+        assert cfg.method.temporal_ensemble_replan_interval == 1
+        assert cfg.method.critic_sequence_mode == "full"
+        assert cfg.method.strict_demo_rl_only
+        assert cfg.method.dense_return_q_target
+        assert cfg.method.dense_return_finest_neighbor_weight == 0.0
+        assert cfg.method.mc_lower_bound_target
+        assert cfg.method.ordered_success_return_mix == 0.0
+        assert cfg.method.unseen_return_floor_weight == 0.0
+        assert cfg.method.bc_lambda == 0.0
+        assert cfg.method.bc_margin == 0.0
+        assert not cfg.method.demo_fosd
+        assert not cfg.method.separate_bc_policy
+        assert not cfg.method.flow_policy
+        assert not cfg.method.coarse_flow
+        assert cfg.num_pretrain_steps == 0
+        assert not cfg.use_self_imitation
+    assert control.method.td_target_action_source == "critic"
+    assert treatment.method.td_target_action_source == "replay_next"
+
+    control_values = flatten_dict(
+        OmegaConf.to_container(control, resolve=False)
+    )
+    treatment_values = flatten_dict(
+        OmegaConf.to_container(treatment, resolve=False)
+    )
+    differences = {
+        key
+        for key in set(control_values) | set(treatment_values)
+        if control_values.get(key) != treatment_values.get(key)
+    }
+    assert differences == {("method", "td_target_action_source")}
+
+
+def test_cqn_as_no_bc_stage16_changes_only_sequence_return_alignment():
+    configs = []
+    for launch in (
+        "cqn_as_pixel_bigym_nobc_stage10_discounted_dense_control",
+        "cqn_as_pixel_bigym_nobc_stage16_sequence_return_gate",
+    ):
+        GlobalHydra.instance().clear()
+        with initialize_config_dir(config_dir=CONFIG_DIR, version_base=None):
+            configs.append(
+                compose(
+                    config_name="robobase_config",
+                    overrides=[
+                        f"launch={launch}",
+                        "env=bigym/move_plate",
+                    ],
+                )
+            )
+
+    control, treatment = configs
+    for cfg in configs:
+        assert cfg.action_sequence == 16
+        assert cfg.execution_length == 1
+        assert cfg.replay.nstep == 1
+        assert cfg.replay.gamma == pytest.approx(0.99)
+        assert cfg.method.temporal_ensemble
+        assert cfg.method.temporal_ensemble_replan_interval == 1
+        assert cfg.method.critic_sequence_mode == "full"
+        assert cfg.method.td_target_action_source == "critic"
+        assert cfg.method.strict_demo_rl_only
+        assert cfg.method.dense_return_q_target
+        assert cfg.method.dense_return_finest_neighbor_weight == 0.0
+        assert cfg.method.mc_lower_bound_target
+        assert cfg.method.ordered_success_return_mix == 0.0
+        assert cfg.method.unseen_return_floor_weight == 0.0
+        assert cfg.method.bc_lambda == 0.0
+        assert cfg.method.bc_margin == 0.0
+        assert not cfg.method.demo_fosd
+        assert not cfg.method.separate_bc_policy
+        assert not cfg.method.flow_policy
+        assert not cfg.method.coarse_flow
+        assert cfg.num_pretrain_steps == 0
+        assert not cfg.use_self_imitation
+    assert control.method.sequence_aligned_mc_discount is None
+    assert treatment.method.sequence_aligned_mc_discount == pytest.approx(
+        treatment.replay.gamma
+    )
+
+    control_values = flatten_dict(
+        OmegaConf.to_container(control, resolve=False)
+    )
+    treatment_values = flatten_dict(
+        OmegaConf.to_container(treatment, resolve=False)
+    )
+    differences = {
+        key
+        for key in set(control_values) | set(treatment_values)
+        if control_values.get(key) != treatment_values.get(key)
+    }
+    assert differences == {
+        ("method", "sequence_aligned_mc_discount")
+    }
+
+
+def test_cqn_as_no_bc_stage18_changes_only_dense_loss_statistic():
+    configs = []
+    for launch in (
+        "cqn_as_pixel_bigym_nobc_stage10_discounted_dense_control",
+        "cqn_as_pixel_bigym_nobc_stage18_expected_q_gate",
+    ):
+        GlobalHydra.instance().clear()
+        with initialize_config_dir(config_dir=CONFIG_DIR, version_base=None):
+            configs.append(
+                compose(
+                    config_name="robobase_config",
+                    overrides=[
+                        f"launch={launch}",
+                        "env=bigym/move_plate",
+                    ],
+                )
+            )
+
+    control, treatment = configs
+    for cfg in configs:
+        assert cfg.action_sequence == 16
+        assert cfg.execution_length == 1
+        assert cfg.replay.nstep == 1
+        assert cfg.method.temporal_ensemble
+        assert cfg.method.temporal_ensemble_replan_interval == 1
+        assert cfg.method.critic_sequence_mode == "full"
+        assert cfg.method.td_target_action_source == "critic"
+        assert cfg.method.strict_demo_rl_only
+        assert cfg.method.dense_return_q_target
+        assert cfg.method.dense_return_finest_neighbor_weight == 0.0
+        assert cfg.method.mc_lower_bound_target
+        assert cfg.method.ordered_success_return_mix == 0.0
+        assert cfg.method.sequence_aligned_mc_discount is None
+        assert cfg.method.unseen_return_floor_weight == 0.0
+        assert cfg.method.bc_lambda == 0.0
+        assert cfg.method.bc_margin == 0.0
+        assert not cfg.method.demo_fosd
+        assert not cfg.method.separate_bc_policy
+        assert not cfg.method.flow_policy
+        assert not cfg.method.coarse_flow
+        assert cfg.num_pretrain_steps == 0
+        assert not cfg.use_self_imitation
+    assert not control.method.dense_return_expected_q_loss
+    assert treatment.method.dense_return_expected_q_loss
+
+    control_values = flatten_dict(
+        OmegaConf.to_container(control, resolve=False)
+    )
+    treatment_values = flatten_dict(
+        OmegaConf.to_container(treatment, resolve=False)
+    )
+    differences = {
+        key
+        for key in set(control_values) | set(treatment_values)
+        if control_values.get(key) != treatment_values.get(key)
+    }
+    assert differences == {
+        ("method", "dense_return_expected_q_loss")
+    }
+
+
+def test_cqn_as_no_bc_stage19_changes_only_q_reward_scale():
+    configs = []
+    for launch in (
+        "cqn_as_pixel_bigym_nobc_stage10_discounted_dense_control",
+        "cqn_as_pixel_bigym_nobc_stage19_reward_scale_gate",
+    ):
+        GlobalHydra.instance().clear()
+        with initialize_config_dir(config_dir=CONFIG_DIR, version_base=None):
+            configs.append(
+                compose(
+                    config_name="robobase_config",
+                    overrides=[
+                        f"launch={launch}",
+                        "env=bigym/move_plate",
+                    ],
+                )
+            )
+
+    control, treatment = configs
+    for cfg in configs:
+        assert cfg.action_sequence == 16
+        assert cfg.execution_length == 1
+        assert cfg.replay.nstep == 1
+        assert cfg.method.temporal_ensemble
+        assert cfg.method.temporal_ensemble_replan_interval == 1
+        assert cfg.method.critic_sequence_mode == "full"
+        assert cfg.method.td_target_action_source == "critic"
+        assert cfg.method.strict_demo_rl_only
+        assert cfg.method.dense_return_q_target
+        assert not cfg.method.dense_return_expected_q_loss
+        assert cfg.method.dense_return_finest_neighbor_weight == 0.0
+        assert cfg.method.mc_lower_bound_target
+        assert cfg.method.ordered_success_return_mix == 0.0
+        assert cfg.method.sequence_aligned_mc_discount is None
+        assert cfg.method.unseen_return_floor_weight == 0.0
+        assert cfg.method.bc_lambda == 0.0
+        assert cfg.method.bc_margin == 0.0
+        assert not cfg.method.demo_fosd
+        assert not cfg.method.separate_bc_policy
+        assert not cfg.method.flow_policy
+        assert not cfg.method.coarse_flow
+        assert cfg.num_pretrain_steps == 0
+        assert not cfg.use_self_imitation
+    assert control.method.q_reward_scale == pytest.approx(1.0)
+    assert treatment.method.q_reward_scale == pytest.approx(2.0)
+    assert treatment.method.q_reward_scale == pytest.approx(
+        treatment.method.v_max
+    )
+
+    control_values = flatten_dict(
+        OmegaConf.to_container(control, resolve=False)
+    )
+    treatment_values = flatten_dict(
+        OmegaConf.to_container(treatment, resolve=False)
+    )
+    differences = {
+        key
+        for key in set(control_values) | set(treatment_values)
+        if control_values.get(key) != treatment_values.get(key)
+    }
+    assert differences == {("method", "q_reward_scale")}
+
+
+def test_cqn_as_no_bc_stage20_changes_only_advantage_gap_operator():
+    configs = []
+    for launch in (
+        "cqn_as_pixel_bigym_nobc_stage10_discounted_dense_control",
+        "cqn_as_pixel_bigym_nobc_stage20_advantage_gap_gate",
+    ):
+        GlobalHydra.instance().clear()
+        with initialize_config_dir(config_dir=CONFIG_DIR, version_base=None):
+            configs.append(
+                compose(
+                    config_name="robobase_config",
+                    overrides=[
+                        f"launch={launch}",
+                        "env=bigym/move_plate",
+                    ],
+                )
+            )
+
+    control, treatment = configs
+    for cfg in configs:
+        assert cfg.action_sequence == 16
+        assert cfg.execution_length == 1
+        assert cfg.replay.nstep == 1
+        assert cfg.method.temporal_ensemble
+        assert cfg.method.temporal_ensemble_replan_interval == 1
+        assert cfg.method.critic_sequence_mode == "full"
+        assert cfg.method.td_target_action_source == "critic"
+        assert cfg.method.strict_demo_rl_only
+        assert cfg.method.dense_return_q_target
+        assert not cfg.method.dense_return_expected_q_loss
+        assert cfg.method.dense_return_finest_neighbor_weight == 0.0
+        assert cfg.method.q_reward_scale == 1.0
+        assert cfg.method.mc_lower_bound_target
+        assert cfg.method.ordered_success_return_mix == 0.0
+        assert cfg.method.sequence_aligned_mc_discount is None
+        assert cfg.method.unseen_return_floor_weight == 0.0
+        assert cfg.method.bc_lambda == 0.0
+        assert cfg.method.bc_margin == 0.0
+        assert not cfg.method.demo_fosd
+        assert not cfg.method.separate_bc_policy
+        assert not cfg.method.flow_policy
+        assert not cfg.method.coarse_flow
+        assert cfg.num_pretrain_steps == 0
+        assert not cfg.use_self_imitation
+    assert control.method.dense_return_advantage_alpha == pytest.approx(0.0)
+    assert treatment.method.dense_return_advantage_alpha == pytest.approx(0.5)
+
+    control_values = flatten_dict(
+        OmegaConf.to_container(control, resolve=False)
+    )
+    treatment_values = flatten_dict(
+        OmegaConf.to_container(treatment, resolve=False)
+    )
+    differences = {
+        key
+        for key in set(control_values) | set(treatment_values)
+        if control_values.get(key) != treatment_values.get(key)
+    }
+    assert differences == {
+        ("method", "dense_return_advantage_alpha")
+    }
+
+
+def test_cqn_as_no_bc_stage21_changes_only_advantage_clipping():
+    configs = []
+    for launch in (
+        "cqn_as_pixel_bigym_nobc_stage20_advantage_gap_gate",
+        "cqn_as_pixel_bigym_nobc_stage21_clipped_advantage_gate",
+    ):
+        GlobalHydra.instance().clear()
+        with initialize_config_dir(config_dir=CONFIG_DIR, version_base=None):
+            configs.append(
+                compose(
+                    config_name="robobase_config",
+                    overrides=[
+                        f"launch={launch}",
+                        "env=bigym/move_plate",
+                    ],
+                )
+            )
+
+    constant, clipped = configs
+    for cfg in configs:
+        assert cfg.action_sequence == 16
+        assert cfg.execution_length == 1
+        assert cfg.replay.nstep == 1
+        assert cfg.method.temporal_ensemble
+        assert cfg.method.temporal_ensemble_replan_interval == 1
+        assert cfg.method.critic_sequence_mode == "full"
+        assert cfg.method.td_target_action_source == "critic"
+        assert cfg.method.strict_demo_rl_only
+        assert cfg.method.dense_return_q_target
+        assert not cfg.method.dense_return_expected_q_loss
+        assert cfg.method.dense_return_advantage_alpha == pytest.approx(0.5)
+        assert cfg.method.dense_return_finest_neighbor_weight == 0.0
+        assert cfg.method.q_reward_scale == 1.0
+        assert cfg.method.mc_lower_bound_target
+        assert cfg.method.unseen_return_floor_weight == 0.0
+        assert cfg.method.bc_lambda == 0.0
+        assert cfg.method.bc_margin == 0.0
+        assert not cfg.method.demo_fosd
+        assert not cfg.method.separate_bc_policy
+        assert not cfg.method.flow_policy
+        assert not cfg.method.coarse_flow
+        assert cfg.num_pretrain_steps == 0
+        assert not cfg.use_self_imitation
+    assert constant.method.dense_return_advantage_clip_ratio is None
+    assert clipped.method.dense_return_advantage_clip_ratio == pytest.approx(
+        0.9
+    )
+
+    constant_values = flatten_dict(
+        OmegaConf.to_container(constant, resolve=False)
+    )
+    clipped_values = flatten_dict(
+        OmegaConf.to_container(clipped, resolve=False)
+    )
+    differences = {
+        key
+        for key in set(constant_values) | set(clipped_values)
+        if constant_values.get(key) != clipped_values.get(key)
+    }
+    assert differences == {
+        ("method", "dense_return_advantage_clip_ratio")
+    }
+
+
+def test_cqn_as_no_bc_stage22_changes_only_to_replay_candidate_backup():
+    configs = []
+    for launch in (
+        "cqn_as_pixel_bigym_nobc_stage10_discounted_dense_control",
+        "cqn_as_pixel_bigym_nobc_stage22_demo_candidate_gate",
+    ):
+        GlobalHydra.instance().clear()
+        with initialize_config_dir(config_dir=CONFIG_DIR, version_base=None):
+            configs.append(
+                compose(
+                    config_name="robobase_config",
+                    overrides=[
+                        f"launch={launch}",
+                        "env=bigym/move_plate",
+                    ],
+                )
+            )
+
+    control, candidate = configs
+    for cfg in configs:
+        assert cfg.action_sequence == 16
+        assert cfg.execution_length == 1
+        assert cfg.replay.nstep == 1
+        assert cfg.method.temporal_ensemble
+        assert cfg.method.temporal_ensemble_replan_interval == 1
+        assert cfg.method.critic_sequence_mode == "full"
+        assert cfg.method.strict_demo_rl_only
+        assert cfg.method.dense_return_q_target
+        assert not cfg.method.dense_return_expected_q_loss
+        assert cfg.method.dense_return_advantage_alpha == 0.0
+        assert cfg.method.dense_return_advantage_clip_ratio is None
+        assert cfg.method.q_reward_scale == 1.0
+        assert cfg.method.mc_lower_bound_target
+        assert cfg.method.unseen_return_floor_weight == 0.0
+        assert cfg.method.bc_lambda == 0.0
+        assert cfg.method.bc_margin == 0.0
+        assert not cfg.method.demo_fosd
+        assert not cfg.method.separate_bc_policy
+        assert not cfg.method.flow_policy
+        assert not cfg.method.coarse_flow
+        assert cfg.num_pretrain_steps == 0
+        assert not cfg.use_self_imitation
+        assert cfg.batch_size == 16
+        assert cfg.demo_batch_size == 16
+        assert not cfg.replay.demo_only_updates
+        assert cfg.batch_size + cfg.demo_batch_size == 32
+    assert control.method.td_target_action_source == "critic"
+    assert not control.replay.include_next_action
+    assert candidate.method.td_target_action_source == "critic_replay_max"
+    assert candidate.replay.include_next_action
+
+    control_values = flatten_dict(
+        OmegaConf.to_container(control, resolve=False)
+    )
+    candidate_values = flatten_dict(
+        OmegaConf.to_container(candidate, resolve=False)
+    )
+    differences = {
+        key
+        for key in set(control_values) | set(candidate_values)
+        if control_values.get(key) != candidate_values.get(key)
+    }
+    assert differences == {
+        ("method", "td_target_action_source"),
+        ("replay", "include_next_action"),
+    }
+
+
+def test_cqn_as_stage26_phase_a_changes_only_demo_trajectory_force():
+    configs = []
+    for launch in (
+        "cqn_as_pixel_bigym_nobc_stage22_demo_candidate_gate",
+        "cqn_as_pixel_bigym_nobc_stage26_demo_trajectory_gate",
+    ):
+        GlobalHydra.instance().clear()
+        with initialize_config_dir(config_dir=CONFIG_DIR, version_base=None):
+            configs.append(
+                compose(
+                    config_name="robobase_config",
+                    overrides=[
+                        f"launch={launch}",
+                        "env=bigym/move_plate",
+                    ],
+                )
+            )
+
+    candidate, trajectory = configs
+    assert candidate.method.demo_behavior_force_probability == 0.0
+    assert trajectory.method.demo_behavior_force_probability == 1.0
+    assert trajectory.method.td_target_action_source == "critic_replay_max"
+    assert trajectory.replay.include_next_action
+    assert trajectory.method.strict_demo_rl_only
+    assert trajectory.method.critic_lambda == 1.0
+    assert trajectory.method.bc_lambda == 0.0
+    assert trajectory.method.bc_margin == 0.0
+    assert not trajectory.method.separate_bc_policy
+    assert trajectory.method.dense_return_q_target
+    assert trajectory.method.mc_lower_bound_target
+
+    candidate_values = flatten_dict(
+        OmegaConf.to_container(candidate, resolve=False)
+    )
+    trajectory_values = flatten_dict(
+        OmegaConf.to_container(trajectory, resolve=False)
+    )
+    differences = {
+        key
+        for key in set(candidate_values) | set(trajectory_values)
+        if candidate_values.get(key) != trajectory_values.get(key)
+    }
+    assert differences == {
+        ("method", "demo_behavior_force_probability")
+    }
 
 
 def test_cqn_as_stage147_gate_composes_clean_plus_anchor():

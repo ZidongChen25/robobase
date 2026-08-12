@@ -11,7 +11,11 @@ from gymnasium import spaces
 from omegaconf import DictConfig
 
 from robobase.language import lang_token_rows, tokens_to_feature_jax
-from robobase.method.bc import BCEncoderModelSpec, BCViewFusionModelSpec
+from robobase.method.bc import (
+    BCEncoderModelSpec,
+    BCViewFusionModelSpec,
+    legacy_resnet_encoder_impl,
+)
 from robobase.method.bc_runtime import bc_observation_layout
 from robobase.method.jax_base import JaxMethodBase
 from robobase.models.backbone import (
@@ -131,6 +135,7 @@ def diffusion_model_spec_from_cfg(cfg: DictConfig) -> DiffusionModelSpec:
             },
         )
         encoder_model_spec = BCEncoderModelSpec(
+            legacy_impl=legacy_resnet_encoder_impl(cfg),
             type=encoder_model_type,
             model=str(encoder_model_cfg.get("model", "resnet18")),
             trainable=bool(encoder_model_cfg.get("trainable", False)),
@@ -308,6 +313,10 @@ def _build_encoder_and_fusion(
                 )
         else:
             encoder_cls = JaxResNetEncoder
+            if getattr(model_spec.encoder_model, "legacy_impl", False):
+                from robobase.models.encoder import LegacyJaxResNetEncoder
+
+                encoder_cls = LegacyJaxResNetEncoder
             plucker_fusion_mode = normalize_plucker_fusion_mode(
                 model_spec.encoder_model.plucker_fusion_mode,
                 use_plucker=model_spec.encoder_model.use_plucker,
@@ -509,6 +518,11 @@ class Diffusion(JaxMethodBase):
         self.model_spec = model
         self.use_lang_cond = bool(model.use_lang_cond)
         self.lang_feature_dim = int(model.lang_feature_dim) if self.use_lang_cond else 0
+        # Pre-06a61d4 lang-conditioned checkpoints consumed real CLIP text
+        # embeddings; route them back (see language.clip_text_features_from_tokens).
+        self._legacy_clip_lang = bool(
+            getattr(getattr(model, "encoder_model", None), "legacy_impl", False)
+        )
         self._backbone_type = backbone_type
         self._condition_as_sequence = backbone_type == "transformer"
         self._condition_as_local = (
@@ -836,6 +850,15 @@ class Diffusion(JaxMethodBase):
         )
 
     def _encode_lang_tokens(self, tokens):
+        if getattr(self, "_legacy_clip_lang", False):
+            from robobase.language import clip_text_features_from_tokens
+
+            return self._as_jax_array(
+                clip_text_features_from_tokens(
+                    tokens, feature_dim=self.lang_feature_dim
+                ),
+                self.jnp.float32,
+            )
         return tokens_to_feature_jax(tokens, feature_dim=self.lang_feature_dim)
 
     def _extract_lang_features(self, batch_or_obs: dict):

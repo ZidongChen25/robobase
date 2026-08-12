@@ -1,0 +1,16 @@
+# @package _global_
+
+# Stage 18: regress only the expected return of the same dense all-bin
+# Bellman/MC Q target, avoiding full C51-shape fitting that control never uses.
+defaults:
+  - cqn_as_pixel_bigym_nobc_stage10_discounted_dense_control
+  - _self_
+
+method:
+  dense_return_expected_q_loss: true
+  dense_return_finest_neighbor_weight: 0.0
+  ordered_success_return_mix: 0.0
+
+hydra:
+  run:
+    dir: ./exp_local/cqn_no_bc/stage18_expected_q_${now:%Y%m%d%H%M%S}

@@ -1,0 +1,18 @@
+# @package _global_
+
+# Stage 20: optimality-preserving advantage-learning translation of the
+# existing dense categorical Q target.
+defaults:
+  - cqn_as_pixel_bigym_nobc_stage10_discounted_dense_control
+  - _self_
+
+method:
+  dense_return_advantage_alpha: 0.5
+  q_reward_scale: 1.0
+  dense_return_expected_q_loss: false
+  dense_return_finest_neighbor_weight: 0.0
+  ordered_success_return_mix: 0.0
+
+hydra:
+  run:
+    dir: ./exp_local/cqn_no_bc/stage20_advantage_gap_${now:%Y%m%d%H%M%S}

@@ -75,6 +75,10 @@ def rl_model_spec_from_cfg(cfg: DictConfig) -> RLModelSpec:
                 default="resnet",
                 target_to_type={
                     "robobase.models.encoder.JaxResNetEncoder": "resnet",
+                    "robobase.models.encoder.JaxDrQV2Encoder": "drqv2",
+                    "robobase.models.EncoderCNNMultiViewDownsampleWithStrides": (
+                        "drqv2"
+                    ),
                 },
             ),
             model=str(encoder_cfg.get("model", "resnet18")),
@@ -92,6 +96,22 @@ def rl_model_spec_from_cfg(cfg: DictConfig) -> RLModelSpec:
                 encoder_cfg.get("plucker_identity_init", False)
             ),
             plucker_fusion_mode=encoder_cfg.get("plucker_fusion_mode", None),
+            num_downsample_convs=int(encoder_cfg.get("num_downsample_convs", 1)),
+            num_post_downsample_convs=int(
+                encoder_cfg.get("num_post_downsample_convs", 3)
+            ),
+            channels=int(encoder_cfg.get("channels", 32)),
+            kernel_size=int(encoder_cfg.get("kernel_size", 3)),
+            padding=int(encoder_cfg.get("padding", 0)),
+            channels_multiplier=int(encoder_cfg.get("channels_multiplier", 1)),
+            activation=str(encoder_cfg.get("activation", "relu")).lower(),
+            norm=str(encoder_cfg.get("norm", "none")).lower(),
+            normalize_inputs=bool(
+                encoder_cfg.get(
+                    "normalize_inputs",
+                    encoder_cfg.get("normalise_inputs", True),
+                )
+            ),
         )
 
     fusion_cfg = method_cfg.get("view_fusion_model", None)
@@ -285,6 +305,50 @@ def unscale_action(
     return jnp.clip(2.0 * (action - action_low) / scale - 1.0, -1.0, 1.0)
 
 
+def random_shift_rgb(
+    rgb: jax.Array,
+    key: jax.Array,
+    pad: int = 4,
+) -> jax.Array:
+    """Replicate-pad and randomly crop channel-first multi-view RGB.
+
+    ``rgb`` is shaped ``[batch, views, channels, height, width]``.  Every
+    batch/view item receives an independently sampled integer translation,
+    matching the reference DrQ-v2 augmentation and the historical RoboBase
+    multi-camera implementation.
+    """
+
+    if pad <= 0:
+        return rgb
+    if rgb.ndim != 5:
+        raise ValueError(
+            "Random-shift RGB expects [batch, views, channels, height, width], "
+            f"got shape {rgb.shape}."
+        )
+    batch, views, channels, height, width = rgb.shape
+    flat = rgb.reshape((batch * views, channels, height, width))
+    flat = jnp.pad(
+        flat,
+        ((0, 0), (0, 0), (pad, pad), (pad, pad)),
+        mode="edge",
+    )
+    shifts = jax.random.randint(
+        key,
+        (batch * views, 2),
+        minval=0,
+        maxval=2 * pad + 1,
+    )
+
+    def crop(image, shift):
+        return jax.lax.dynamic_slice(
+            image,
+            (0, shift[0], shift[1]),
+            (channels, height, width),
+        )
+
+    return jax.vmap(crop)(flat, shifts).reshape(rgb.shape)
+
+
 def next_observation_batch(batch: dict[str, Any], observation_keys) -> dict[str, Any]:
     next_batch = {}
     missing = []
@@ -473,6 +537,7 @@ __all__ = [
     "TwinQCritic",
     "normal_entropy",
     "normal_log_prob",
+    "random_shift_rgb",
     "rl_model_spec_from_cfg",
     "scale_unit_action",
     "squashed_normal_sample_and_log_prob",

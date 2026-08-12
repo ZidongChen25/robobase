@@ -10,16 +10,39 @@ env:
   demo_down_sample_rate: 20
   render_mode: rgb_array
   camera_conditioning: none
-  # Stage-160: append the (normalized) floating-base state to the tail of
-  # low_dim_state so training-time masking can keep it while zeroing the
-  # rest. False keeps the official observation layout.
-  append_floating_base_to_low_dim: false
+  # DEFAULT ON since 2026-08-06 (user directive: run the official observation
+  # layout everywhere). The official CQN-AS state_keys INCLUDE
+  # proprioception_floating_base; this port's ConcatDim excludes it from
+  # low_dim_state, so false was NOT the official layout (the old comment
+  # claiming so was wrong). Appending the base restores parity (60 -> 63
+  # dims on move_plate). Paired effect measured 2026-08-06: -1~-2pp vs the
+  # base-less layout (within noise; seeds 77.5/73.0 vs 78.5/73.0).
+  append_floating_base_to_low_dim: true
   enable_all_floating_dof: false
   filter_successful_demos: true
   expected_successful_demos: null
-  # Online BiGym terminates on the first successful step. Historical demos can
-  # continue recording after success and otherwise create repeated rewards in
-  # a different MDP. Keep legacy behavior unless an audit/run opts in.
-  truncate_demo_at_success: false
+  # DEFAULT ON since 2026-08-03. Live BiGym terminates on the first successful
+  # step and pays the sparse reward once (bigym_env.py:164,488), but recorded
+  # demos keep a post-success tail, so replayed demos are a DIFFERENT MDP from
+  # the one the agent acts in. Measured on move_plate (60 demos, 51 successful):
+  # median 24 consecutive reward-1 steps per demo; discounted RTG (gamma 0.99)
+  # median 9.45, max 23.77, so 96.0% of demo transitions exceed the C51
+  # v_max=2.0 and clip to the SAME top atom -- the value function cannot learn
+  # temporal ordering from them, and demo successes are valued ~10-20x above the
+  # agent's own online successes (whose RTG is <= 1.0). Truncating restores RTG
+  # to [0.044, 1.0] (0% clipped) and removes 13.1% of demo transitions
+  # (9,287 -> 8,072). Sealed 200-ep @ seeds 800-999, fixed endpoint, seed 1:
+  # 67.5 -> 78.5 (+11.0). Set false only to reproduce pre-08-03 results.
+  truncate_demo_at_success: true
+  # Degenerate-scale guard for observation standardization. Internal
+  # Robotiq gripper joints vary only by solver jitter in the demos
+  # (move_plate proprioception dims 17-24: std ~1e-4 rad), so
+  # (v-mean)/std turns a legal online gripper stroke into thousands of
+  # sigma -- measured max |low_dim_state| 2213.6/2444.2 on healthy runs
+  # and -3042.8 on stage-173 shortly before it went NaN. Each dim is
+  # floored at this fraction of its own key's median std, so
+  # sanely-scaled dims are bit-identical. 0 disables (pre-08-04
+  # behaviour). Caps the worst normalization gain at ~1/(rel*median).
+
 
 demos: !!float .inf

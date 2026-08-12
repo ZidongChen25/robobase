@@ -13003,3 +13003,1689 @@ xla_mem_fraction 开关入 gpu.py。同卡双跑(0.45×2,错峰 120s)实测
 **14.1 steps/s/卡 = 1.31× 吞吐**(且双跑单条仍是旧管线单跑的 1.54×)。
 全尺度换算:101k 单跑 ~2.6h、双跑 ~4.0h/条。第二任务矩阵(8 run):
 双跑 4 卡一波 ~4h < 单跑 4 卡两波 ~5.3h,**采用双跑**。
+
+### 51. 预注册:官方配方全尺度复现闸门(新 infra,用户指令)
+
+新 replay 管线(§48/50)上跑**官方 CQN-AS**(demo_driven launch,无探索/
+衰减/QC,官方 ensemble 执行)MovePlate 101k,seed 1,GPU2 单卡,async
+协议(无 in-loop eval),链 sealed 200-ep@800(ne=25,最终快照)。
+判据:① 任务成功率落在官方 4-seed 带内(均值 64.6);② 全尺度墙钟
+~2.6-2.7h(§50 的换算复核);③ 训练曲线无异常。通过则第二任务波次
+直接在新 infra 上发车;不过则回退开关逐项归因。
+runner:`scripts/run_cqn_official_repro_newinfra.sh`。
+
+### 51.1 复现闸门裁决:**通过**
+
+官方配方 × 新 infra 全尺度(seed1,GPU2,101k,async 协议):
+- **sealed 200-ep@800 终点 = 67.5**,落在官方 4-seed 带内(均值 64.6,
+  +2.9pp < 1 SE)✓;
+- **墙钟 3.20h**(23:44→02:56;旧管线同尺度 ~7.0-7.4h → **全尺度
+  2.2-2.3×**)。略高于 §50 的 2.6-2.7× 外推:稳态 ~114ms/step vs 基准
+  93ms,归因候选 = _try_fetch 的目录 glob+sort 随 episode 文件数(终局
+  ~700)线性变贵 + 快照写盘 + 邻卡负载;可选微修(目录列表增量缓存,
+  预估再拿 5-8%)记为后续,不阻塞;
+- 曲线健康(log 零错误,在线末段采样成功率 ~0.55,官方典型)✓。
+
+**结论:新 infra 复现官方基线成立,第二任务波次绿灯**(官方 vs combined
+× 2 seeds × 2 任务,双跑规程,AGENTS.md)。本 run 顺带成为官方基线在新
+infra 上的 seed-1 参照点(67.5)。
+
+### 52. Stage-165 预注册:第二任务外部效度(dishwasher_close_trays,用户指令)
+
+任务选择:dishwasher_close_trays(中等难度双托盘推入;demo 库本地齐备,
+量级与 MovePlate 同域;有效 episode ~800 步 = 中等视界)。臂(用户指定
+两臂):**combined**(探索×衰减,stage158 原配方,官方 ensemble 执行)与
+**official+QC**(stage163c:nstep8 + replan-8 训练评估同口径),seeds 1/2。
+新 infra + 双跑规程首个生产波次:GPU2=两臂 seed1、GPU5=两臂 seed2
+(0.45 切片、错峰 120s,臂跨卡平衡)。链条:各 run 训毕自动 sealed
+200-ep@800(ne=25,最终快照,匹配执行方式)。探针本波不跑(anchor 为
+MovePlate 调参,任务口径先行)。判据:任务口径下两臂相对该任务官方水平
+的增益方向与 MovePlate 一致(combined ≈ +10、QC ≈ +9)则机制外推成立;
+注意本波无同任务官方臂,官方参照取 CQN-AS 论文该任务数值区间,若两臂
+绝对值可疑则补官方臂。ETA:双跑 ~0.66× → 单条 ~4.9h,波次 ~5h。
+
+### 52.1 附:独立 JAX Q-chunking 的 robomimic square-mh 复现结账(用户问询驱动)
+
+7/28 的 repro run 被中止在 **1M offline 预训练的 355k 处(35%)**,从未进入
+online 阶段——console log 的 "Step: 0" 是 env-step 计数(离线阶段恒 0),
+eval.csv 的 5k-355k 是**离线 update 数**,不是 online env steps。对照
+run 内存档的论文数字化参考曲线(diag_bc_only_100k.json,Fig.3):
+- 论文 offline 段:100k=4.8%,1M 终点=36.8%;线性内插 355k ≈ ~16%;
+- 我们 offline 355k = **28-30%**(50-ep,watcher)——**在匹配预算处
+  略超论文离线曲线**;BC-only 诊断 100k=26% 亦健康(BC 早期强于
+  QC-offline 属预期:RL 式离线目标需 Q 预热)。
+- 论文头条数字(offline 终点 36.8 / online 终点 92.8)因 run 中止从未
+  被检验。
+**结论:截至被中止处,复现在轨甚至略超;账没结完而非对不上。**
+结账成本:恢复 latest snapshot 续跑 offline 剩余 645k(~2h)+ online 1M
+(env-stepped,较慢),约一夜;排在 stage-165 波次之后可选。
+
+### 53. Stage-166 预注册:BC 断奶(λ→0)续训(用户裁定,单 seed)
+
+问题:combined 训成的策略能否撤除模仿锚(桥接 no-BC 线)。从 stage158
+seed1 @101k 快照恢复(新 run dir,快照+全量 replay/demo 硬链接 = 完整
+续训语义),续 100k 至 201k:
+- **wean0**(GPU0):`step_linear(1.0,0.25,100000,0.0,100000)`,前段与
+  历史逐点一致,101k 起 0.25→0(201k 归零);
+- **hold025**(GPU1,对照):原 schedule 钳位 0.25,隔离"多训 100k"。
+探索保持恒定(§46:不许动)。旧快照无探索 RNG 键(48.2 前)→ 恢复时
+探索流重开,两臂一致,不构成混淆。判据:201k sealed 200-ep@800,
+**Δ(wean0 − hold025) 为主读数**;wean0 落在 combined 带(75±SE)→ 断奶
+成立;塌则塌点 λ* = 模仿锚最低必要剂量。探针两臂各跑可后补。单 seed
+初筛,有效再补 seed2。
+
+§53 修订(用户裁定,v2):首次发射 40 分钟后按新设计重启(从 101k 快照
+重启而非中途改 schedule,保持"两臂至 101k 逐点一致"精确成立;首发目录
+已清)。变更:① 两臂**同卡双跑**(GPU0,0.45 切片,错峰 120s),释放
+GPU1;② wean0 schedule 改 `step_linear(1.0,0.25,100000,0.0,50000)`——
+λ 在 **150k 归零**,150k-201k 为 **50k 纯 TD 平台期**(观察 λ=0 稳态,
+不只是逼近过程);名义 TD:BC 均衡点(λ=0.1)在 ~130k。ETA 双跑 ~4.2h。
+
+### 52.2 Stage-165 中途手术(用户优先级清单 P1/P2)+ §53 v2 勘误
+
+- **P1**:offqc8 seed2 自 **8k 步**起 critic_loss=NaN(其后 39k 步无效),
+  已终止;**seed1 健康**(48k,loss 0.13,零 NaN)→ QC 化臂以单 seed 存
+  活。新任务上 nstep-8 的 1/2 seed 早期发散本身入档:dishwasher(~800 步
+  稀疏)下 QC 段内回传的数值稳定性弱于 MovePlate(~300 步),后续若补
+  seed 需考虑 reward-scale/target-clip 防护。
+- **P2(设计缺陷承认并修复)**:stage165/166 runner 的 inline eval 链会
+  在同卡配对训练未结束时开评(违反不共置协议)。已杀全部 runner shell
+  (训练进程转孤儿续跑),改由**后置编排器**统一调度:每卡全部训练结束
+  后才在该卡顺序跑 sealed 200-ep;GPU5 评完自动接 **P4 纯官方臂**
+  (seed1/2 双跑,官方执行)。offqc8_s2 不评(无价值)。
+- **§53 v2 勘误**:v2 重启后我按列位读 wean0 的 env_steps(39 列布局下
+  $34=episode_length)误判"未恢复"并误杀了健康进程(实际按列名读为
+  102000,恢复成功);已原目录重启,损失 ~1k 步。**规则固化:CSV 一律
+  按表头名取列,禁止按位置**(今日第二次踩同类坑)。
+- **P5**:QC square 离线段边界监视器已装(online 首行即 SIGINT,精确停
+  在 ~1M 离线快照);GPU1 上 async watcher 已即时恢复评估(50-ep,补
+  360k→1M 积压)。P3(no-BC Stage-23)为用户线,不代管。
+
+§52.2 P5 勘误与补评协议(7/31 13:36):上句“watcher 已恢复评估”只证明
+进程曾启动,不构成有效结果。取证显示旧命令一处把 watcher 参数误写成
+`--num-eval-episodes`(watcher 实际接收 `--num-episodes`),另一处又把不接受
+单快照参数的 `eval_q_chunking_snapshot_sweep.py` 传给 watcher;其生成的
+`async_eval_*.log` 均为 CLI 失败,因此有效 `eval.csv` 仍只到 355k=28%,
+**1M offline endpoint 尚无任务质量读数**。训练 loss 有限只证明 wiring,
+不能替代该结论。下一阶段固定为单一问题:精确评估
+`snapshots/1000000_snapshot.pkl`(不使用含 55k online 的 latest),本地单
+seed、不做 checkpoint selection,held-out seeds=400--449、50 episodes;
+指标为 success% 与 mean reward,匹配参考为官方 QC square-mh 1M offline
+=36.8%。预注册通过线为 success>=30%(至少不低于本地 355k 的 28% 且
+距官方点不超过 6.8pp),否则判复现未在 offline 终点保持在轨。执行已排
+队:PID 1581041 等待 Stage-26 controller PID 1517295 完整结束且 GPU1
+连续空闲 120s 后,调用 `eval_q_chunking_robomimic_checkpoint.py`;输出
+`offline_1000000_eval50_seeds400.{log,json}`。当前 Stage-26 seed2 尚在跑,
+预计约 25--30min 后启动,补评本身另需数分钟;结果落盘前不得写成通过。
+
+§52.2 追加(用户质询"NaN 是不是代码问题"的取证结论):
+1. seed2 存储 replay 全量扫描:191 集、全部 float 数组零非有限值、
+   最短 225 步 ≫ nstep=8 → 环境物理爆炸/数据污染/短集边界三假设排除;
+2. **决定性实验**:用 seed2 真实数据(60 集,真实 shape:低维 62 维、
+   proprio 4 维、action 16 维)做新旧采样路径对比,20 试次 × 256-batch
+   **逐字节零差异、交付值全有限** → 新采样器交付的 batch 与旧代码逐位
+   一致,NaN 必在下游;
+3. 方法侧定位:7k 时 critic_loss=0.19 正常,8k 时 loss 与 entropy 同时
+   nan → 单个 1k 区间内的更新爆炸(logits/权重 → nan),发生在全零
+   reward 阶段,nstep=8 bootstrap 下的目标漂移溢出为首要机制假设;
+   seed1 同代码同任务 48k 健康、MovePlate nstep=8(crown 2 seeds +
+   offqc8)从未 NaN → "确定性方法 bug"假设弱,"任务统计相关的数值
+   不稳定"假设强。潜在方法级 bug 不能绝对排除,深挖入口 = 5000 快照
+   权重范数对比 seed1(未做,按需)。
+
+### 52.3 offqc8_s2 NaN 结案(用户"为啥会爆炸"追查)
+
+静态取证全线排除(§52.2 追加 + 本节):输入有限性 ✓、幅度常规(爆炸窗
+≤94,而 seed1 后期吃过 4631 不死)✓、5k 参数与健康 seed 逐层孪生 ✓、
+Adam 一二阶矩冰冷同构 ✓、采样逐位等同 ✓、demo 集完整(44=该任务成功
+demo 数;seed1 67=44+23 自模仿,顺带证明 seed1 已在学成功)✓。
+**动态判决**:seed2 从 5000 快照在 GPU1 复活穿越 7-8k 危险区至 13k,
+critic_loss 0.16 全程干净——**未复现**。按预注册解读:无法区分"方法×
+任务罕见数值事件"与"GPU5 硬件瞬态",但实用结论一致:**单发低概率事件,
+非系统性**;处置 = probe 转正为 seed2b(GPU4 续至 101k,链 sealed eval)
++ 建议加 non-finite 早停守卫(待用户裁定)。
+附:QC 边界停机实际落在 online ~55k(console 块缓冲延迟了监视器触发;
+教训:监控 console 需 PYTHONUNBUFFERED=1),1M 离线边界快照完整,离线
+判决不受影响,55k online 为免费预览。
+
+§52.3 再追加(QC 评估恢复的曲折,全部入档):watcher 三连败(①参数名
+--num-episodes 记错;②给错 eval-script 合同(sweep vs checkpoint);
+③换对脚本后进程仍静默死)→ 弃 watcher 改直跑 milestone 循环仍死
+(exit 144,无 traceback,死于 robosuite env 初始化)→ GPU4 单测成功
+(42s)→ **隔离结论:GPU1 无法运行 robosuite/robomimic eval(EGL 路径
+特异,BiGym 训练不受影响)**,GPU1 彻底留空,milestone 扫描(400k→
+1055k,15 点 × 50-ep,seeds 400)转 GPU4 执行中。教训:后台进程发射后
+必须验证首个成功产物,不能只验证进程存活。
+
+### 52.4 QC square-mh 离线段复现判决:**通过**
+
+完整离线曲线(50-ep,seeds 400,GPU4;单点 SE≈±7pp):
+400k=24 450k=36 500k=24 550k=36 600k=54 650k=36 700k=44 750k=40
+800k=34 850k=42 900k=40 950k=46 **1M(离线终点)=40** 1005k=32;
+意外多跑的 online+55k 点 = 52。
+对照论文(Fig.3 数字化):离线终点 36.8,内插路径 100k=4.8 → 1M=36.8。
+**判定:离线终点 40 vs 36.8(噪声内达标),且实测段全程压在论文内插
+路径上方;early-online 52 也落在论文 online 起坡(36.8→59.6@1.1M)的
+轨道上。JAX Q-chunking 移植的离线复现成立。**
+成本修正:今晨意外 online 段实测 ~115 steps/s → 补完 1M online 仅需
+**~2.5-3h 单卡**,不是先前估的"一夜"(那是像素时代的直觉);是否补跑
+待用户裁定(论文 online 终点 92.8)。GPU4 已被 jz5725 接走(留卡政策
+生效),补跑需等空槽。
+
+§53 中途读数(重要,先于终点判决记录):**wean0 在 λ 归零点即刻行为塌缩**。
+5k 桶点采样在线成功率:145k(λ=0.025)= 0.80 → **150k(λ=0)起连续三桶
+= 0.00**(15 个采样点全零;若真率仍 60%,P≈1e-6,非采样噪声);同窗
+hold025(λ=0.25)保持 0.2-0.8 常态。且 wean0 的 critic_loss 不升反降
+(0.207→0.194)、entropy 正常——**TD 找到了更低损失但不再把好动作排在
+argmax 上的解**,正是"margin 锚承重"的行为学证据。塌点定位:λ* ∈
+(0, 0.025]——2.5% 的名义权重仍足以维持行为,恰好为零则崩。两臂按预注册
+跑完 201k(观察纯 TD 段是否自恢复 + 终点 sealed 定量)。
+勘误:我此前向用户口头报"曲线正常"仅基于 loss/存活,未查成功率——
+第三次"验证前先宣称"教训,并入 §52.3 的规则。
+
+### 52.5 第二任务首批 sealed 结果(dishwasher_close_trays,200-ep@800)
+
+| arm | sealed | 在线尾段(30 采样) | 备注 |
+|---|---|---|---|
+| combined seed1 | **1.000**(200/200) | 0.50 | 在线-贪心差=0.50,全部由 ε-bin 探索污染解释 |
+| official+QC seed1 | 0.865 | 0.90 | 无探索 → 差≈0,同时排除评估器全判成功的 bug |
+
+**新观察入档:探索的在线代价是任务相关的**——MovePlate 上在线≈贪心,
+dishwasher 上在线=贪心的一半;该任务存在"脆弱段",16 步连贯 sibling
+偏移落上即毁整集,但对最终贪心策略无损(反而 100%)。外部效度正式
+结论待纯官方臂(seed1/2 已上 GPU2 双跑,P4)标定任务难度后下;
+combined_s2 独立 eval 交叉验证中;seed2b 停 50k 快照(GPU5 让渡)。
+
+### 54. Stage-167 预注册:任务广度检验(用户裁定,砍官方臂)
+
+用户裁定:dishwasher 官方臂取消(论文 Fig.5 读图 ~75-80 + 宽 CI 做参照;
+GPU2 官方双跑已杀,零浪费损失 ~40min)。对"可能只是 seed 好/任务易"的
+质疑,以**广度**回应:combined × seed1 × {sandwich_remove(540 步,
+24 demos,论文 CQN-AS 读图 ~55-65), move_two_plates(550 步,30 demos,
+论文 ~20-30,全家最难档)},GPU2 双跑(0.45,错峰;首发因
+replay_size_before_train=500 < 单集长 540/550 秒退,以 =600 重发)。
+判据:两硬任务上 combined 相对论文官方读数的方向与幅度;
+move_two_plates 是论文接近失败的任务,若 combined 仍显著为正即为
+最强外部效度证据。sealed 200-ep@800 训毕自动(卡空后)。
+
+### 53.1 Stage-166 断奶终点裁决
+
+| 臂 | sealed 200-ep@201k | 
+|---|---|
+| wean0(λ 150k 归零 + 50k 纯 TD 平台) | **0.0**(0/200) |
+| hold025(λ=0.25 定格,对照) | **79.0** |
+
+**Δ = −79pp,四条结论:**
+1. λ* 悬崖坐实:0.025 仍安然(在线 0.76-0.80),恰好 0 即全塌;塌后
+   50k 纯 TD **零自恢复**(在线 16 连零 + sealed 0/200)。
+2. 对照臂 79.0 ≥ combined 参考 75.0:多训 100k(λ=0.25)无害微益
+   → 效应 100% 归因 λ→0 本身。
+3. 塌缩期 loss 反降 + entropy 正常:TD 自由解在数值上更优、行为上致命
+   ——反标定论题的最纯净展示,"margin 是 argmax 排序的棘轮"。
+4. 对 no-BC 线的直接推论:任何纯 RL 目标必须携带 argmax 锚的功能等价物
+   (floor/gate 类),否则即使从完美策略出发也会被 TD 拆掉。
+断奶不可行(以本配方形态);λ 最低剂量 ∈ (0, 0.025],便宜到可永久保留。
+
+§54 首批读数(seed1,200-ep sealed@800):
+- sandwich_remove:combined = **52.5**(论文官方 Fig.5 读图 ~55-65 → 平/略低)
+- move_two_plates:combined = **19.5**(论文 ~20-30,最难档 → 平/略低)
+外部效度图景(3 任务):dishwasher_close_trays 顶格(100/100 双 seed)、
+两个长视界精细任务与论文官方水平持平。初步解读:粗层对比数据在"粗粒
+度失败模式"任务(托盘/单盘位置类)上命中,在精细双手长视界任务上不
+增益——与 §52.5"探索代价任务相关"同源。限定:单 seed(seed2 夜车中)、
+跨口径(200-ep vs 8×25-ep 读图)。钉死需自跑 official 臂(待裁定)。
+stage168(nonoise+L2boost)已于 01:42 发车。
+
+§55 追加(用户裁定,stage169):第二格剂量探针 `nonoise +
+[0.01, 0.05, 0.4]`(近 ε 语法天花板:激活覆盖 ~87% 步,L2 dim-step
+≈5% —— 仍为高斯 42% 的 1/8,rate parity 不可达已预注册)。与 168
+([0.002,0.004,0.064])构成剂量二点:若 168≈169≈68 → 剂量说排除、
+亚 cell 通道论成立;若单调上升趋 75 → 剂量说复活。GPU2 排 168 后,
+ETA 训毕 ~08:45。在线成功率预期被 87% 覆盖率重度污染,仅 sealed 有效。
+
+### 56. 晨间五判决(08/01 07:52)
+
+1. **stage168 = 74.0**(nonoise + [.002,.004,.064],200-ep sealed):**剂量说
+   获胜,我的"亚 cell 不可替代"预测被证伪**。L2 档 ×8 在无高斯下几乎复原
+   combined(75.0),远超 N 臂(68.0)。高斯通道可被网格级细层 ε 以足够
+   速率替代 → **配方 v2 候选:单一探索机制、零噪声**。待 169(天花板剂量
+   单调性)+ seed2 + 探针后再议升级。
+2. **saucepan_to_hob combined seed1 = 83.0** vs 论文读图 ~75-85:带顶。
+   外部效度第 4 任务:长视界旗舰格达标(与 MovePlate/dishwasher 家族一致,
+   与两个精细双手任务的平手形成分化图谱)。
+3. **wean00125 = 83.5**(λ 定格 0.0125):健康且高于 hold025(79.0)→
+   **λ* < 0.0125**,悬崖在 1.25% 权重之下;且更低的晚期 λ 或有微益
+   (与衰减方向一致)。
+4. **seed2b = 0.02**(offqc8 dishwasher seed2,50k→101k 续完,无 NaN):
+   任务口径灾难。offqc8@dishwasher = 86.5 / 2.0,双 seed 均值 44、方差
+   巨大——**QC 化在该任务上双模态不稳**(该 seed 谱系先 NaN 后死策略);
+   不稳定性本身入档为 QC 线发现。
+5. stage169 首发 07:18 因 GPU2 三租户瞬时挤爆(CUDA client 初始化失败)
+   秒死;08:0x 已重发(0.45 cap,solo),ETA sealed ~11:45。
+seed2 双跑(sandwich_remove/move_two_plates)90k/91k,~09:00 齐。
+
+### 57. 评估污染事件:sealed 数字可被静默损坏(协议级警报 + 修正)
+
+**事实链**:sandwich_remove combined seed2 同一 101000 快照——
+坏评估(09:09 起,GPU1 与 jz×4 重度竞争,渲染落物理 GPU5)耗时
+**5786s(4.7× 正常)→ 20.0%**;健康重复(11:40,轻载)1236s → **67.5%**;
+validation 400 家族 66.5%;在线尾段 0.50。三健康口径一致,20.0 为损坏值。
+**机制候选**(未定):(a) 重度竞争下 EGL 渲染出坏帧(观测变垃圾 → 策略
+"致盲"仍能拿 20%);(b) 快照写入竞态(弱:写完 ~09:05,枚举 ~09:11)。
+**修正**:sandwich_remove combined = 52.5 / **67.5**,均值 60.0 ≈ 论文带
+(55-65)——昨夜"高方差低于论文"的下调判断作废一半;move_two_plates
+seed2(0.10,同一污染会话)重复评估进行中。
+**协议加固(即刻生效)**:① sealed 一律配 50-ep validation 交叉读数,
+偏差 >3σ 触发重复;② eval 避开重度竞争窗口;③ 评估脚本加观测均值
+sanity 输出(致盲检测)待实现。
+
+### 58. 正午总裁决(08/01 12:20,全部 sealed 200-ep@800,健康评估)
+
+**A. 细层/噪声通道问题(162N + 168×2 + 169)**:
+| 臂 | 任务 |
+|---|---|
+| combined(ε 基础 + 高斯) | 75.0(2 seeds) |
+| N(ε 基础,无噪声) | 68.0 |
+| 168 = L2×8,无噪声 | 74.0 / 65.0(均值 69.5) |
+| 169 = 天花板 [.01,.05,.4],无噪声 | 70.0(半程 68.5) |
+**裁决:晨间"剂量说获胜"过早(seed1 侥幸)**。无噪声 L2-boost 家族聚在
+~65-74(三 run 均值 ~69.8),介于 N(68)与 combined(75)之间;168≈169
+→ 3.2%→5% 覆盖再加剂量无增益(平台)。真相居中:**细层 ε 补回高斯通道
+的一部分,但补不满;亚 cell 通道仍有独立贡献**。配方 v2(去噪声)不予
+升级,旗舰保持 combined(带高斯)。所有差异 1-2 SE,精细区分需更多 seed。
+
+**B. move_two_plates seed2 重复 = 9.0%**:与原次 10% 一致(未污染)——
+该任务 combined = 19.5 / 9.0,均值 14.3,真实地弱且不稳。
+
+**C. 外部效度终表(combined vs 参照)**:
+| 任务 | combined | 参照 | 判定 |
+|---|---|---|---|
+| move_plate | 75.0(2s) | 自家 official 64.6 | **+10** |
+| dishwasher_close_trays | **100/100** | 论文 ~75-80 | **顶格** |
+| saucepan_to_hob | 83.0(1s) | 论文 ~75-85 | 带顶 |
+| sandwich_remove | 60.0 均值(52.5/67.5) | 论文 ~55-65 | 平手 |
+| move_two_plates | 14.3 均值(19.5/9.0) | 论文 ~20-30 | 低于 |
+**图景**:粗粒度失败模式任务(盘/托盘/锅)大胜至顶格;精细双手长视界
+递减至低于论文。机制边界与 §52.5/§56 一致:ε-bin 的粗层对比数据只在
+失败发生于粗粒度的任务上转化为增益。
+
+### 60. Stage-171 预注册:explore-aware n-step 截断 × crown 复活(用户裁定的 QC 结合路线 ①)
+
+**机制**:agent 追踪"执行动作来自被 shift 的已注册 plan"(replan 感知
+倒计时,persist-2 → 2×replan_interval 步),经 `explored` extra 入 replay
+(在线+自模仿重标自动继承,离线 demo 恒 0);采样时 n-step 在窗内首个
+后继 explored 步处截断提前 bootstrap(首动作自身 explored 不截断——
+1-step 对比正是所需)。标量/向量双路径,bit-equal + 语义测试 12+1/13 过,
+回归 91/91。开关:`replay.nstep_explore_truncate`(单旗标同时门控存储与
+截断)。
+**Run**:crown 配方(stage163b:探索[0.016,0.032,0.064]persist2 + 衰减 +
+nstep8 + replan8)+ 截断,move_plate seed1,GPU2,101k。
+**判据**:crown 参照 53.3(±2.5);截断版 **≥70 → 毒性通道理论证实**
+(探索段 8 步报酬和污染 QC 目标是 crown 崩溃主因),CQN-AS×QC 结合的
+第一块基石落地;≈55 → 毒性通道非主因,干涉另有机制。健康检查:replay
+中 explored 密度应 ≈0.15-0.20。
+
+§60 追加(实现-发射记录):实现 + 双路径位等/语义测试全过(13+91)。发射
+经历一次"零旗标幽灵"(两次 script 发射 npz 密度 0.000,同代码同配置的
+直跑/探针进程密度 0.17-0.21,机制未定,疑 stale import 或 kill 交叉火力;
+全部僵尸清场后以探针实测 0.17 的进程转正为正式 run)。健康检查规矩再
+加固:发射后必须验证「进程树单实例 + 用进程 cmdline 捕获 run dir +
+数据内容抽查」三件套。正式 run:probe_run 目录,GPU2,~04:15 训毕,
+链 sealed+validation。
+
+### 60.1 Stage-171 判决:**80.5**(sealed 200-ep@800;validation 74.0 一致)
+
+**毒性通道理论证实**:同一 crown 配方,仅加 explored 截断,53.3 → **80.5**
+(+27.2)。且为全项目 move_plate 历史最佳:vs combined 75.0(+5.5)、
+official+QC 74.0(+6.5)、official 64.6(+15.9)。**§47 的可加性判据
+(≥80)在修复毒性通道后达标**——探索×衰减与 QC 回传×滚动执行在隔离
+相互污染后近乎可加。seed2 已发射(单实例全树验证,健康自检挂链);
+≥2 seeds 通过后 crown-truncate 升任新旗舰,随后:探针(反事实口径)、
+Tier-1 近分布探索变体、Tier-2 检索 best-of-N、外部效度任务矩阵移植。
+
+§60.2 勘误(追鬼收场):零旗标幽灵 = **误读 demo 播种**。前 ~11k 全局步
+的 episode 文件是 51 条离线 demo 的转换件(explored=0 正确),在线
+episode 自 ~11.2k 起密度即健康(0.18-0.24 全程)。被判死的历次发射
+全部无辜;env-var/启动载体/stale-import 假设全部撤销。§60.1 的 80.5
+判决无损(晚期密度 0.27-0.34 实证截断生效)。健康检查配方修正:抽
+start_step>12000 的 episode。seed2(seed2_direct)存活转正,评估链已挂。
+
+§61 预注册(stage-172,Tier-1 细层专属探索):皇冠-截断配方,唯一变量
+bin_explore_probs [0.016,0.032,0.064]→[0,0,0.112](总剂量配平,全押最细层
+±1/125 格)。假设:近分布探索降低探索税(撞死率),截断保留其收益通道。
+对照 = stage-171 seed1 80.5(200ep@800)。MovePlate,seed1,GPU4。
+
+§60.3 stage-171 seed1 完整 scaling 曲线(每 5k snapshot × 200ep@seeds800,
+三卡并行评完;merged CSV: probe_run/scaling_curve_200ep_seeds800.csv):
+5k 67.5 | 10k 69.0 | 15k 75.0 | 20k 77.0 | 25k-60k 平台 73.5-77.0 |
+65k-75k 77.5/77.5/75.0 | 80k 78.5 | 85k 80.5 | 90k 78.0 | 95k 77.5 |
+100k 80.0 | 101k 80.5(sealed 原点)。
+判读:①BC 起跳极快(5k=67.5 已平官方终点 67.5);②15k 即入 ~75 平台,
+25k-60k 无增益(λ≈0.9→0.55 区间,BC 仍压制 TD);③80k+(λ≲0.4)出现
+向 80 的缓坡,85k/100k/101k 三点 80±0.5 —— 增益集中在 λ 低段,无跃迁,
+101k 附近未见饱和转折但斜率已缓。含义:(a) 中段 40k 步近乎浪费,支持
+更快衰减臂(linear 1.0→0.25@50k,从未跑过,wean 线证明 0.25 持有安全);
+(b) 若求单点更高,加训至 150k(λ hold 0.25)有正期望但边际有限。
+评估事故记录:分片 g4 曾因 EGL 数字索引把渲染落到 GPU0(与他人训练争
+用,饿死 9 分钟无输出)——根因=eval 脚本用同一数字同推 CUDA 与 EGL;
+临时解=UUID 算力 + 显式 EGL id;待办=脚本拆 --compute-device/--egl-device-id。
+GPU1 已于 08-02 重启后恢复(CUDA 可用),旧"坏卡"结论作废。
+
+§62 预注册(stage-173,两段式快衰减):皇冠-截断配方,唯一变量
+bc_lambda_schedule linear(1.0,0.25,100000) → step_linear(1.0,0.25,50000,
+0.0125,50000)。动机 = §60.3 曲线(增益集中于 λ 低段,25k-60k 平台浪费)
+× §53 wean 阶梯(晚期 λ=0.0125 安全且 83.5 为项目最高)。假设:压缩
+高 λ 平台 + 主阶段引入低 λ 段 → 同预算终点 ≥ 80.5;分段归因:50k 前塌
+= 快衰过急,后半塌 = 低 λ 过早(λ* 悬崖仅在成熟策略上测过)。
+对照 = stage-171 seed1(80.5,§60.3 全曲线)。MovePlate,seed1,GPU2
+(用户指定,与 seed2_direct 合租 0.45×2 至其 ~11:00 训完;首发 GPU3 因
+hydra 括号值未引号解析失败,未启动即退,无污染)。
+
+§60.4 stage-171 seed2 判决:sealed 200ep@800 = 72.5(GPU3 独占,187.6s
+正常,验证 50ep@400 = 62.0 同向,无腐蚀迹象)。皇冠-截断双 seed =
+80.5/72.5(均值 76.5,散差 8pp)vs 组合 nstep3 双 seed 76.0/74.0(均值
+75.0)。裁决:毒性通道机制结论不变(站在 seed1 +27.2 上);**旗舰晋升
+暂缓**——均值 +1.5 在 8pp seed 方差下不足裁定,待 seed3 破平局或
+stage-173(快衰减)/172(细层探索)改写格局。附注:seed2 曲线未做全扫
+(只评终点);§60.3 曲线属 seed1。
+
+§62.1 stage-173 判决:两段式快衰减 step_linear(1.0,0.25,50k,0.0125,50k)
+**中途坍塌**——训练成功率(replay 实测,seeds≥12k 在线段)30k 0.51 →
+40k 0.05 → 50k-101k 全零。塌点 ~35-40k,对应 λ≈0.40-0.50,落入预注册
+判据第一支:**快衰过急**。发现升格:λ 悬崖随策略成熟度移动——成熟
+策略(150k 训练后)λ*<0.0125(§53),而 ~35k 的未成熟策略在 λ≈0.4-0.5
+即塌。BC 锚最低必要剂量 = f(策略成熟度),单调下降。不做终点 sealed
+(训练全零已决定性);皇冠的 linear(1.0,0.25,100k) 恰好压着安全走廊。
+后续候选:主线安全版低 λ 变体 = 皇冠原 schedule 跑满 100k 后接续训
+100k→150k λ:0.25→0.0125(= 把 §53 wean00125 的 83.5 红利以续训形式
+搬进主线,零悬崖风险)。
+
+§61.1 stage-172 判决:细层专属探索(剂量配平 [0,0,0.112])sealed 200ep
+@800 = **65.0**,低于皇冠-截断(80.5/72.5)与组合(76.0/74.0)。训练内
+稳态 0.55-0.60 亦低一档。**Tier-1 假设"近分布探索降低探索税"在纯细层
+形态下不成立**:粗/中层大步探索承载不可替代的价值(与 §58 剂量部分
+替代结论一致)。细层-only 出局;Tier-1 余下候选(后缀翻转、相干高斯)
+优先级下调,待 174/seed3 出分后再议。
+
+§62.2 stage-174 判决:皇冠-截断 seed1(101k=80.5)续训 50k、λ
+step_linear 降至 0.0125 → **sealed 200ep@800 = 82.5,验证 50ep@400 =
+82.0**。三个要点:①续训段(101k-151k)训练成功率 0.62-0.72 全程无塌,
+再证成熟策略低 λ 安全(对照 §62.1 未成熟 λ≈0.45 即塌);②sealed +2.0
+(80.5→82.5,单点不显著)但**验证 +8.0(74.0→82.0),两口径收敛于 82**
+——泛化 gap 闭合,增益真实;③与 wean00125(组合谱系,83.5)同带,
+低 λ 续训红利跨谱系可移植。**主线配方候选升级:皇冠-截断 100k +
+λ→0.0125 续训 50k**(150k 总预算,82.5/82.0)。注:eval 耗时 450.9s
+(2.6× 常态,GPU4/EGL5 组合偏慢)但验证交叉一致,数字可信。待 seed3
+(~18:50 训完)定旗舰终局。
+
+§60.5 旗舰终局判决(三 seed 齐):皇冠-截断 sealed 200ep@800 =
+**80.5 / 72.5 / 42.5**,均值 65.2,极差 38pp;对照组合 nstep3 =
+76.0/74.0(紧)。裁决:**旗舰晋升否决**——皇冠-截断是高天花板/高方差
+线,QC 化(nstep8 开环训练)的跨 seed 不稳定性再次现身(同族证据:
+offqc8@dishwasher 86.5/2.0 双模态)。seed3 非塌盘非 NaN:训练全程
+0.38-0.50 就没起来过,弱 seed 形态。机制结论不变:①截断修复毒性通道
+(seed1 +27.2)仍成立;②低 λ 续训红利(174:82.5/82.0)仍成立,但其
+基座是幸运 seed。**组合 nstep3 保住旗舰(稳定性权重 > 均值 +1.5 的
+诱惑)**;皇冠-截断降格为"冲分线"。开放方向(未启动,待定夺):
+(a) stage-175 = 组合 nstep3 + 截断(把已证的截断收益装回稳定基座,
+无 QC 方差);(b) QC 方差根因(为何 nstep8 开环训练分裂 seed 命运);
+(c) 弱 seed 早期识别信号(20k 时 0.42 已可判?)。
+
+§63 QC 方差根因调查(用户指令:先审计再查因)
+
+**A. seed3 训练审计:干净。** 配置与 seed2 逐行 diff 仅差 seed(及一个
+null 字段的 schema 顺序);日志 0 错误/0 NaN/0 重启;独占 GPU2(254
+steps/s,快于合租期 seed2 的 102,与正确性无关);截断/探索管线正常。
+42.5 是真实的弱 seed,不是事故。
+
+**B. 三个证据链,方差机制重构:**
+1. **命运在首个在线 bucket(12-20k)已定**:三 seed 在线成功率
+   0.61/0.41/0.39,与终局 80.5/72.5/42.5 完全同序;relabel 飞轮
+   (@101k 278/220/144)是放大器而非起因——@20k 时仅 22/13/11,差距
+   已由成功率决定。
+2. **弱开局是配方无关的种子彩票**:组合 nstep3 的 comb_s2 同样开局
+   0.41,但 40k 即回到 0.62、终局 74.0(完全自愈);QC 线的 seed2
+   (0.41 开局)仅部分自愈(72.5),seed3(0.39)零自愈(42.5)。
+   **差异不在彩票,在自愈能力:nstep3 有均值回归,nstep8 锁死早期命运。**
+3. **锁死形态 = 自信的悲观**:seed3 终局 entropy 1.28(seed1 1.70、
+   seed2 1.46)、critic_loss 最低(0.135)——分布最尖、拟合最好、行为
+   最差。机制推断:replan8+nstep8 下 8 步回报和忠实反映当前弱策略的
+   失败(截断只挡探索污染,不挡 on-policy 失败和),TD 高效学会"确信
+   的零";nstep3 多 5 步 max-Q bootstrap 的乐观偏置维持候选动作的
+   生存空间 → 回归。n-step 双刃:降 bootstrap 偏置的同时放大行为策略
+   偏置——强 seed 更强、弱 seed 更弱的 rich-get-richer 回路。
+   (旁证:offqc8@dishwasher 86.5/2.0 双模态同构。)
+
+**C. 附带修正**:组合 nstep3"稳定"的样本量仅 n=2(seeds 3/4 于 07-27
+9k 步即被杀,非完整 run)——其低方差结论证据薄弱,§60.5 的旗舰裁决
+稳定性论据需降级为"未被证伪"。
+
+**D. 待做的决定性实验**(未启动):
+1. **seed3 × nstep3 重跑**(同 seed 同配置仅 nstep 8→3):若恢复到
+   ~70+,nstep8 因果锁死成立——这是一锤定音的实验,3.2h;
+2. 弱 seed 早期识别:20k 在线成功率 <0.45 即弱开局(三例全中),可作
+   止损/重开信号;
+3. 廉价 Q 探针:给 eval sweep 脚本加 10 行 dump 每 snapshot 的贪心 Q
+   均值,验证"自信的零"(低优先)。
+
+§63.1 预注册(stage-176,nstep 因果锁死检验):seed3_direct 全同配置
+(seed=3,replan8,截断开,同 launch 链)唯一变量 replay.nstep=8→3。
+判据:sealed ≥~70 → nstep8 因果锁死弱开局成立(§63.B 机制坐实),
+QC 方差获得可控旋钮(成熟度自适应 nstep 候选);若仍 ~40-50 → 锁死
+主因不在 nstep(转向 replan8 开环执行或交互项)。对照 = seed3_direct
+42.5/48.0。MovePlate,GPU2。
+
+§63.2 stage-176 判决(nstep 因果检验):seed3 仅改 nstep 8→3 →
+sealed 200ep@800 = **60.5**(对照 42.5,+18.0),验证 50ep@400 =
+**74.0**(对照 48.0,+26.0,已达组合线弱 seed comb_s2 的自愈水平)。
+训练内曲线:开局 0.39 完全复刻对照(同种子验证),随后每 bucket
++0.08-0.11。裁决:**部分因果成立**——nstep8 约贡献锁死伤害的一半
+(sealed 口径 38pp 差距中的 18pp),§63.B 的"n-step 放大行为策略偏置"
+机制获得直接因果支持;但残余 ~12-20pp 缺口指向 replan8 开环执行或
+BC 表征彩票的交互项。注:两 seed 族分裂(800 族 60.5 vs 400 族 74.0,
+弱/中 seed 反复出现 val>sealed 的倒挂,强 seed 相反)——本身或是
+"弱 seed 泛化谱系不同"的线索,列为开放观察。
+后续候选:(a) seed3 × nstep3 × replan1(全去 QC 化,补齐因果分解
+最后一格);(b) 成熟度自适应 nstep(弱期 3 → 强期 8)原型。
+
+§63.3 预注册(stage-177,因果分解最后一格 = 全去 QC 化):seed3,
+nstep=3 + replan_interval=1 + 探索剂量回配平([0.002,0.004,0.008],
+按 §163 的 ×8 规则反算)+ 截断保留。这同时是 §60.5 提的 stage-175
+(组合 nstep3 + 截断)在弱 seed 上的首个数据点。判据:若 ≥~75 →
+锁死配方 = nstep8(半)+ replan8(半),QC 化两component 均有害于弱
+seed;若仍 ~60 → replan8 无关,残差归于 BC/表征彩票。评估用
+replan-interval=1(与训练匹配)。对照:42.5(nstep8+replan8)、
+60.5(nstep3+replan8)。GPU2。
+
+## 64. 2026-08-03:λ 的可解释性纲领(用户诊断:schedule 的初值/末值/时长
+均为魔数,不可跨任务迁移)
+
+**问题重述**:λ 不是"BC 权重"而是**罚系数**。margin 铰链实施约束
+`Q(s,a_demo) >= max_sibling Q + m`(分段线性 → 违反时梯度为常数
+λ/(L·D·B),满足时**恰为零**),所以 λ 设定的是一个**力**;其对手 TD
+力的尺度由奖励密度、视界、Q 值域、demo 占比决定,**全部任务相关**。
+故 (1.0, 0.25, 100k, 0.0125) 是"在 MovePlate 上恰好达成某力比的坐标",
+不是常数。可迁移的应是**力比**或其行为效果,而非 λ 本身。
+
+**发现的仪表空白**:主 update 路径此前只 log critic_loss/entropy/
+target_entropy/loss_coeff——**连 bc_weight 都没落盘**,即两周的 λ 调参
+全程无观测。已修:`cqn.py` update 加 6 个诊断量(demo 行统计):
+bc_weight、bc_agreement(demo 动作是否仍是 argmax = 约束的行为满足度)、
+bc_binding_rate(兄弟 bin 中违反 margin 的比例 = 铰链真正在施力的部分,
+已排除自身项)、bc_margin_gap(Q_demo − max_sibling,约束松弛量)、
+bc_sibling_q_span(critic 对兄弟的分辨力 = 覆盖度代理)、
+bc_online_agreement(在线行同量)。测试:tests/unit/test_cqn_as.py 中
+"demo 身份不得泄漏"守护测试原比较整个 metrics dict;诊断量按 demo/
+online 分组统计,故按定义会随标签改变——已在该测试中排除这 5 个纯观测
+键并写明理由,参数级 bit-for-bit 保证不变(仍逐叶断言)。
+
+**离线回溯探针**:`scripts/probe_bc_anchor.py`——对任意 run 的 snapshot
+档案逐点重算上述诊断,demo batch 由 BiGym 原始数据集**重新加载**(跨 run
+完全同批,消除自模仿污染)。首测(171 seed1):
+`@5k λ=0.96 agree=0.899 bind=0.297 span=0.41` →
+`@101k λ=0.25 agree=0.980 bind=0.093 span=1.42`。
+即 λ 降 4× 的同时约束**满足得更好**、铰链施力更少、critic 对兄弟的分辨
+力涨 3.5×——初步支持 H3(约束随覆盖度增长自我执行,λ 可被释放)。
+
+**待证伪的三条定律**(全档案扫描进行中:171 s1/s3、174、173、176、
+wean0、wean00125、158 s1):
+H1 力比定律(塌盘发生于力比跌破普适 c*)、H2 行为定律(前兆是 agreement
+跌破阈值 → 控制器直接盯它)、H3 覆盖定律(安全 λ 下限 = f(sibling span
+/ 覆盖度)→ 逐样本不确定度门控,消灭 schedule 概念本身)。
+
+### 64.1 首批回溯结果:**λ 的真实职能是维持未执行 bin 的可分辨结构**
+
+(注:wean0 run 目录经 3 次续跑覆盖,.hydra/config.yaml 只保留最后一段
+的 schedule,故探针 λ 列对该 run 不可用;相位按 §53 已知:101-150k
+λ=0.25,150-201k λ=0,205k+ λ 恢复 0.25。探针数据与该相位表逐点吻合,
+本身即是探针有效性的强验证。)
+
+| run/相位 | agreement | binding | **sibling span** |
+|---|---|---|---|
+| 171 s1 @5k(λ=0.96) | 0.896 | 0.305 | 0.404 |
+| 171 s1 @101k(λ=0.25) | 0.979 | 0.097 | 1.386 |
+| wean0 @145k(λ=0.25) | 0.963 | 0.154 | 1.429 |
+| **wean0 @150k(λ=0)** | **0.475** | **0.944** | **0.045** |
+| wean0 @201k(λ=0 尾) | 0.315 | 0.995 | 0.011 |
+| wean0 @216k(λ 恢复) | 0.795 | 0.323 | 1.073 |
+| 174 @150k(λ=0.0125) | 0.919 | 0.307 | 1.125 |
+
+**机制结论(改写 §53 的"恒力墙"解释)**:C51 per-bin 头中,TD 只监督
+**被执行的那个 bin**(`canonical_per_sample` 只用 chosen_log_probabilities);
+兄弟 bin 无任何直接梯度(`unseen_return_floor_weight=0.0`),**margin
+铰链是塑造它们的唯一力**。λ→0 时该力消失,兄弟 Q 在权重衰减与参数共享
+的牵引下**塌向同一值**——span 1.43 → 0.045(30×),argmax 退化为在平坦
+地形上抽签,行为随之死亡。塌缩不是"模仿变弱"的连续极限,而是**约束
+存在/不存在的相变**:λ=0.0125 仍保住 span 1.125,λ=0 直接归零。这解释
+了为何 λ* < 0.0125 却又 λ=0 必死——铰链只需强到抵消漂移力,所需强度极小
+但**不可为零**。
+
+**λ 可被释放的真正原因(H3 获支持)**:171 s1 的 span 在 λ 单调下降的
+同时从 0.404 涨到 1.386——探索使兄弟 bin 被真实执行、从而获得 TD 监督,
+覆盖度接管了铰链的工作。**λ 该跟随的不是时间表,而是覆盖度。**
+
+**可迁移的量**:span/Q(无量纲)。健康区 ≈1.0-1.4,塌缩 ≈0.01。
+agreement ≥0.95 健康、≤0.5 已死。二者皆无量纲、跨任务同义。
+
+**由此产生的算法候选(比控制器更优美)**:铰链的职能既然是"给无监督的
+bin 提供结构",就该由一个**不依赖 demo 身份、不含手调力度**的项承担——
+代码里已有的 `unseen_return_floor_loss`(Q-Transformer 式:把未执行 bin
+回归到合法最小回报,`weight=0` 未启用)正是该形态,且天然服务 no-BC 线。
+候选实验:λ→0 + unseen_return_floor 开启,检验 span 是否被守住、行为
+是否免于塌缩。若成立,则 (1.0,0.25,100k,0.0125) 四个魔数一次性消失。
+
+### 64.2 **§62.1 判决作废(重要更正)**:stage-173 不是"快衰过急",是 NaN
+
+回溯探针在 173 的 35k+ 快照上返回全 nan;直查参数确认:30000 快照
+0 NaN、max|w|=1.228,**31000 步起全部 28,571,854 个参数皆为 NaN**
+(train.csv 的 critic_loss/entropy 亦自 31k 起为 nan)。训练"成功率
+40k 跌到 0.05、其后全零"是 NaN 权重输出垃圾动作的结果,**与 λ 无关**。
+
+因此:
+1. **§62.1 的结论(λ 悬崖随策略成熟度移动、λ≈0.4-0.5 对未成熟策略致命)
+   证据基础不成立,予以撤销**。快衰减 schedule 从未被真正检验——它在
+   λ 还有 0.55 时就死于数值发散。
+2. 这是本项目第三次 NaN 事件(offqc8_s2 @8k、本次 @31k),且两次都发生在
+   nstep8+replan8 谱系。**NaN 不再是"非系统性单发",升为待查缺陷**。
+3. §174 的低 λ 续训结论**不受影响**(它是从健康的 171 s1 101k 快照续训,
+   全程 span 1.1-1.4、无 NaN,82.5/82.0 有效)。
+4. 教训:**训练曲线全零 ≠ 策略塌缩**。此前仅凭 replay 成功率归零即下
+   "坍塌"判决,漏检了数值发散。已有的非有限值早停守卫(开放项)应立即
+   实装:检测到 loss 非有限即停并落盘诊断快照。
+
+**待重跑**:快衰减臂需在装上 NaN 守卫后重做,才谈得上检验。
+
+### 64.3 预注册(stage-178,机制检验:结构项能否替代 demo 锚)
+
+§64.1 的机制主张:铰链的职能是给**无 TD 监督的兄弟 bin** 提供结构。
+若为真,一个不看 demo 身份、不带时间表的结构项应能替代它。代码内已有
+`unseen_return_floor_loss`(遮蔽被执行 bin,把其余 bin 回归到合法最小
+回报 0;Q-Transformer 式保守正则),此前 weight=0 从未启用。
+
+**完美三元对照**(同一基座:171 seed1 的 101k 快照,续训 50k):
+| 臂 | λ(101k→151k) | floor | 已知/待测 |
+|---|---|---|---|
+| 174(已跑) | 0.25→0.0125 | off | **82.5/82.0**,span 1.125 |
+| wean0(旧谱系) | 0 | off | 塌(span 0.045) |
+| **178A** | **0** | **on** (w=0.1, value=0, mean) | ? |
+| **178B**(对照) | **0** | off | ? 本谱系内复现塌缩 |
+
+判据:178A 若 span 保持 ≳1.0、sealed ≳75 → 机制成立,**λ 及其四个魔数
+可被一个无量纲、无时间表的结构项替代**(且该项不看 demo 标签,天然服务
+no-BC 线);178B 应塌(本谱系内的阴性对照,排除"皇冠-截断谱系自带免疫"
+这一替代解释)。floor 权重 0.1 与 critic_lambda 同量级,是唯一剩余旋钮,
+但它不随时间变化、不随任务重调——这正是要检验的性质。
+
+### 63.4 stage-177 判决:**QC 化是 38pp 方差的全部来源;seed3 不是弱 seed**
+
+同一颗 seed3,三种制度(sealed 200ep@800 / 验证 50ep@400):
+| arm | nstep | replan | sealed | Δ |
+|---|---|---|---|---|
+| 171 s3 | 8 | 8 | 42.5 | — |
+| 176 | 3 | 8 | 60.5 | +18.0 |
+| **177** | **3** | **1** | **79.5**(val 70.0) | **+19.0(累计 +37.0)** |
+
+裁决:①**锁死是两个组件各承一半**:nstep8(+18)与 replan8 开环执行
+(+19),后者略重;②seed3 在标准执行制度下达到 79.5 ≈ seed1 皇冠-截断
+的 80.5——**"种子彩票"是 QC 化的产物,不是环境/初始化的固有属性**;
+③§60.5 的"高天花板高方差"描述需改写:皇冠-截断的方差**全部**来自
+QC 化,去掉它方差即消失。
+
+**附带的重大收获**:177 的配方 = 组合 nstep3 + replan1 + 探索截断,
+即 §60.5 预告的 stage-175。它在**最差的那颗 seed** 上拿到 79.5,已超过
+现旗舰(组合 nstep3 双 seed 76.0/74.0)的两个 seed。**新旗舰候选**:
+截断把已证的毒性通道修复装回稳定基座,收益保留、方差消失。
+待办:seed1/seed2 复现(seed1 已发,GPU4);之后做截断消融(nstep3 下
+窗口短,截断的边际贡献需单独确认)。
+
+### 64.4 stage-178B(阴性对照)判决:**机制在第二个谱系上复现**
+
+皇冠-截断基座 + λ=0 + 无结构项,续训至 151k:
+**sealed 200ep@800 = 0.0(0/200)**;探针 @151k:agreement 0.361、
+binding 0.996、**span 0.0104**(健康态 1.1-1.4)、Q 1.104。
+
+与 wean0(组合谱系)的塌缩指纹逐项一致(span 0.011、agreement 0.315、
+binding 0.995)。**§64.1 的机制主张在独立谱系上获得复现**:λ=0 →
+兄弟 bin 结构消失 → argmax 退化 → 行为死亡;且"皇冠-截断谱系自带
+免疫"这一替代解释被排除。178A(λ=0 + unseen_return_floor)评估中,
+它是"结构项能否替代 demo 锚"的正面检验。
+
+### 64.5 stage-178A 判决:**λ 有两份工作,结构项只能接管其中一份**
+
+同一基座(171 s1 @101k = 80.5)续训 50k,四元对照终局:
+| 臂 | λ | floor | sealed | agreement | span | span/Q |
+|---|---|---|---|---|---|---|
+| 174 | →0.0125 | off | **82.5** | 0.919 | 1.125 | 1.10 |
+| **178A** | **0** | **on** | **72.5** | 0.819 | 0.818 | **1.06** |
+| 178B | 0 | off | **0.0** | 0.361 | 0.010 | 0.009 |
+
+**结论(机制二分)**:
+1. **可分辨性(span)可以外包**。一个完全不看 demo 标签、无时间表的
+   结构项(`unseen_return_floor`,w=0.1,value=0,mean)把 λ=0 的 run
+   从 0/200 救到 72.5,span/Q 1.06 落在健康带。**"demo 锚是存活的必要
+   条件"被证伪**——必要的是"未执行 bin 有人监督",而非 demo 身份。
+   这条对 no-BC 线是直接可用的结论。
+2. **排序(agreement)接管不了**。178A 的 agreement 只有 0.819(健康
+   ≥0.95),且相对自身起点退步(80.5 → 72.5),而 174 同期是进步
+   (80.5 → 82.5)。floor 把所有未见 bin 一律压向 0,能撑开跨度,却
+   不保证 demo 动作**排在第一**;铰链除了"压下兄弟"还在"顶起 demo",
+   这是第二份、独立的工作。
+3. 因此 §64.1 的机制陈述需精化:**λ = 可分辨性维持 + 排序优先,两份工作
+   捆在一个标量里**——这也解释了为什么它既无法用单一无量纲量刻画、
+   又对数值不敏感(两份工作的需求量级不同)。
+
+**由此收敛的方案图**:
+- **主线**:结构由 floor 承担,排序由一个**恒定的小 λ** 承担(174 证明
+  0.0125 恒定即足够且更好)。候选 = floor on + λ≡0.0125,**零时间表、
+  两个有自然标度的常数**。待验:此前 0.0125 只在"高 λ 训练 100k 之后"
+  被检验过,from-scratch 未测。
+- **no-BC 线**:floor 是合法的结构替代品,72.5 是该线迄今最强的存活证据
+  (对比其历代 40-50 区间)。
+
+### 64.6 跨任务标定:**计数型指标可迁移,比值型指标不可**
+
+MovePlate(171 s1,80.5) vs dishwasher_close_trays(combined s1,100.0),
+同一探针、同一 batch 协议:
+| 量 | MovePlate 5k → 平台 | dishwasher 5k → 平台 | 可迁移? |
+|---|---|---|---|
+| agreement | 0.896 → **0.98** | 0.839 → **0.98** | **是** |
+| binding_rate | 0.305 → **0.07-0.10** | 0.319 → **0.08-0.12** | **是** |
+| span/Q | 0.54 → **1.37-1.40** | 0.66 → **1.99** | **否**(+45%) |
+| Q 量级 | 1.01 | 0.65 | — |
+
+**为什么**:agreement 与 binding 是**计数比例**(达标的头数 / 违反的兄弟
+bin 数),按构造落在 [0,1],与价值尺度无关;span/Q 是两个价值尺度量的
+比,任务的价值地形形状不同则不抵消。轨迹**形状**三者一致(先升后平台),
+但只有前两者的**绝对水平**跨任务重合。
+
+**对控制器版的直接修正**:设定值应挂在 **agreement(地板 0.95)**或
+binding_rate(上限 ~0.15),**不要用 span/Q 的绝对阈值**。这两个量在两个
+任务上标定一致,且与 §64.5 的 seed3 悖论相容——它们只作单边地板(跌破
+才加大 λ),绝不作为优化目标(seed3 的 0.99 是自然到达,不是被推上去的)。
+span/Q 仍是有用的**诊断**(塌缩时归零),但不适合做设定值。
+待第三任务(sandwich_remove)确认。
+
+### 64.6a QC NaN 根因审计: OOD 标准化输入触发,不是 C51 目标溢出
+
+**1. Previous-stage result.** 对全部带 Hydra 配置且使用 fused-8 JAX
+后端的 BiGym CQN-AS `train.csv` 重新按列名扫描:完成至少 8k 步的
+`nstep=8,replan=8` 共 15 个 run,2 个出现真实训练 NaN(13.3%);
+其余制度共 322 个 run,1 个 NaN(0.31%;单侧 Fisher exact p=0.0056)。
+两个 QC 事件分别是
+`cqn_stage165_second_task/...offqc8_seed2...` @8k 和
+`cqn_stage173_fastwean/two_stage_s1` @31k。坏前一桶的 critic loss 仅
+0.188/0.201,不是 loss 逐步爬升。stage-173 的 30k snapshot 中参数、
+target 与 Adam moments 全部有限(max|param|=1.228);35k 时全部
+28,571,854 个参数、全部 26,484,718 个 target 参数及除 step counter
+外全部 57,143,708 个 optimizer 元素均为 NaN,即一次坏更新全树污染。
+
+真实 replay 的网络输入提供了新的共同前兆:offqc8_s2 在坏点前出现
+`max|low_dim_state|=2605.5`,而同任务/同预算健康 seed1 只有 186.5;
+stage-173 坏点前为 3042.8,且 `|z|>1000` 占 0.147%。这些值已经是
+ConcatDim 交付给网络的 demo-z-score,不是原始物理量。实现以 demo
+`std`(下限仅 1e-10)做除法,但对 online OOD 值不裁剪
+(`robobase/envs/bigym.py:804-843`,
+`robobase/envs/wrappers/concat_dim.py:58-94`)。QC 的 replan-8 连续执行
+更容易产生这种离开 demo 支持集的状态;随机 replay batch 是否聚集到
+极端窗口,解释了 seed/运行级偶发性。当前配置同时是
+`critic_grad_clip=null`,所以首个非有限梯度会直接进入 AdamW。
+
+**2. Interpretation.** 先前的“nstep=8 bootstrap 目标漂移溢出”解释被
+排除:C51 投影在进入 loss 前显式 clip 到 `[-2,2]`,softmax Q 也被同一
+support 有界;原始 replay 全有限且新旧 sampler 逐字节相同。当前最强
+因果链是 **replan-8 数据分布 -> 未裁剪的巨大 z-score -> 某个随机
+minibatch 的非有限 forward/backward -> 无梯度防线的 Adam 全树污染**。
+已确定前兆、污染位置和 QC 富集;尚未捕获首个坏 minibatch,所以不能把
+最后一跳进一步归到 LayerNorm/GRU/CUDA 的某一个具体算子。另一个
+`nstep=1,replan=1` dense-return run 也曾 NaN,因此 QC 是强风险放大器,
+不是 NaN 的逻辑必要条件。
+
+**3. Next-stage decision.** 数值机制门采用同一 QC 配方/seed/replay,
+只比较 baseline、`low_dim z-clip=20`、`critic_grad_clip=10` 三臂;不同时
+改变 nstep/replan。先以固定训练 seeds 1--3 做 40k stability selection,
+指标为首个 non-finite step、输入 max/p99.9、pre/post-clip grad norm 和
+有限参数比例;通过线为三 seeds 全部 40k 有限且 baseline 至少复现一次。
+这个门仅用于复现历史 `truncate_demo_at_success=false` 数值机制,不作策略
+质量基线;通过臂须在已修正的 `truncate_demo_at_success=true` 数据制度下
+另起 matched quality 实验跑到 101k,用 validation seeds 400--449 选 checkpoint,
+最后 sealed held-out seeds 800--999;任务质量不得用稳定性 loss 代替。
+
+**4. Execution.** 已完成上述 373-run 矩阵扫描、三份坏 snapshot 全树
+审计及 matched replay 输入分布扫描。现有
+`exp_local/cqn_nan_probe/qc_notrunc_s1` 复现探针已正常完成 8k;最后记录的
+7k critic_loss=0.2055 且有限,log 随后正常清理 replay,未复现 NaN。
+未再发三臂动态门:当前六卡均已有训练/评估负载且仓库训练已超过用户规定
+的四并发硬上限,没有安全训练槽。下一步应先给 update 输出加 pre-apply
+gradient/activation 非有限诊断与坏 batch 落盘,再在槽位释放后发 matched
+门;仅有 post-update loss 早停只能止损,不能定位首坏算子。
+
+### 64.6b 2605 state 反解:右夹爪内部关节的 demo-std 放大,不是 MuJoCo qpos 爆炸
+
+**1. Previous-stage result.** 将 `dishwasher_close_trays_offqc8_seed2` 的 44 份
+成功 demo raw safetensors 与 44 份归一化 demo replay 逐轨迹配对(第 0 维
+逐值完全相等),反解出了运行时实际使用的 affine stats。在线 episode 56 的
+local step 242/global replay index 15128 中,`low_dim_state[21]=2605.4626`。
+62 维布局是 qpos 0--29、同序 qvel 30--59、两维 gripper summary 60--61;
+运行时 MuJoCo joint 映射确认 dim 21 是
+`h1/robotiq_2f85_right/left_driver_joint`。它的 raw qpos 仅 0.774285 rad,
+demo mean/std 为 0.002510/0.0002962,故被放大成 2605.46。相邻的右夹爪
+driver/spring joints(dim 17/19/23)同时是 raw 0.775/0.782/0.769 rad;
+step 249 的 `dim 47=-2588.68` 是 dim 17 同一关节的 qvel,raw 仅
+-5.336 rad/s,其 demo std 为 0.002061 rad/s。driver 的 MJCF 合法范围是
+[0,0.8] rad,所以 0.774 rad 仍在关节限位内。
+
+成功 demos 的右手 gripper summary 第二维在全部 11,046 帧中恒为 0,
+且右夹爪内部 dim 21 的 raw 范围仅 [-0.00048,0.00505];该在线 episode
+却在 step 228--255 走过 0.1 -> 1.0 -> 0.0。三路图像显示右腕紧邻
+dishwasher rack,但仅凭 replay 不能把运动进一步唯一归因为接触力还是控制
+动态。可以确定的是 MuJoCo 给出的是有限且限位内的夹爪状态,2605 只在
+demo 标准化之后出现。本阶段是数值机制定位,不涉及 best-checkpoint 策略
+质量比较。
+
+**2. Interpretation.** “因为没有 fail termination,MuJoCo 状态本身跑到
+2600”不成立。BiGym 实际有 `terminate = success or fail`,其中通用 fail
+是 pelvis 距原点超过 10 m,另在 PhysicsError 时 truncate;该样本的
+reward/terminal/truncated 均为 0,浮动底座 xyz 约
+[-0.111,-0.554,0.500],episode 最终正常在 320-step TimeLimit 截断。
+它没有 task-specific stuck/jam failure,所以长 episode 的确增加遇到 OOD
+接触状态的机会,但这里只是物理上合法的右夹爪全行程。真正的表示问题是
+`proprioception` 已包含两只 Robotiq 的内部被动机构 qpos/qvel,同时又追加
+了两维 `proprioception_grippers`;任务 demo 从不动右夹爪,于是重复的内部
+维度以求解器微抖动作为 std。把合法夹爪动作定义为 fail 会错误改变 MDP,
+只能减少暴露机会,不能修复数值尺度。
+
+**3. Next-stage decision.** 下一机制门优先隔离“重复的内部夹爪状态”这一项:
+同一历史 QC 配方、replay 与 seeds 1--3,只比较原始 62 维 baseline 与移除
+两只夹爪内部 qpos/qvel、保留 2 维 gripper summary 的 observation arm;
+不同时加 z-clip 或 grad-clip。40k stability 指标为首个 non-finite step、
+input max/p99.9、pre-apply grad norm 和参数有限比例;通过线是三 seeds 40k
+全有限、内部夹爪 arm 的 |z| 极值消失且 baseline 至少复现一次。梯度防线
+另作后续 guardrail 实验。策略质量仍须在
+`truncate_demo_at_success=true` 下另跑 101k,validation seeds 400--449
+按 best checkpoint 选择,最后 sealed held-out seeds 800--999。
+
+**4. Execution.** 已完成 44/44 raw-demo/replay 精确配对、坏 episode 逐维
+反归一化、无渲染 MuJoCo runtime joint-name/range 审计及 step 220--256
+三相机核对。现有 `exp_local/cqn_nan_probe/qc_notrunc_s1` 已正常完成 8k;
+最后记录的 7k critic loss=0.2055 且有限,log 随后正常清理 replay,没有
+复现 NaN,再次说明单 seed/单次短跑不是充分复现。当前仍有至少八个训练
+量级 GPU 进程,超过四并发硬上限,故未启动 matched 40k 门;本阶段未改
+训练代码。
+
+### 64.6c move_plate 更正:夹爪尺度病灶真实,但既非 NaN 必要条件也非充分条件
+
+**1. Previous-stage result.** 上一节反解的是 dishwasher 的 2605,不是
+move_plate stage-173 的首个 NaN;这里独立重做。stage-173 在 30k 的
+critic loss=0.2008 且有限,31k 首次记录 NaN。其 30k 前最大输入发生在
+online step 29,557:`low_dim_state[51]=-3042.8093`。move_plate 的 60 维
+布局是 qpos 0--28、同序 qvel 29--57、gripper summary 58--59;runtime
+映射确认 dim 51 是 qvel index 22,
+`h1/robotiq_2f85_right/left_coupler_joint`。将全部 60 份 raw demo 与运行的
+60 份 replay demo 逐轨迹精确配对后,该值反解为 raw qvel=-3.02674 rad/s,
+运行实际 mean/std=-6.23e-5/9.94698e-4。同一冲击中 dim 48 的 raw qvel
+为 12.0146 rad/s(z=2345.58)。因此这里仍是有限的夹爪机构状态被 demo
+尺度放大,但具体致命极值是 qvel,不是 dishwasher 的 dim-21 qpos。
+
+stage-173 实际 qpos std(dim 17--24)依次为
+`3.20e-4,9.02e-5,3.70e-4,4.69e-4,3.20e-4,8.50e-5,3.70e-4,4.54e-4`。
+这与外部审计所报的 `1.2e-5/3.3e-5` 不是同一运行统计;上述数值由真正存入
+stage-173 replay 的 affine 关系反解,逐点残差 <3e-10。更关键的是,
+`truncate_demo_at_success` 在当前代码中发生在 obs stats 计算之后。实际把
+未截断 stage-173 与截断 official seed1 的 replay 分别反解,上述每一维
+std 逐位相同到约 1e-14,不是只差 1.2 倍。
+
+跨臂证据切断了“极值直接导致 NaN”的充分性与必要性:
+
+- 截断 official nstep-1 seed1/seed2 各跑完 101k 且有限,online max 分别
+  2213.64/2444.17;
+- 截断 QC seed1/seed2 分别在 iteration 4k/1k 因 NaN guard 退出,但整个
+  replay max 仅 91.45/42.54;
+- 截断 QC seed4 当前已到 15k,critic loss=0.2051 且有限,同时 replay max
+  已达 1440.40;
+- 另有 move_plate nstep-1/replan-1 dense-return A7 在 13k NaN,其 replay
+  max 仅 91.59。
+
+本阶段是数值机制审计,不作 best-checkpoint 策略质量比较。
+
+**2. Interpretation.** 夹爪内部关节用极小 demo 方差归一化是确定存在的
+表示缺陷,且与 demo success 截断无关;但现有证据不再支持把它写成 NaN 的
+直接根因。大极值既非充分条件(2444 的 nstep-1 和 1440 的 QC 仍健康),也
+非必要条件(42/91 已可 NaN)。nstep-8/QC 在总体矩阵中仍显著富集 NaN,
+因此可称风险放大器,不能称“把极值变致命的必要一步”;A7 是 nstep-1
+反例。
+
+外部审计关于 normalization 分支的判断也需纠正:`use_standardization=false`
+与 `use_min_max_normalization=true` 只控制 action wrapper。stage-173 的
+`.hydra/config.yaml` 是 `norm_obs=true,obs_norm_type=standardization`,并由
+`ConcatDim` 走 `(v-mean)/(std+1e-10)`。raw demo 到真实 replay 的 affine
+拟合残差 <3e-9 也直接证明当前走 z-score,不是 min-max observation 路径。
+
+**3. Next-stage decision.** “std floor + output clip 同时改、两个 seed 过 5k”
+只能作为止损 smoke,不能建立因果:它一次改两个机制,而历史 failure 可晚至
+31k,当前 QC seed4 也已有限通过 15k。下一数值 containment 门只改一个量:
+对 standardization 输出加 `clip=10`,baseline 与 clip arm 使用相同 QC+
+截断配置和 seeds 1--4,至少跑到 40k;指标为 first non-finite step、clip
+rate、pre-apply grad norm、参数有限比例。通过线为 clip 四 seeds 40k 全
+有限且 matched baseline 至少一次失败。与此同时必须在 update apply 前
+保存首个坏 batch、逐模块 activation 与 gradient finite mask;即便 clip
+通过,没有首坏 batch 也只能证明 guardrail 有效,不能证明根因。nstep 因果
+另用 1/1、8/1、1/8、8/8 独立矩阵回答,不得混入 normalization arm。
+任务质量仍须 101k,validation seeds 400--449 选 best checkpoint,最后
+sealed held-out seeds 800--999。
+
+**4. Execution.** 已完成 move_plate 60/60 raw/replay 配对、截断与未截断
+运行 stats 逐位对照、stage-173 30k 前 replay 扫描、runtime joint mapping
+及 nstep-1/QC 反例矩阵。QC+截断 seed4 正在 15k 继续运行且有限;当前至少
+八个训练量级进程占卡,超过四并发上限,未再启动 clip arm。本阶段没有修改
+训练或 wrapper 代码。
+
+### 64.7 三任务标定完成:**agreement / binding 是跨任务常数,span/Q 不是**
+
+| 任务(健康 run) | 5k agree | 平台 agree | 平台 bind | 平台 span/Q | Q |
+|---|---|---|---|---|---|
+| move_plate(80.5) | 0.896 | **0.984** | **0.081** | 1.39 | 0.99 |
+| dishwasher_close_trays(100.0) | 0.839 | **0.980** | **0.084** | 1.96 | 0.66 |
+| sandwich_remove(67.5) | 0.823 | **0.988** | **0.074** | 2.17 | 0.49 |
+
+三个任务、三种成绩(67.5/80.5/100.0)、三种 Q 量级(0.49-0.99),
+**agreement 平台 0.980-0.988(散布 0.008)、binding 平台 0.074-0.084
+(散布 0.010)——跨任务几乎逐位重合**;span/Q 从 1.39 到 2.17(+56%),
+且与 Q 量级反相关,不可迁移。原因见 §64.6:前两者是计数比例,后者是
+价值尺度之比。
+
+**因此控制器版的设定值确定为 agreement,地板 0.95**(健康平台 0.98,
+塌缩态 0.32-0.48,中间无观测密度——地板落在真空区,不敏感)。
+binding 上限 0.15 可作冗余判据。三任务标定后,s* 不再是魔数。
+注意:agreement 只作**单边地板**(§64.5 seed3 悖论:0.99 且最差 42.5),
+控制器是安全装置,不是优化目标。
+
+### 64.8 move_two_plates @82k 更正:state 极值不是这类 NaN 的近因
+
+**1. Previous-stage result.** `official_move_two_plates/seed1_20260804100800`
+已完成 101k 训练和全部评估。validation-50(seeds 400--449)在
+5k--100k 为 12--24%,101k 最高 **32%**;因此按 validation-selected
+best checkpoint 口径,应报 101k 的 sealed-200(seeds 800--999)
+**19.5%**。固定端点 100k/101k 分别是 **21.5%/19.5%**。未截断
+combined 的 101k 是 19.5% 与 10.0%(后者健康重评 9.0%);所以
+当前 seed1 在 matched 101k 与 combined 的强 seed 相同,相对原两次
+均值 14.75% 是 +4.75pp(用重评数字则均值 14.25%,+5.25pp)。
+先前 +6.7pp 是用当前 100k 对 combined 101k 均值,端点不 matched;
+且仍是 n=1 vs n=2,不作方法提升结论。
+
+`official_move_two_plates/seed2_20260804100800` 的 81k 记录仍有限
+(`critic_loss=0.22834`),80k snapshot 已落盘,随后在 iteration 82k
+报 `critic_loss=NaN` 并中止。该次完整 forensic dump 的三个保留
+batch 中,所有 float 叶子的 finite fraction 都是 1.0;
+`low_dim_state` max|x| 依次为 **36.814/30.486/34.353**。
+守卫触发后,online params 108/108 个叶子与 optimizer state
+216/216 个叶子全部 0% finite。另外三份有完整 dump 的事件
+(QC seed3@11k,QC seed2@99k,mask seed1@2k)也是所有 float batch
+全 finite,发现 batch 的 max|low_dim| 分别只有 87.75/57.41/29.71,
+且同样是全部 params/optimizer leaves 一次性变为 non-finite。
+
+**2. Interpretation.** 这个 nstep-1、已有 relative std floor 的最难任务
+是直接反例:`2600/3000` 标准化夹爪状态是真实的表示缺陷,但它
+不是 NaN 的必要条件,也不是这次的近因。nstep-8/QC 也不是
+必要条件,最多仍是事件率放大器。因此§64.6c 的 observation
+clip arm 不再是根因定位的下一优先级;它只可作独立 guardrail,
+不能用来解释这一簇同签名 NaN。
+
+当前 dump 仍不能把首发点写成“已确定在 optimizer apply”。
+`critic_loss` 是 `value_and_grad` 在 optimizer 之前算出的,但 workspace
+是 update 返回后才只检查这个 loss。如果前一步是 finite loss ->
+non-finite gradient/update,它会先污染参数,到下一步才被 loss guard
+发现。所以 34.353 严格说是 detection batch,首污染 batch 也可能是
+前一个 30.486 batch;两者(连同再前一个 36.814 batch)均全 finite
+且没有 state 极值,因而不改变上述结论。真正未决的是首个
+non-finite 究竟位于 forward/loss、backward gradient、Adam state/update
+还是 apply/target EMA。现有 forensic tap 还丢掉了 uint8 RGB;图像一定
+有限且有界,但重要的是,没有它们就不能对失败 update 做逐位重放。
+
+**3. Next-stage decision.** 先完成已注册的 no-ensemble 独立问题,
+随后把下一数值阶段改为**只加取证,不加 clip/删 state/grad-clip**:
+在 JIT update 中返回 pre-params/target/opt-state、forward 中间量
+(encoder features,target/chosen logits,target distribution,TD/FOSD/margin loss)、
+raw gradient 分子树、optimizer updates/new state、candidate params/target 的 finite bitmask、
+max-abs 和 global norm。一旦 candidate state 不 finite,不 commit 该次更新,
+保留 pre-update 状态和前/当两个完整 batch(包括 RGB)。
+
+诊断组使用高复发率的 QC+truncation seeds 1--4,不做 policy checkpoint
+selection;对正常 finite snapshot/batch,新旧 update 必须逐位等价。通过线是
+至少捕获一次“首个坏 stage+参数叶子”,且能从前一 finite snapshot
+重放相同 full batch 复现;若四 seeds 全部 101k 无事件,只能说本轮
+未复现。根因候选修复后再用 held-out seeds 5--6 做 matched
+101k 确认,指标为 first-nonfinite step、各 stage finite mask/norm 和 101k
+存活率;策略质量若需比较,仍另用 validation 400--449 选 best,
+sealed 800--999 只在闸门通过后打开。
+
+**4. Execution.** 至 2026-08-04 16:45 BST,no-ensemble move_plate seeds 1/2
+已在物理 GPU1(`GPU-ce804993-...`)各以 0.45 显存切片真实开始;
+PIDs 3828668/3832907,路径为
+`exp_local/cqn_trunc_arms/noens_move_plate/seed{1,2}_20260804162305`。
+seed1 已到 8k(`critic_loss=0.28331`,5k snapshot 存在),seed2 已到
+6k(`critic_loss=0.29589`,5k snapshot 存在),两者均 finite;按当前双租户稳态速度预计
+20:45--21:15 完成 101k。这是当前已执行的 next stage;梯度首发
+守卫按上述注册顺序等 no-ensemble 结果,本阶段未修改 update 数学路径。
+
+move_two_plates seed2 的 17 个现存 snapshot val50 和 80k sealed
+已在 GPU4 分别由 PIDs 3849025/3849824 运行;val50 已完成
+3/17(到 15k),sealed 仍在运行,不预报数字。sandwich_remove 两个 101k
+训练均有 `train_complete`;GPU3 上的链式 val50 已分别完成
+12/21(seed1/seed2,均到 60k),按当前每快照
+~246--251s 预计 validation 约 17:20 齐,sealed 约 17:45--18:00 齐。
+训练只占一张卡、评估与训练分卡,符合 GPU 配额协议。
+
+## 65. Artifact lifecycle: shared demos, rolling resume, best+final retention
+
+**1. Previous-stage result.** 2026-08-04 的磁盘审计确认旧生命周期有三个
+独立重复源:每个 run 都重新落盘 demo replay;每个 snapshot 都保存完整
+optimizer/RNG/replay metadata 且从不轮换;自然训练完成后 online replay 仍被
+保留。旧 evaluator 只读取完整 snapshot,所以即使 evaluation 不需要 optimizer,
+也不能在训练后立即删 resume state。
+
+**2. Interpretation.** demo 是跨 seed 不变的输入数据,但 CQN-AS 的 dedicated
+demo buffer 还会追加 self-imitation success,因此只能共享一个不可变 demo seed,
+不能让多个 run 写同一目录。resume checkpoint 与 evaluation checkpoint 也是
+两个不同用途:前者必须含 optimizer/RNG/replay state,后者只需 agent state。
+把两者继续混在同一个 pickle 中会阻止安全清理。
+
+**3. Next-stage decision.** CQN-AS/CQN-Flow 默认启用以下 gate:公共缓存分别保存
+`all_demos` 和 `expert_demos`;run-local replay 以 hardlink 初始化后可独立追加;
+训练期完整 resume 最多保留最近 2 个;每个评估步另存 params-only checkpoint;
+只有自然训练完成且最终 params checkpoint 存在时才删 run-local replay 和全部
+resume snapshot。validation seeds(<800)覆盖全部 checkpoint 后选 success 最大者
+(tie 取更早),sealed evaluation 完成后仅保留 validation-best 与 final;held-out
+CSV 被禁止用于选择。旧 run 未启用该配置,不自动清理。
+
+**4. Execution.** 已实现 `SharedDemoReplayCache`、replay hardlink seed/局部清理、
+Workspace 原子保存与 latest-two 轮换、params-only checkpoint、自然完成清理,
+并让 `eval_cqn_as_snapshot_sweep.py` 优先读取轻量 checkpoint及执行有 gate 的
+best+final 收尾。`run_cqn_trunc_arm.sh` 对新生命周期在 sealed eval 后自动收尾,
+对当前正在跑的旧 noens/hard-task 配置保持 legacy fallback。聚焦测试
+`tests/unit/replay_buffer/test_uniform_replay.py` 与
+`tests/unit/test_artifact_lifecycle.py` 为 **10/10 pass**;BC/Flow snapshot及
+CQN-Flow config 回归为 **5/5 pass**。实测 hardlink inode 相同,删除 run-local
+链接后公共 cache 文件仍存在;5/10/15 step 保存后完整 resume 只剩 10/15,
+而三个 params checkpoint 均可加载;validation-best=10、final=15 的收尾只保留
+这两个并删除 resume/replay。当前 16:23 启动的 noens runs 的已解析 Hydra
+config 不含新 artifact 字段,因此不会被这次改动中途删除。
+另以 4-step 微型 BC 完整调用 `Workspace.train()` 做自然完成 smoke:
+实际生成 1/2/3/4 四个 params checkpoint,结束后 resume 目录为空、online replay
+NPZ 为 0,finalization record 记录删除 2 个 replay episode 与 3 个 resume entry;
+因此清理不只是 helper 单测路径。
+
+## 66. Post-ensemble L2 随机化审计与跨任务确认门
+
+**1. Previous-stage result.** `move_plate` 的 100k、sealed-200
+(episode seeds 800--999) 四个 train seeds，normal success 为
+`78.5/73.0/82.0/82.0%`，修正后的 post-temporal-ensemble iid-L2
+(`--post-ensemble-keep-levels 2`) 为 `78.0/76.0/83.0/74.5%`；逐 seed
+差为 `-0.5/+3.0/+1.0/-7.5pp`，均值 `-1.0pp`。这只是在该四 seed
+点估计上没有观察到平均退化；train-seed 差值的 t-95% 区间约为
+`[-8.3,+6.3]pp`，不能据此认证等价。固定 leaf-0 的同组结果为
+`0.0/0.0/5.0/0.5%`，但 trace 中相对原动作的 delta 不是零方差常数：
+全 15 维均值约 `-0.0301`、std `0.0228`、范围约 `[-0.072,+0.008]`。
+
+同一 move_plate seed1 100k checkpoint 另在 eval seeds 400--449、50
+episodes 上对 temporal-ensemble plan history 做三层离散一致性审计：success
+`80%`；L0/L1/L2 的 modal-vote exact 分别为
+`98.54/92.34/65.78%`，相邻格一致率为 `99.95/99.31/88.90%`，所有
+history plans 全体一致的 `(dimension, step)` 比例为
+`94.26/70.78/9.38%`。配置确为 `levels=3,bins=5`、temporal ensemble on、
+replan interval 1。归一化 action 全跨度为 2；选定 L0/L1 后的 cell 宽
+`2/5^2=0.08`，即全动作跨度的 4%，L2 cell 宽为 `0.016`，即 0.8%。
+
+**2. Interpretation.** 可以保留的窄结论是：在 move_plate 这一个任务、
+这一组 checkpoint 上，把 temporal ensemble 已输出的连续 action 重新定位到
+其几何 L1 cell，再在该 cell 的五个 L2 中心逐 step、逐 dimension iid 均匀
+抽样，平均 success 只差 `-1pp`；而且 raw plan histories 的 L1 选择确实高度
+一致。不能把它写成“4% 区间内无论如何晃动都无损”或“L2 critic 等价于
+常数”：尚未测试 episode-persistent、低频、对抗、state-dependent 的零均值
+扰动，且 seed4 单独下降 `7.5pp`。post-ensemble 随机化发生在 plan averaging
+之后，所以 temporal ensemble 不会把该 iid 噪声再平均掉；plant/controller
+的低通与任务容差仍是可能机制。实现保留的是 ensembled continuous action
+反解出的几何 prefix，不是每个原始 critic plan 的逐位 ground-truth L0/L1。
+“无偏”也只严格指相对 L1 cell center 对称，不自动等于相对 critic 原动作
+零均值。
+
+**3. Next-stage decision.** 跨任务确认只纳入当前 corrected-demo-MDP 且非低
+成功率任务：`flip_cup`、`sandwich_remove`、`wall_cupboard_open`；明确排除
+sealed success 约 `18.5--21.5%` 的 `move_two_plates`。旧
+`dishwasher_close_trays` 100% run 使用 `truncate_demo_at_success=false` 且
+没有 validation sweep，不混入 matched 表。每任务 train seeds 1/2，各自用
+validation seeds 400--449 success 最大且 tie 取更早的 checkpoint：flip 为
+`101k/101k`，sandwich 为 `85k/35k`，wall 为 `5k/5k`。normal 与 iid-L2
+均用相同 diagnostic episode seeds 600--699、100 episodes、25 envs；800--999
+held-out 保持不用于这次选择或诊断。主指标为每 train seed success paired
+delta 与跨 seed mean；`mean delta >= -5pp` 视为初步复现，`<= -10pp` 视为
+明确不复现，中间区间增加 episode 数而不改 intervention。
+
+**4. Execution.** 新增 `scripts/run_l2_cross_task_eval.sh`；每个 arm 在独立
+artifact view 下只 symlink 原 config 与 validation-best params checkpoint，
+避免 evaluator 的 `sweep_evals/eval_<step>.json` 覆盖原 validation artifact。
+结果将写入
+`exp_local/cqn_l2_cross_task/<task>/seed<seed>/step<step>/<arm>/result.csv`。
+2026-08-06 01:24 BST 已启动 controller PID `1826297`，log 为
+`exp_local/cqn_l2_cross_task/controller.log`。启动时六张 GPU 均有训练进程；
+按 no-eval-with-training 协议，controller 只等待物理 GPU2
+(`GPU-80b9cc0d-...`)连续两次无 compute process 后才发车，目前尚未占用 GPU。
+
+### 66.1 跨任务 iid-L2 结果：三任务全部明确不复现 move_plate
+
+**1. Previous-stage result.** controller 已自然退出，12/12 个预注册 CSV
+完整，未见 traceback、CUDA/OOM 或 CPU fallback。每格均为 validation-selected
+checkpoint、diagnostic seeds 600--699、100 episodes；normal -> post-ensemble
+iid-L2 结果为：
+
+| task | train seed / checkpoint | normal | iid-L2 | delta |
+|---|---:|---:|---:|---:|
+| flip_cup | 1 / 101k | 42% | 28% | -14pp |
+| flip_cup | 2 / 101k | 39% | 27% | -12pp |
+| sandwich_remove | 1 / 85k | 71% | 38% | -33pp |
+| sandwich_remove | 2 / 35k | 85% | 61% | -24pp |
+| wall_cupboard_open | 1 / 5k | 100% | 88% | -12pp |
+| wall_cupboard_open | 2 / 5k | 100% | 88% | -12pp |
+
+task-level mean delta 分别为 `-13/-28.5/-12pp`，全部越过预注册的
+`<= -10pp` 明确不复现线；6/6 train-seed comparisons 同号下降。按每任务
+合并两 seed 的 200+200 episodes 做保守的独立二项近似，flip、sandwich、wall
+的 delta 95% CI 分别约为 `[-22.2,-3.8]`、`[-37.5,-19.5]`、
+`[-16.5,-7.5]pp`。sandwich 的两个 iid-L2 log 各记录 2 行
+`UnstableSimulationWarning`，对应 normal 均为 0；这最多是额外症状，数量
+不足以单独解释 24--33pp 的 success drop。
+
+**2. Interpretation.** `move_plate` 的四-seed mean `-1pp` 不是可迁移的
+CQN-AS 性质。相同 levels/bins、temporal ensemble 和 post-ensemble L2
+实现，在三个非低成功率任务上都造成 12pp 以上损失；因此“只要在 4%-wide
+L1 cell 内无偏 iid 晃动，成功率就不变”被直接否定。现有结果还不能区分
+两种机制：(a) 高频逐 step/逐 dimension jitter 本身破坏控制；(b) critic 学到
+的 L2 within-cell placement 对这些任务确实有用。sandwich 的少量 physics
+warning 支持 jitter 会伤动力学，但不是充分解释。
+
+**3. Next-stage decision.** 只增加一个独立 arm：同一 checkpoint、同一
+600--699 episodes，在 post-ensemble L1 cell 恒取中心 leaf 2。复用上表 normal
+baseline，不再打开 held-out。若 fixed-center 相对 normal 的 task mean
+`>= -5pp`，则判为主要是 iid jitter/时间结构问题、而非 critic L2 ordering；
+若 fixed-center 与 iid-L2 相差不超过 5pp 且相对 normal `<= -10pp`，则支持
+critic 的 L2 placement 有任务价值；其余为 mixed，增加 episode 数而不改 arm。
+
+**4. Execution.** 已新增并启动
+`scripts/run_l2_cross_task_center_eval.sh`，controller PID `2273788`，log 为
+`exp_local/cqn_l2_cross_task/center_controller.log`。2026-08-06 07:29 BST
+确认 flip/sandwich/wall seed1 分别真实运行在空闲 GPU1/2/3，命令均含
+`--post-ensemble-fixed-leaf 2 --num-eval-episodes 100
+--eval-seed-start 600 --num-eval-envs 25`；两 train seeds 在各卡串行，预计
+wall/flip 约 4--8 分钟、sandwich 约 16--18 分钟完成。未与训练同卡。
+
+### 66.2 口径更正：正式确认改为 200 episodes / seeds 800--999
+
+**1. Previous-stage result.** §66.1 的每格数字来自 diagnostic episode seeds
+600--699、100 episodes；虽然 6/6 deltas 同号且幅度很大，但它与 Claude
+原始 move_plate 表使用的 800--999、200 episodes 不同，不能标作同口径
+复现。现存跨任务 800--999 baseline 也不能直接拼表：flip 旧 200-episode
+结果是 100k，而 validation-best 为 101k；wall 旧结果是 25k，而 best 为
+5k；sandwich 没有 best-checkpoint 的 200-episode 表。用户指出这一不一致
+是正确的。
+
+**2. Interpretation.** 600--699 表保留为独立诊断证据，但正式跨任务裁决
+必须降级等待 matched 800--999 结果。旧 move_plate 四-seed normal/iid-L2
+表虽然已经是 200 episodes、800--999，却全部固定在 100k；其 validation-best
+实际为 seed1/2/3/4 的 `100k/100k/95k/45k`。特别是 seed4 validation 在
+45k 为 90%、100k 仅 74%，固定 100k 会把 checkpoint overtraining 混入
+L2 intervention 问题，不能回答“validation-selected policy 是否需要 L2”。
+
+**3. Next-stage decision.** 正式矩阵统一为：corrected-demo-MDP、validation
+seeds 400--449 选 success 最大且 tie 取更早 checkpoint；normal 与
+post-ensemble iid-L2 使用相同 episode seeds 800--999、每格 200 episodes、
+25 envs。三项 breadth tasks 各两个 train seeds，共 12 格/2400 episodes；
+move_plate 为直接审核 Claude 结论保留四 train seeds，共 8 格/1600 episodes。
+checkpoint 不由 800--999 选择。沿用 gate：task mean delta `>= -5pp` 初步
+复现，`<= -10pp` 明确不复现，中间区间增加 model seeds/episodes。fixed-center
+仍是独立机制问题，不混进此正式 normal-vs-iid 裁决。
+
+**4. Execution.** 2026-08-06 07:38 BST 已启动
+`scripts/run_l2_cross_task_ep200_800.sh`，controller PID `2292236`，artifact
+root `exp_local/cqn_l2_cross_task_ep200_800`；flip/sandwich/wall 已分别在
+GPU1/2/3 开始 best-checkpoint baseline。07:39 BST 又启动
+`scripts/run_l2_move_plate_ep200_800.sh`，controller PID `2295693`，artifact
+root `exp_local/cqn_l2_move_plate_ep200_800`；seed1/2 的 100k baseline 已在
+GPU0/5 开始，随后同卡串行 iid-L2 与 seed3/4 的 95k/45k 两臂。启动审计确认
+所用卡只存在 eval-only workload、无训练，occupancy <80%；命令强制
+`JAX_PLATFORMS=cuda`，因此不接受 CPU fallback。按现有每格耗时，move_plate
+预计 12--18 分钟，完整 breadth matrix 受 sandwich 限制预计 60--75 分钟。
+
+### 66.3 move_plate 独立四-seed 重跑完成：小幅负效应，不是零效应
+
+**1. Previous-stage result.** `scripts/run_l2_move_plate_ep200_800.sh` 已自然
+完成，8/8 result CSV 齐全；无 traceback、CUDA/OOM、CPU fallback 或
+`UnstableSimulationWarning`。每格均为 validation-selected checkpoint、
+episode seeds 800--999、200 episodes：
+
+| train seed / checkpoint | normal | iid-L2 | delta |
+|---|---:|---:|---:|
+| 1 / 100k | 79.5% | 79.0% | -0.5pp |
+| 2 / 100k | 73.5% | 70.5% | -3.0pp |
+| 3 / 95k | 81.0% | 79.5% | -1.5pp |
+| 4 / 45k | 73.5% | 70.0% | -3.5pp |
+
+normal mean `76.875%`，iid-L2 mean `74.75%`，paired model-seed mean delta
+`-2.125pp`；四个 delta 全部为负。以四个 model-seed deltas 做 t-95% CI
+约为 `[-4.32,+0.07]pp`；以 800+800 episode totals 做保守独立二项近似
+约为 `[-6.32,+2.07]pp`。因此未证明统计等价，但通过预注册的
+`mean delta >= -5pp` 初步复现线。Claude 固定 100k 的原表 mean delta
+`-1pp` 方向和量级大体正确，精确数值没有独立复现；例如 seed2 原表为
+`+3pp`，本次为 `-3pp`。
+
+**2. Interpretation.** “move_plate 上 post-ensemble iid-L2 只造成小影响”
+不是 evaluator 接错，也没有被 validation-best 选择推翻；但应写成约 2pp 的
+小幅负点估计、CI 仍跨 0，而不是“完全等价/完全无损”。这与任务语义上的
+“需要精细操作”不矛盾：精度需求要区分低频/系统偏差和逐 step、逐 dimension
+零均值高频 jitter。move_plate 的固定 leaf-0 系统偏差约 -0.03 会摧毁策略，
+证明它对 bias 高度敏感；本结果只说明其 contact/controller/trajectory 对
+同 L1 cell 内的高频 iid 变化有较强容忍，不能推出 persistent 或 state-dependent
+L2 perturbation 也安全。
+
+100-episode diagnostic 的 fixed-center 已全部完成，normal -> center 为：flip
+`42->40/39->37`（均 -2pp），sandwich `71->67/85->77`（-4/-8pp），wall
+`100->100/100->100`。center 远好于对应 iid-L2 的
+`28/27`、`38/61`、`88/88`；所以 breadth tasks 的大跌主要指向 iid 时间结构
+有害，而不是“critic 精确 L2 bin selection 必不可少”。sandwich 仍有 modest
+center cost，不能说所有任务 L2 ordering 完全无价值。
+
+**3. Next-stage decision.** 先完成正在运行的正式 breadth 200-episode
+800--999 矩阵，不在其完成前再开新的 perturbation 问题。最终按每 task 两个
+train-seed paired mean 和原 gate 裁决，并将 600--699 表明确保留为诊断/复现
+split。若正式 breadth 仍显示 move_plate 独有的 iid robustness，下一独立机制门
+才比较 fixed-center、iid-L2 与 episode/block-persistent L2；相同 best checkpoint
+与 600--699 selection-free diagnostics，persistent 相对 iid 再下降 >=10pp 才
+支持“频谱/低通”解释。
+
+**4. Execution.** move_plate controller PID `2295693` 已退出并写出
+`[l2-move-plate] all matched evaluations complete`，artifact root 为
+`exp_local/cqn_l2_move_plate_ep200_800`。breadth controller PID `2292236`
+仍运行；截至 08:03 BST，wall 两 seed 已完成为
+`100->83.5/100->82.5`，flip seed1 为 `42.5->27.0`、seed2 baseline 38%，
+sandwich seed1 baseline 65.5%，其余格仍在跑。当前结果未用于 checkpoint
+选择，预计受 sandwich 剩余三格限制还需约 35--50 分钟。
+
+### 66.4 正式跨任务 800--999 矩阵完成：move_plate 的耐受性不具普遍性
+
+**1. Previous-stage result.** 2026-08-06 08:28 BST，formal breadth 矩阵
+12/12 个 CSV 已齐全。每格均使用 validation seeds 400--449 选出的 best
+checkpoint，normal 与 post-ensemble iid-L2 共用 episode seeds 800--999、
+200 episodes、25 envs：
+
+| task | train seed / checkpoint | normal | iid-L2 | delta |
+|---|---:|---:|---:|---:|
+| flip_cup | 1 / 101k | 42.5% | 27.0% | -15.5pp |
+| flip_cup | 2 / 101k | 38.0% | 26.0% | -12.0pp |
+| sandwich_remove | 1 / 85k | 65.5% | 33.5% | -32.0pp |
+| sandwich_remove | 2 / 35k | 78.5% | 54.5% | -24.0pp |
+| wall_cupboard_open | 1 / 5k | 100.0% | 83.5% | -16.5pp |
+| wall_cupboard_open | 2 / 5k | 100.0% | 82.5% | -17.5pp |
+
+task-level paired mean delta 分别为 flip `-13.75pp`、sandwich `-28.0pp`、
+wall `-17.0pp`，全部越过预注册的 `<= -10pp` 明确不复现线，且 6/6
+train-seed comparisons 同号下降。按每任务 normal/iid 各合并 400 episodes
+做保守独立二项近似，delta 95% CI 分别为 `[-20.22,-7.28]pp`、
+`[-34.56,-21.44]pp`、`[-20.68,-13.32]pp`。对应 600--699、100-episode
+diagnostic 的 task means 为 `-13/-28.5/-12pp`，正式 split 在方向和量级上
+复现，而不是由 episode split 造成。
+
+结合 §66.3 的 move_plate 四-seed结果，完整 formal audit 共 20 格、4000
+episodes：move_plate `-2.125pp`，其余三个 task 均为 `-13.75pp` 或更差。
+formal breadth logs 未见 traceback、CUDA/OOM 或 CPU fallback；sandwich
+四格各有 2 条 `UnstableSimulationWarning`，normal 与 iid 对称，不能解释
+arm 间 success 差异。所有目标 evaluator PID 已退出。
+
+**2. Interpretation.** Claude 的窄结论——move_plate 上 post-ensemble、
+逐 step/逐 dimension 的无偏 iid-L2 只造成小幅变化——量级上成立；本次
+validation-best 重跑点估计为 `-2.125pp`，不是严格的零损失或统计等价。
+把它推广成“在 4%-wide L1 cell 内只要无偏就无损”则被三个正式任务一致
+否定。move_plate 看起来需要精细操作却能容忍这种 intervention，不构成矛盾：
+已有 leaf-0 实验说明它对约 0.03 的低频系统偏差极敏感；本实验测的是同一
+L1 cell 内的高频零均值 jitter。任务精度、偏置敏感性与高频抖动敏感性是
+不同轴。fixed-center diagnostic 又显示 breadth 的大跌主要来自 iid 时间结构，
+而不是 critic 精确 L2 leaf 本身不可替代；但 sandwich 的 4--8pp center cost
+仍保留少量 L2 placement 价值的可能。
+
+**3. Next-stage decision.** 对用户当前问题，formal gate 已给出明确裁决：接受
+“move_plate 特例上影响小”，拒绝“其他成功率较高 task 也普遍如此”，不再
+为这一裁决增加 held-out episodes。episode/block-persistent、低频或
+state-dependent L2 扰动属于新的机制问题，必须使用独立 protocol；若继续，
+matched arms 应为 center、step-iid、episode-persistent，复用同一 best
+checkpoint 与未参与选择的 diagnostic split，主指标为 success delta，
+persistent 相对 step-iid 再下降 `>=10pp` 才支持低通/频谱解释。
+
+**4. Execution.** formal artifacts 保存在
+`exp_local/cqn_l2_cross_task_ep200_800` 与
+`exp_local/cqn_l2_move_plate_ep200_800`。用户授权后，缺失臂迁到 GPU2/4；
+GPU2 峰值同时运行三条 eval，未与训练同卡。为避免原 controller 自动重复
+启动 seed2，sandwich 父 shell 曾暂停；seed1 iid 写出后仅终止该旧 shell，
+新发车的 seed2 两臂不受影响。最终结果计数为 breadth `12`、move_plate `8`，
+日志异常扫描完成，旧 controller/zombie 与全部目标 evaluator 均已退出，
+GPU2/4 已释放本实验占用。本阶段按预注册 gate 闭环，不自动启动一个不同的
+扰动机制实验。
+
+### 66.5 L0-only deterministic-center gate：区分 fine-level 选择与随机抖动
+
+**1. Previous-stage result.** 回查现有 100k、200-episode、seeds 800--999
+MovePlate artifacts 后确认，旧 `level_override_mode=middle` 已经做过真正的
+层级删除对照：保留 critic L0，L1/L2 全部固定为 bin 2，四个 train seeds 为
+`81.0/71.5/80.5/83.0%`，mean `79.0%`；matched normal 为
+`78.5/73.0/82.0/82.0%`，mean `78.875%`，delta `+0.125pp`。因此 fixed
+center 删除 L1/L2 的选择没有造成损失。相反，修正后的 post-ensemble
+keep-L0、逐 step/逐 dimension 均匀随机 L1+L2 为 `0.5/0/0/0%`，mean
+`0.125%`；归零来自高幅 iid jitter，而不是删除 fine-level critic ordering。
+
+同一批官方 truncated MovePlate 100k checkpoints 的 powered sibling causal
+probe（四 train seeds；每层约 800 states）给出 pooled pairwise sign accuracy：
+L0 `57.1%`、L1 `52.2%`、L2 `51.2%`；五个 sibling expected-Q mean span 为
+`1.358/1.084/0.328`。这说明 L0 有弱但一致的因果排序信号；L1 虽制造较大
+Q gap，排序仍近随机；L2 更平且排序近随机。probe 没有保存 51-atom
+distribution divergences，所以不能把 expected-Q 更接近升级为完整 C51
+distributions 相同。
+
+**2. Interpretation.** MovePlate 当前证据已不支持“L1 是 value 命门”：任务
+需要一个稳定的 L0 cell 内 placement，但不需要 critic 对 L1/L2 做逐层 argmax；
+deterministic midpoint 足够。random keep1 与 middle-from1 回答的是不同问题，
+前者测时间高频扰动，后者才测 fine-level selection 的边际价值。算法层面的
+候选简化因此是 `critic-select L0 + deterministic center refinement`，而不是
+继续修 L1/L2 value 或把 Gaussian/jitter 当作 value fidelity proxy。
+
+**3. Next-stage decision.** 正式 external-validity gate 复用 §66.4 的
+validation-selected normal baselines，不重跑 baseline；新增唯一 arm 为
+post-ensemble geometric L0 cell center：`keep_levels=1,fixed_leaf=12`（3 levels、
+5 bins 下剩余 25 leaves 的正中心）。episode seeds 800--999、200 episodes、
+25 envs；MovePlate 四 train seeds，flip/sandwich/wall 各两 seeds，共 10 arms、
+2000 new episodes。每 task paired mean delta `>=-5pp` 判 fine-level selection
+可在执行侧删除，`<=-10pp` 判该 task 仍需 fine geometry（但单独不能证明
+critic ordering 正确），中间带增加 model seeds。若所有高成功率 task 均通过，
+下一阶段才训练真正 `levels=1` 的 matched variant，以区分执行侧可删与训练期
+shared-representation/loss 仍有贡献。
+
+**4. Execution.** 新增 `scripts/run_l0_only_center_ep200_800.sh`，artifact root
+`exp_local/cqn_l0_only_center_ep200_800`，controller log
+`exp_local/cqn_l0_only_center_ep200_800_controller.log`。2026-08-06 09:22 BST
+controller PID `2531776` 已确认运行；GPU2 上 flip seeds 1/2 两条 evaluator
+命令均含 `--post-ensemble-keep-levels 1 --post-ensemble-fixed-leaf 12
+--num-eval-episodes 200 --eval-seed-start 800`。GPU4 当时已有三个其他用户的
+`eval_only=true` 进程，第三 worker 正在等待 occupancy <3 后发车；controller
+每臂前重新计数，保证 GPU2/4 各自最多三个 eval 且不与训练同卡。
+
+## 67. `official+truncation` 命名更正与官方差距归因审计
+
+**1. Previous-stage result.** 四个 MovePlate 高分 run 的实际
+`.hydra/overrides.yaml` 只含 canonical `cqn_as_pixel_bigym_demo_driven`、
+`env.truncate_demo_at_success=true`、train seed/GPU 与运行基础设施开关；
+四份 resolved config 除 seed/GPU 外逐值相同。没有 offline pretraining、high
+UTD、QC/n-step、bin/structured exploration、reward/Q scale、BC schedule 或
+checkpoint selection；10/100k 日志按列名核验为 UTD=1，100k 时
+`act_train_calls_total=100001`，各探索触发计数为 0。四 seed 固定
+100k、200-episode、seeds 800--999 为 `78.5/73.0/82.0/82.0%`，mean
+`78.875%`；101k 为 `78.5/70.5/83.0/76.0%`，mean `77.0%`。
+
+两个同 checkpoint 的执行侧对照均已完成（seed1@100k，200 episodes，
+seeds 800--999）：
+
+| eval contract | success | matched current |
+|---|---:|---:|
+| current local | 78.5% | — |
+| 官方 `TemporalEnsembleControl` 的 zero-sentinel + 旧计划高权重 | 78.5% | 0.0pp |
+| 官方锁定 BiGym `72d3054` | 78.0% | -0.5pp |
+
+新 artifacts 为
+`cqn_official_truncated/...seed1.../ep200_official_temporal.csv` 和
+`ep200_bigym72d305.csv`；两次均无 traceback、CUDA/EGL fallback、OOM 或
+physics warning。因此 temporal-ensemble 权重方向/zero-sentinel 与新旧
+BiGym reset 不能解释约 14.9pp 的官方 public-log 差距。
+
+**2. Interpretation.** runner 注释中“Everything else is stock official”不成立，
+这些 run 应改称 **local canonical JAX + demo truncation**。官方公开代码自
+首个 public commit 起已在第一个 reward 处截断 demo，所以不能把
+`78.875 - 64.0pp` 全部写成“我们多加了截断”。能严格成立的
+截断因果量只是本地同 seed 的 `67.5 -> 78.5%` (+11pp)；它说明
+截断修复了本地未截断 replay，不能单独解释为什么官方已截断的
+public log 仍为 64.0%。
+
+已确认的剩余训练合同差异为：官方每帧 low-dim 是
+`58 proprio + 2 gripper + 3 floating-base = 63D`，并对 63D 全部用截断后
+demo stats 做 z-score；本地是 60D，不输入 floating base，并把
+`proprioception[0]` 和两维 gripper summary 保持 raw scale。官方把第一个
+post-action demo frame 当 dummy FIRST，丢掉 reset-to-first-action transition；本地用
+demo seed 重建 reset observation 并保留该 transition。本地 stats 在截断前算，
+官方在截断后算；MovePlate action min/max 实测逐维相同，因此 action
+scaling 已被排除，obs contract 仍未隔离。其余 residual 是 Flax/PyTorch
+GRU、initialization、RNG/replay scheduling 和官方训练内每 2500 步 25-episode eval
+与本地 async eval 的差异。官方 README 自身明示 public logs 可与 paper
+不同、public port 可能无法完全复现 paper；其 64.0 只有聚合 pickle，
+无 checkpoint/resolved config/per-seed episode 可供进一步归因。
+
+**3. Next-stage decision.** 下一训练归因门只回答 observation contract，
+不混 demo alignment 或 framework 更换。共享 current local+trunc baseline，分别单改
+(A) 恢复对 `proprioception[0]`/gripper summary 的全 z-score（仍 60D），
+(B) 只追加 normalized floating-base 3D（仍保留本地特殊 scale）；seeds 1/2、
+101k，validation seeds 400--449 覆盖所有 checkpoints 选 best，通过后才打开
+800--999 的 200-episode held-out。主指标是 best-checkpoint success 的 paired
+delta，并同时记录 online low-dim p99.9/max 和 non-finite 事件。任一单改两
+seed mean 使 local baseline 下降 `>=8pp` 则升格为主差距候选；`<=5pp`
+则排除为主因；中间带补 model seed。demo alignment 作为下一个独立问题，
+不与本门同时修改。
+
+**4. Execution.** 本轮已完成 launcher/resolved-config/log/replay 审计与两个
+200-episode 执行侧配对对照，并写出上述 CSV。未启动新训练臂：
+当前 GPU0/1/3/5 均有其他用户的训练量进程，GPU2 正跑两个已注册
+L0-center eval，GPU4 有三个其他用户 eval；新训练会违反共享集群配额与
+no-eval-with-training 规则。因此 concrete blocker 是没有安全训练槽，不是实现或数据缺失。
+
+## 68. JAX CQN-AS 首个 non-finite stage 取证与 task-rate 对照
+
+**1. Previous-stage result.** 旧 forensic dump 已覆盖 QC/non-QC、nstep-1/8、
+move_plate/move_two_plates 与多种执行臂；所有保留 batch 的 float 叶均有限，
+但守卫触发后 online params 与 Adam state 已整树 non-finite。坏点前的 snapshot
+参数范数和 Adam moments 与健康 seed 同量级，loss 也没有渐进爬升。因此旧
+artifact 只能把首污染区间缩到一次 JAX forward/backward/Adam/apply，不能判定
+首个坏算子；旧 tap 又没有保存 RGB，无法做完整 batch 重放。PyTorch 与本地
+JAX 配置均是 AdamW、`critic_grad_clip=null`，所以“PyTorch 默认有梯度裁剪而
+JAX 没有”已由配置和代码排除。
+
+按 2026-08-03 后有明确错误日志的近期波次计数，8 次 hard NaN 中 7 次发生在
+move_plate、1 次在 move_two_plates；但 exposure 强烈偏向 move_plate，不能把
+7/8 当 task 因果。更可比的子组是：official move_plate nstep-1/replan-1 为
+0/2；当前使用的 move_plate `QC8 + truncate + obs_std_floor=0` 旧波次中两个
+有效启动 seed 分别在 1k/4k NaN（另一个 OOM、一个被 controller 中止，均不计）；
+`obs_std_floor=0.01` 的 QC 波次为 2/4（11k/99k）；official move_two_plates
+为 1/2（82k）；sandwich_remove 0/4、flip_cup 0/2。训练 loss 仅用于数值
+存活判断，不代表 policy quality，本阶段不涉及 checkpoint selection。
+
+**2. Interpretation.** 当前最高复发的历史组确实是 move_plate QC8，而不是
+普通 official move_plate。task 相关性有信号，但与 nstep/replan、observation
+contract 和各 task 的曝光预算混淆，尚不能写成根因。新 provenance 的
+move_plate seed1/2 已同时健康穿过历史 1k/4k 坏点，seed3 到 2k；所有记录的
+features/target logits/distributions/loss、raw grads、Adam updates/new state、
+candidate params/target 均有限且 `update_committed=1`。同 seed/config 坏点不
+确定复现，说明事件依赖实际 online trajectory/minibatch 或更低层非确定性，
+而非由 task+seed+config 唯一决定。
+
+**3. Next-stage decision.** 首要门继续只加 provenance、不加 z-clip、删 state
+或 grad-clip：move_plate QC8 seeds 1--3 跑到首个 non-finite 或 101k；通过线
+是捕获至少一次首坏 stage 并保留 pre-update state 与完整 RGB batch，三 seed
+全到 101k 则只判本轮未复现。task 假设作为独立 matched control：
+dishwasher_close_trays seed2 仅替换 env，保持 QC8、truncate、
+`obs_std_floor=0`、无 grad clip 和相同 instrumentation；比较 first-nonfinite
+step 与 101k survival，不用 success/loss 代替数值判决。确认首坏 stage 后，
+根因修复才用新 seeds 做 survival validation；策略质量另按 validation
+400--449 选 best checkpoint，held-out 800--999 保持密封。
+
+**4. Execution.** provenance 代码已在 JIT update 内返回 forward、gradient、
+optimizer/new-state/candidate-tree finite flags 与 max-abs；首坏 candidate 不
+commit，workspace 保存最近三个完整 batch（含 uint8 RGB）和 pre-update agent
+state。focused tests：CQN-AS update `1 passed`，workspace guard `2 passed`，
+并已由真实 GPU 首次 update 验证。主 artifact root 为
+`exp_local/cqn_nan_provenance/qc_20260806212634`；截至 21:38 BST，GPU2
+运行 seed1/3，GPU4 运行 seed2（该卡另有一条外部训练），严格保持每卡最多
+两条训练。cross-task controller PID `3487733` 已排队，root 为
+`exp_local/cqn_nan_provenance/cross_task_20260806213800`；它要求 GPU2/4
+任一卡连续两次检查低于两条 CUDA process 才发 dishwasher control，当前尚未
+占用额外 GPU slot。
+
+### 68.1 首坏点已捕获：tp1 batch 在 critic 前已发生内存级污染
+
+**1. Previous-stage result.** move_plate device-merge seed2 在 iteration
+`5154` 首次触发，新 guard 在 candidate commit 前保住了 last-good state。
+`pre_params/pre_target/pre_opt_state` 全有限；current features、chosen/all logits、
+BC terms 也全有限。第一个坏 stage 是 `next_features_all_finite=0`，随后
+target logits/probabilities/distribution、loss、gradient、Adam candidate 和
+candidate params/target 依次非有限。关键是输入 tap 同时证明网络前的
+`low_dim_state_tp1` 已坏：512/512 rows 受影响，122,880 个元素中 203 个
+non-finite、36,016 个 `abs(x)>1e6`，最大有限值
+`3.3974545e38`；同批 current low-dim max 仅 40.666，其余 float fields 全有限。
+
+按 dump 的 512 个 indices 分别从 online replay 与 expert-demo replay 的落盘
+episode 重建 nstep-8 tp1。current state 与 dump **122,880/122,880 逐元素相同**；
+正确 tp1 全有限、max 21.386，但与 dump **122,880/122,880 全部不同**，online
+和 demo 两半均为 0 个相等元素。源 episode 自身全有限。原始 dump、pre-state
+与重建审计分别在
+`exp_local/cqn_nan_provenance/qc_20260806212634/seed2/nonfinite_dump/`
+的 `batches_iter5154.npz`、`pre_update_state_iter5154.pkl`、
+`summary_iter5154.json`、`reconstruction_audit_iter5154.json`。
+
+**2. Interpretation.** 这次 NaN 的直接原因不是 C51 target、GRU/LayerNorm、
+backward 或 AdamW 自发数值爆炸，而是 **host replay 文件之后、JAX forward
+之前的 tp1 transport/merge batch corruption**。critic 只是忠实地把坏输入传播成
+NaN；新 guard 阻止了整树污染。它也解释了为什么 PyTorch 版本可以从不 NaN：
+当前嫌疑是本地 JAX-only 的 `WorkspaceFast` device-side demo merge/background
+prefetch 路径，而不是两个 framework 的 Adam epsilon 或 gradient clip 差异。
+task 仍可能通过 tensor shape/allocator 时序改变触发率，但环境动力学不可能
+产生本次接近 float32 上限的数值。尚未区分 device merge/prefetch 与更早的
+vectorized sampler；重建排除了持久 replay 数据本身。
+
+**3. Next-stage decision.** matched containment/attribution arm 只设置
+`ROBOBASE_HOST_MERGE=1`，其余保持同 move_plate QC8、truncate、seed2、
+`obs_std_floor=0`、vectorized sampler、device prefetch 与 provenance；先比较
+5154 旧坏点，最终指标为 first-corrupt-input step 与 101k survival。若 host merge
+也复现相同输入污染，下一独立 arm 才设置 `ROBOBASE_SCALAR_SAMPLE=1`；若 host
+merge 多 seeds 存活而 device arm 再次失败，则 device merge/background JAX
+dispatch 被判为主因。数值 containment 确认前不做 policy-quality 声明。
+
+**4. Execution.** device seed1 留作 replicate；已在健康 3k 主动停止 seed3，
+并写入 `STOP_REASON.md`，不能计作 survival。host-merge controller PID
+`3501504` 已于 21:45:38 BST 在 GPU2 启动，artifact root
+`exp_local/cqn_nan_provenance/host_merge_20260806214538`；GPU2 上仅与 device
+seed1 配对，首次真实 JIT update 已写出 iteration 0、loss 0.49318、全部 stage
+finite、`update_committed=1`。dishwasher task-only control 已在 GPU4 启动并写出
+2k finite row；
+同卡另有一条外部训练。停止 seed3 后旧 queue 曾竞态重发 PID `3500330`，已
+精确终止该重复进程及 queue shell；GPU2 已恢复两条训练上限。
+
+### 68.2 第二次独立复现与 host-merge 首个归因门
+
+**1. Previous-stage result.** device-merge seed1 又在 iteration `10308`
+触发，pre-params/target/Adam 仍全有限。这次与 5154 相反：tp1 features、target
+logits/distribution 全有限，首先坏的是 current features；完整 batch 中
+`low_dim_state` 的 122,880 个元素有 297 个 non-finite、33,453 个
+`abs(x)>1e6`，最大有限值 `3.3975584e38`。按 indices 从持久 replay 重建，
+正确 current state 全有限、max 42.536，且 dump 的 122,880/122,880 个元素
+全部不匹配；同 batch 的 tp1 则与重建 122,880/122,880 逐元素相同、max
+15.160。第一次随机坏 tp1，第二次随机坏 current observation，签名相同而 key
+不同。
+
+matched `ROBOBASE_HOST_MERGE=1` seed2 已写出 6k finite row：loss 0.22447、
+`update_committed=1`、无 nonfinite dump，明确穿过同 seed device arm 的 5154
+failure step。dishwasher device-merge task control 同期到 6k finite。
+
+**2. Interpretation.** 两次都是 online 与 demo 两半一起整张 observation
+buffer 变成近似未初始化内存，而另一时态 observation 完全正确；这不符合
+MuJoCo/task state、持久 replay 数据或 critic 数值发散。它与
+`WorkspaceFast._DeviceMergedIterator` 的实现边界吻合：background prefetch
+线程对每个 key 独立执行 host-to-device `jnp.asarray` 和 device-side
+`jnp.concatenate`，每个 key 对应独立的异步输出。host merge 去掉这一层后首个
+matched failure step 存活，已支持 device-merge/prefetch 为主因，但单个 6k
+survival 尚不足以排除随机事件或 vectorized sampler。
+
+**3. Next-stage decision.** host-merge seed2 至少继续超过第二个 device 事件
+10308，并最终跑到 101k；若全程无输入污染，再补一条 host-merge seed 验证。
+若 host arm 也出现同签名，下一独立 arm 才关闭 vectorized sampler。低层确认可
+在 device merge 前记录 host finite/checksum、merge 后立即 block/checksum；host
+正确而 device 错误即可把首坏操作钉到 concat/transfer。通过标准仍是 input
+finite 与 101k survival，不用 critic loss 代表 policy quality。
+
+**4. Execution.** device seed1 已由 guard 安全退出并保存完整 dump/pre-state；
+host-merge PID `3501509` 在 GPU2 继续运行，6k artifact 已验证；dishwasher
+PID `3489377` 在 GPU4 继续运行。两卡仍各最多两条训练进程，本阶段没有打开
+任何 held-out policy evaluation。
+
+### 68.3 host-merge 回退的实时吞吐成本
+
+**1. Previous-stage result.** host-merge seed2 已到 8k、无 dump。剔除首次
+compile、5k/10k snapshot 区间后，当前同 GPU2 双跑条件下，host arm 的完整
+1k-window 中位吞吐为 6.61 steps/s；同期 device seed1 为 6.13 steps/s。host
+没有观测到减速，但两者受同卡竞争和不同启动时刻影响，不能把 +7.7% 写成
+真实加速。历史 clean ABBA 的 4.55 -> 10.73 steps/s 是
+`scalar+host` 对 `vectorized+device` 的组合差，不能归因给 merge 单项；其中
+已单独测得的主要收益是 vectorized sampler 的 78.5 -> 35.8 ms/buffer。
+
+**2. Interpretation.** 保留 vectorized sampler、只回退 host merge 不会退回旧
+管线 2.36x 的慢速；当前实测成本在运行噪声内。host `np.concatenate` 会多做
+约 130MB/update 的 CPU copy，但 prefetch 可与约 75ms backend update 重叠，
+所以 CPU work share 不能直接换算成 end-to-end slowdown。保守预期是 0--15%，
+而不是 2x；exact 单卡数字仍需 clean matched benchmark。
+
+**3. Next-stage decision.** 数值稳定优先，host merge 继续作为 containment arm。
+它通过 101k survival 后再在 GPU5 按 ABBA 单跑、固定 1k--3k window 测
+device/host 单项差，并用输入 checksum guard 保证 device arm 不静默污染。
+若 host 的 clean slowdown <=15% 则直接作为默认；更高才设计同步后的安全
+device merge。性能门与 policy quality 分开。
+
+**4. Execution.** host PID `3501509` 继续训练；当前 throughput 由两份
+`train.csv` 按列名和 total-time 差分重算，snapshot windows 已剔除。未为测速
+新增 GPU 进程，也未改变正在跑的 numerical-control config。
+
+### 68.4 GPU0 utilization 跳动的实时归因
+
+**1. Previous-stage result.** 20 秒、1 Hz `nvidia-smi dmon` 的 SM utilization
+为：GPU0 mean 65.0%, sd 23.7, range 10--98；GPU5 mean 61.0%, sd 29.9,
+range 10--98；GPU2 mean 95.0%, sd 3.9, range 87--98；GPU4 mean 92.1%,
+sd 4.2, range 86--98。GPU0 上是两条相差约 3 秒启动的
+`swflip_sandwich_remove` host-merge nstep-1 run，采样时均在 3k；GPU5 上
+两条同批 `l1flip_hi_move_plate` run 也同样跳动。GPU2/4 各自还有一条
+早启动约两小时的 QC8/nstep-8 训练填充新 run 的空档。GPU0 当前
+47 C、power limit 575 W，无 active thermal/HW slowdown；Xorg/desktop 仅占约
+61 MB。sandwich 两份日志合计仅一次 `mjWARN_BADQACC`。
+
+**2. Interpretation.** 图上的差异是同卡 workload mix，不是 GPU0 硬件故障：
+host replay/concat、environment step 和 GPU update 交替会产生 burst/gap；同时
+启动的同构进程会让部分 gap 对齐。GPU2/4 的旧 QC8 run 将这些空档
+填平。GPU5 的 move_plate 也出现同等幅度，所以 task 不是主因；
+一次 MuJoCo warning 也无法解释持续波形。utilization 跳动本身不是
+NaN/batch corruption 的证据。
+
+**3. Next-stage decision.** 不为了平滑 nvitop 图重启训练。效率以每条
+`train.csv` 的无 snapshot 完整 1k window 为准；只有若 GPU0 的单 run
+持续比 matched GPU5 低 >20%，才单独分离 task CPU cost、host merge 和进程
+同步性。后续新建配对 run 仍按协议错开约两分钟启动。
+
+**4. Execution.** 已核对 GPU PID/CWD/config/environment、采集 dmon/pmon、检查
+日志和 throttle state；六条新 run 都仍在 2k--3k 并继续产生 CSV。
+没有新增、终止或重启任何 GPU 进程。
+
+### 68.5 host-merge 101k survival gate 与扰动 wave 当前进度
+
+**1. Previous-stage result.** matched move_plate QC8 host-merge seed2
+`exp_local/cqn_nan_provenance/host_merge_20260806214538/seed2` 已于
+2026-08-07 01:45 BST 正常退出，`completed_env_steps=101000`、保留 21 个
+eval checkpoints。`train.csv` 的 101 行、20 个 `*_all_finite` 诊断列和
+`update_committed` 全部通过，无 `nonfinite_dump`；对应 device-merge seed2/seed1
+分别在 5154/10308 发生整张 observation buffer 污染。device-merge
+dishwasher task control
+`exp_local/cqn_nan_provenance/cross_task_20260806213800/dishwasher_close_trays_seed2`
+也正常完成 101k，同样 101/101 rows、20 个诊断列全通过、0 dumps。
+
+六条 post-ensemble perturbation 主训练尚未完成：`swflip_sandwich_remove`
+seed1/2 在 93k/84k，`l1flip_move_plate` 在 79k/78k，
+`l1flip_hi_move_plate` 在 86k/82k；六条当前都是 finite、0 dumps。还没有
+`val50_seeds400.csv` 或 `ep200_seeds800.csv`，因此尚无 policy-success 结果。
+
+**2. Interpretation.** host merge 在同 task、同 seed、同 QC8 配置下从 device
+路径的 5k failure 提升到完整 101k survival，强支持
+`_DeviceMergedIterator`/asynchronous device merge 边界是主因；但只有一条
+matched host QC8 seed，仍不能宣称完全封案。dishwasher device arm 能到
+101k 说明 task/tensor/allocator timing 会影响触发率，不说明 device path
+安全。perturbation wave 的 training loss/online episode 不能替代 validation 或
+sealed success rate，所以 L1/L2 研究结论此刻不变。
+
+**3. Next-stage decision.** NaN 线需要第二条 matched host-merge QC8 seed 完成
+101k、0 dumps 才通过 containment replicate gate；之后才做 blocked/checksummed
+device concat 定位。perturbation wave 按原协议训到 100k，用 seeds 400--449
+的 50-episode validation 做 checkpoint selection，再用 seeds 800--999 的 200-episode
+sealed read；必须比较各自 validation-selected best checkpoint，100k endpoint 只作
+固定端点补充。当前最慢主 run 按最近 1k window 约 91 分钟到
+100k，此后才会有 eval result。
+
+**4. Execution.** 已从 live PID/environment、GPU UUID、`train.csv`、controller
+exit code、`training_artifacts_finalized.json`、eval checkpoints 和 dump 目录完成本阶段
+核对；正在运行的六条主 run 保持不动。本次检查同时发现他会话
+新启动了 GPU1 两条 `l1flip_decay_move_plate`；当前本 repo 的 training
+使用 GPU0/1/2/4/5，违反“最多两张卡训练”协议。GPU0/5 的两个 wrapper
+还可能在 peer seed 仍训练时直接启动同卡 eval。因本轮是只读状态请求，
+未擅自终止其他 session 的进程，也未新启动 replicate。
+
+### 68.6 blocked device merge 候选修复
+
+**1. Previous-stage result.** host-merge move_plate QC8 seed2 已 101k/0 dumps，
+而旧 device-merge seed2/seed1 在 5154/10308 出现整张 float observation
+buffer 污染。检查 `WorkspaceFast._DeviceMergedIterator` 确认：它在后台
+prefetch thread 中发起每个 key 的 `jnp.asarray` 和 device concatenate，然后在
+整棵 tree ready 前直接返回。已实现候选 containment：在该 background
+worker 里对 merged tree 做一次 `jax.block_until_ready`，然后才释放两份
+source NumPy batch；concat 和 transfer 仍在 device，没有恢复 host 的大拷贝。
+另增 `ROBOBASE_DEVICE_MERGE_VERIFY=1` attribution gate，会对所有非 RGB
+字段做 host/device 逐值 exact compare，任一 mismatch 立即报错。
+
+CPU 的 workspace/vectorized-replay focused suite 为 16 passed。在空闲 GPU3 上使用
+5154 dump 中一个真实 20-key、261,701,120-byte retained batch，修复路径
+与 host concat 20/20 keys 逐值一致；500 次源 buffer 返回后立即 NaN/Inf
+poison stress 为 500/500 exact。修复路径孤立延迟 median 17.55 ms、p99
+26.97 ms；host-concat-then-put 的 12 次对照 median 120.99 ms。但同样的
+旧 unsafe async synthetic 500 次也未复现污染。
+
+**2. Interpretation.** ready barrier 是一个有明确安全性边界、不恢复 260 MB
+host copy 的合理修复；孤立测量中它只比 unsafe dispatch median 约 1.1 ms，
+而且仍可以在 prefetch thread 与 main-thread update 重叠。但 synthetic unsafe
+500/500 通过意味着“host source 被立即复用”还没被证明为唯一首坏
+机制；当前应称为 candidate containment，不能称已封案 root cause。微基准
+也不等于 end-to-end training throughput。
+
+**3. Next-stage decision.** 下一独立 infra arm 必须去掉 `ROBOBASE_HOST_MERGE`、
+打开 `ROBOBASE_DEVICE_MERGE_VERIFY=1`，使用同 move_plate QC8、truncate、seed2
+和原 nonfinite dump 设置。第一门是穿过 5154 和 10308 到 12k，exact
+verifier 0 mismatches、0 dumps；通过后继续 101k。再用第二 seed 复制 101k
+survival。性能用无 JIT/snapshot 的 1k windows 与 host arm 比较；本问题没有
+checkpoint selection 或 held-out policy split，不做 policy-quality 声明。只有两条
+101k 都通过后，才从后续生产 launch 中摘掉 `ROBOBASE_HOST_MERGE=1`；
+kill switch 保留。
+
+**4. Execution.** 修复与 verifier 已写入 `robobase/workspace_fast.py`，回归写入
+`tests/unit/test_workspace_fast.py`；CPU 和 GPU retained-batch gates 均已执行。没有
+改动任何已运行训练的 environment，也没有摘除它们的 host rollback。
+真实 12k/101k arm 未启动：当前他 session 仍让本 repo 的 training 占用
+GPU0/1/2/4/5，已超过“最多两张卡”硬上限；在 card count 回到允许范围
+前不再新增训练。后续 live 复查又确认他 session 同时启动了 6 个
+50-episode validation：GPU2/4 已实际出现 training+eval 同卡，GPU3 同时
+运行 4 个 eval。本阶段未再加载 fixed-device training，也未干预他 session
+进程。
+
+### 68.7 blocked device merge 真实训练门已启动
+
+**1. Previous-stage result.** 空闲卡出现后，候选修复的 move_plate QC8 seed2
+arm 已在独占 GPU4 真正写出 `env_steps=2000`：最近 `critic_loss=0.28463`，两行
+均为 20/20 `*_all_finite` 诊断通过、`update_committed=1`，无 verifier mismatch、
+无 nonfinite dump。0--1k/1k--2k 的 `total_time` 差分吞吐分别为
+11.24/10.97 steps/s；30 秒、1 Hz
+GPU4 采样的 SM utilization 为 83--92%，显存固定约 13.08 GB，卡上只有该
+训练 PID。旧 host arm 的 80 个无 snapshot window 中位数为 6.90 steps/s，
+但它曾与别的训练同卡，不能把两者差值归因成 merge 修复的加速。
+
+**2. Interpretation.** 这证明 barrier + dtype-aware exact verifier 已经通过真实
+replay、JIT 和首个参数更新，且 device 快路径在当前独占卡上没有 GPU0 所见的
+大幅 utilization 空档。它尚未穿过旧 device seed2/seed1 的 5154/10308 首坏点，
+所以现在只能说 launch/wiring/performance smoke gate 通过，不能说 NaN 已修复；
+两个早期 1k window 也不是最终吞吐结论。critic loss 有限只用于数值健康，不代表
+policy quality。
+
+**3. Next-stage decision.** 该 arm 原配置不变继续到 12k：matched baseline 是
+旧 device-merge seed2/seed1 的 5154/10308 failure 与 host-merge seed2 的
+101k survival；选择 split/held-out split 均不适用，因为这是 numerical infra
+gate。主指标为 exact verifier mismatch、nonfinite dump、20 个 finite 诊断和
+进程退出状态；12k 必须全部为零失败才继续到 101k。按首个完整 window，12k
+约 16 分钟、101k 约 2.5 小时，snapshot 开销会让实际 ETA 略长。
+
+**4. Execution.** 运行目录是
+`exp_local/cqn_nan_provenance/blocked_device_20260807072305/seed2`，controller
+PID `4185035`、train PID `4185058`，workspace fix SHA256 为
+`231e012b72f7273d486f58b3c53e8498e73d3f6cf42b80d7f9a066475b260ba3`。
+launch 显式清掉 `ROBOBASE_HOST_MERGE`、设置
+`ROBOBASE_DEVICE_MERGE_VERIFY=1`、`xla_mem_fraction=0.45`、truncate=true，
+并保留 nonfinite dump；当前进程仍活着并继续写 CSV。更早的两次启动分别因
+已删除的 Hydra 字段和 verifier 未按 JAX x64-disabled dtype canonicalization
+比较而在训练前/首 batch 退出，均不计 scientific arm；回归已补至 17 passed。

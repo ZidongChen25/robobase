@@ -1867,10 +1867,41 @@ class Workspace:
             logging.exception("Non-finite forensics dump failed: %r", exc)
             return None
 
+    def _apply_demo_batch_fraction_schedule(self) -> float | None:
+        """Scheduled demo/online sample split at constant total batch.
+
+        Mutates both buffers' default sample sizes before an update block.
+        The consuming iterators re-read .batch_size per __next__, so the
+        change is immediate (up to replay_prefetch_size updates of skew).
+        """
+        schedule_spec = self.cfg.get("demo_batch_fraction_schedule", None)
+        if schedule_spec is None:
+            return None
+        if self.demo_replay_buffer is None:
+            raise ValueError(
+                "demo_batch_fraction_schedule requires demo_batch_size."
+            )
+        if int(self.cfg.replay.get("num_workers", 0)) != 0:
+            raise ValueError(
+                "demo_batch_fraction_schedule requires replay.num_workers=0."
+            )
+        total = int(self.cfg.batch_size) + int(self.cfg.demo_batch_size)
+        step = self.pretrain_steps + self.main_loop_iterations
+        fraction = float(utils.schedule(str(schedule_spec), step))
+        fraction = min(max(fraction, 0.0), 1.0)
+        demo_count = int(round(fraction * total))
+        demo_count = min(max(demo_count, 1), total - 1)
+        self.demo_replay_buffer.set_batch_size(demo_count)
+        self.replay_buffer.set_batch_size(total - demo_count)
+        return demo_count / total
+
     def _perform_updates(self) -> dict[str, Any]:
         if self.agent.logging:
             start_time = time.time()
         metrics = {}
+        realized_demo_fraction = self._apply_demo_batch_fraction_schedule()
+        if realized_demo_fraction is not None and self.agent.logging:
+            metrics["demo_batch_fraction"] = realized_demo_fraction
         update_slots = self._num_update_slots()
         self.agent.train(True)
         for i in range(update_slots):

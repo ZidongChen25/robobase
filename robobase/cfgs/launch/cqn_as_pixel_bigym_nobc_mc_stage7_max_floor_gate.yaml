@@ -1,0 +1,14 @@
+# @package _global_
+
+# Stage 7 matched control: the retained parallel MC + max-floor objective.
+defaults:
+  - cqn_as_pixel_bigym_nobc_mc_parallel_dims_gate
+  - _self_
+
+method:
+  autoregressive_action_dims: false
+  dense_return_q_target: false
+
+hydra:
+  run:
+    dir: ./exp_local/cqn_no_bc/stage7_mc_max_floor_${now:%Y%m%d%H%M%S}

@@ -1,0 +1,32 @@
+# @package _global_
+
+# R-line wave-2 arm "tokensplit" (cqn-rline.md): SEAR-inspired per-token
+# horizon split on the canonical recipe. Tokens 1..boundary keep the exact
+# legacy 1-step backup; tokens boundary+1..K regress to the auxiliary_nstep
+# horizon backup from the same start state (replay's clamped aux window).
+# move_plate: K=4, aux horizon 4, boundary 2 -> tokens 1-2 one-step,
+# tokens 3-4 four-step. Prior art distinctions: unlike stage-163c/171 this
+# does NOT change the primary nstep (short-horizon precision is kept for
+# early tokens) and does NOT change execution (standard replan-1 ensemble).
+defaults:
+  - cqn_as_pixel_bigym_demo_driven
+  - _self_
+
+save_csv: true
+eval_every_steps: 1000000
+num_eval_episodes: 0
+num_eval_envs: 0
+save_snapshot: true
+snapshot_every_n: 5000
+log_eval_video: false
+
+replay:
+  auxiliary_nstep: 4
+
+method:
+  token_split_horizon_targets: true
+  token_split_boundary: 2
+
+hydra:
+  run:
+    dir: ./exp_local/cqn_rline/tokensplit_${env.task_name}_${now:%Y%m%d%H%M%S}

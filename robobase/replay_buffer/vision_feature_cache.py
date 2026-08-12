@@ -21,6 +21,7 @@ JAX_FLOW_MATCHING_FEATURE_KEY = "vision_features_jax_flow_matching_v3"
 JAX_ACT_FEATURE_KEY = "vision_features_jax_act_v3"
 JAX_PPO_FEATURE_KEY = "vision_features_jax_ppo_v3"
 JAX_SAC_FEATURE_KEY = "vision_features_jax_sac_v3"
+JAX_DRQV2_FEATURE_KEY = "vision_features_jax_drqv2_v3"
 JAX_CQN_FEATURE_KEY = "vision_features_jax_cqn_v3"
 JAX_CQN_AS_FEATURE_KEY = "vision_features_jax_cqn_as_v3"
 JAX_Q_CHUNKING_FEATURE_KEY = "vision_features_jax_q_chunking_v3"
@@ -39,6 +40,7 @@ def cached_feature_observation_key(method_name: str, backend_name: str = "jax") 
         "flow_matching": JAX_FLOW_MATCHING_FEATURE_KEY,
         "ppo": JAX_PPO_FEATURE_KEY,
         "sac": JAX_SAC_FEATURE_KEY,
+        "drqv2": JAX_DRQV2_FEATURE_KEY,
         "cqn": JAX_CQN_FEATURE_KEY,
         "cqn_as": JAX_CQN_AS_FEATURE_KEY,
         "q_chunking": JAX_Q_CHUNKING_FEATURE_KEY,
@@ -175,6 +177,7 @@ def build_vision_feature_cache_plan(
         "cqn_as",
         "cqn_flow",
         "diffusion",
+        "drqv2",
         "flow_matching",
         "ppo",
         "q_chunking",

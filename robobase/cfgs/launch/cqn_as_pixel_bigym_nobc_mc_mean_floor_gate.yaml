@@ -1,0 +1,14 @@
+# @package _global_
+
+# Stage 3 matched control: rerun the Stage-2 MC lower-bound plus average
+# unseen-bin reward floor under the current source tree.
+defaults:
+  - cqn_as_pixel_bigym_nobc_mc_floor_gate
+  - _self_
+
+method:
+  unseen_return_floor_reduction: mean
+
+hydra:
+  run:
+    dir: ./exp_local/cqn_no_bc/stage3_mc_mean_floor_${now:%Y%m%d%H%M%S}
