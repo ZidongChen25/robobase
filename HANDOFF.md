@@ -1,4 +1,4 @@
-# HANDOFF — CQN-AS 改进研究（R 线，2026-08-12 交接）
+# HANDOFF — CQN-AS 改进研究（R 线，2026-08-12 交接；当晚补丁见 §0.5）
 
 本文件是**唯一现行交接文档**（旧 HANDOFF/HANDOFF_NOBC_CLAUDE 已废；
 它们的结论被本线消化或勘误，见 §7）。完整执行日志与全部预注册在
@@ -14,6 +14,32 @@
   为 +64% 假上坡；机制三层证据链齐（held-in / held-out / 复权分段）。
 - **criterion 1：未达成**——全部臂的行为效应居于种子噪声带
   （±7pp/seed；n=4 配对检测窗 ≈5pp）。当前分数主攻见 §4。
+
+## 0.5 当晚重大补丁（2026-08-12 晚，详见 cqn-rline.md 勘误 #4 与 Wave-7）
+
+1. **勘误 #4**：反事实生成器的 demo 重放从未对齐过（错用 executed_action
+   + 对已 rescale 的 demo_action 双重变换）。**全部旧反事实数据实为
+   off-manifold 乱舞轨迹**，"near-manifold 一格之差"的表述作废；cfaug
+   密封判决与探针数值仍是真实测量，但解释降级为"off-manifold 失败数据
+   的效果"。修复后正确用法：`ts.info["demo_action"]` 逐字使用（已是
+   tanh 空间）。铁律 10：重放/生成管线必须先过零扰动对照。
+2. **恢复伺服落地**（用户提议）：demo 动作前馈 + 关节偏差 tanh 仿射
+   比例反馈（raw 偏差 e → 修正 2e/span,gripper 维不反馈）。生成器支持
+   `--paired`（同锚开环/恢复双变体）+ manifest.jsonl（含 jerr 与
+   object-deviation 字段）。
+3. **v2b 生产批**：move_plate ±0.4 paired,306 对（both_s 209 /
+   both_f 43 / harm 21 / teach 33）。开环成功率 75% = 邻域真实形状。
+   MILES 式场景偏差 check 实测**阴性**（max qpos 范数不预测 harm）。
+4. **Wave-7 注入原料已组装**：`exp_local/cqn_rline/inject_fence_v2_moveplate/`
+   （120 条开环带真实 return）与 `inject_recovteach_v2_moveplate/`
+   （33 反转对 66 条）。均 gitignore,跨机需 rsync 或重生成（~30min）。
+5. **MILES 对照**（用户指定调研）:research_paper.md 附录 S1。核心:
+   "demo 邻域自监督扰动数据喂 critic"在 citation graph 是空白格;
+   MILES 的密度 ablation 与幅度标定思想值得后续移植。
+6. 中期读数（等 s2 配对,勿单独引用）:anneal-A s1 密封 69.5(−8.0);
+   combined-fc s1 密封 41.5(−1.0,探索通道濒临出局)。zero70b ×2 与
+   anneal/comb s2 在训。arm 脚本 finalize 路径 bug 已修
+   (--selection-csv 只传文件名);之前两次 sealed_failed 均已手动补。
 
 ## 1. 制度与基线（全部密封 200ep @100k 整，seeds 800-999，无选点）
 

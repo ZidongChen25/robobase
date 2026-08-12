@@ -38,8 +38,17 @@ def _parse_args():
     p.add_argument("--perturb-steps", type=int, default=4)
     p.add_argument("--perturb-delta", type=float, default=0.4,
                    help="tanh-space delta = one CQN L0 bin width")
+    p.add_argument("--recovery-steps", type=int, default=0,
+                   help="after the perturbation, servo back to the demo's "
+                        "reference joint positions for this many steps "
+                        "(ground-truth recovery; delta action mode makes "
+                        "this an exact subtraction), then resume the demo")
     p.add_argument("--max-episodes", type=int, default=400)
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--paired", action="store_true",
+                   help="per anchor, roll BOTH the open-loop branch and the "
+                        "recovery branch from the same perturbation; write "
+                        "both episodes (suffix _open/_recov in the log)")
     p.add_argument("--smoke", action="store_true",
                    help="2 demos x 1 anchor, for wiring checks")
     return p.parse_args()
@@ -77,7 +86,9 @@ def main():
     factory = BiGymEnvFactory()
     factory.collect_or_fetch_demos(cfg, args.num_demos)
     factory.post_collect_or_fetch_demos(cfg)
-    demos = factory._raw_demos
+    # DemoStore returns demos in nondeterministic order; sort by seed so
+    # paired arms (e.g. recovery on/off) hit identical demos and anchors.
+    demos = sorted(factory._raw_demos, key=lambda d: int(d.seed))
     env = factory.make_eval_env(cfg)
     action_stats = factory._action_stats
     margin = cfg.min_max_margin
@@ -99,11 +110,35 @@ def main():
             margin,
         )
 
+    # tanh space is affine in raw action space; a raw joint offset e maps to
+    # a tanh correction of 2e/span with no midpoint bias. Grippers (last two
+    # dims) are absolute commands, not deltas — never feedback-correct them.
+    stats_min = np.asarray(action_stats["min"], np.float32)
+    stats_max = np.asarray(action_stats["max"], np.float32)
+    span = (
+        (stats_max + np.fabs(stats_max) * margin)
+        - (stats_min - np.fabs(stats_min) * margin)
+        + 1e-8
+    )
+
+    def feedback_correction(raw_offset):
+        corr = 2.0 * np.asarray(raw_offset, np.float32) / span
+        corr[-2:] = 0.0
+        return corr
+
     for demo_index, demo in enumerate(demos):
+        if n_written >= args.max_episodes:
+            break
         timesteps = demo.timesteps[1:]  # step 0 carries no executed action
+        # info["demo_action"] is what the training pipeline replays — and
+        # post_collect_or_fetch_demos has already rescaled it IN PLACE to
+        # tanh space, so it is used verbatim. (executed_action is a
+        # different, non-delta quantity; to_tanh(demo_action) would
+        # double-transform. Both replay as garbage.)
         actions = [
-            to_tanh(ts.executed_action) for ts in timesteps
-            if ts.executed_action is not None
+            np.asarray(ts.info["demo_action"], np.float32)
+            for ts in timesteps
+            if ts.info.get("demo_action") is not None
         ]
         n = len(actions)
         if n < 12:
@@ -113,10 +148,16 @@ def main():
         anchors = sorted(anchor_candidates[: args.anchors_per_demo])
 
         # Replay pass: drive the env along the demo, capturing branch
-        # states + prefix rows at each anchor.
+        # states + prefix rows at each anchor, and the actuated joint
+        # reference trajectory for ground-truth recovery servoing.
         obs, _ = env.reset(seed=demo.seed)
         rows = []  # (obs_last_frame_dict, action, reward, term, trunc)
         captured = {}
+        ref_qpos = []
+        ref_qpos_full = []  # full physics qpos (robot + objects), MILES-style
+        # scene-disturbance reference: deviation of the world state from the
+        # demo's recorded state at the same step separates "servo failed"
+        # from "servo succeeded but the correction disturbed the objects".
 
         def last_frames(observation):
             return {
@@ -138,27 +179,70 @@ def main():
             rows.append(
                 (last_frames(obs), action, float(reward), term, trunc)
             )
+            ref_qpos.append(
+                np.asarray(env.unwrapped.robot.qpos_actuated, np.float32)
+            )
+            ref_qpos_full.append(
+                np.asarray(
+                    env.unwrapped.mojo.physics.data.qpos, np.float64
+                ).copy()
+            )
             obs = next_obs
             if term or trunc:
                 break
+        print(
+            f"[gen] demo {demo_index} replay return "
+            f"{sum(r[2] for r in rows):.2f} len {len(rows)}",
+            flush=True,
+        )
 
-        # Branch pass per anchor.
-        for anchor in anchors:
-            if anchor not in captured or n_written >= args.max_episodes:
-                continue
-            env_state, prefix_rows, anchor_frames = captured[anchor]
+        def rollout_branch(env_state, prefix_rows, anchor_frames, anchor,
+                           dim, delta, recovery_steps):
             restore_bigym_branch_state(env, env_state)
             branch_rows = [row for row in prefix_rows]
-            dim = int(rng.integers(0, len(actions[0])))
-            delta = float(args.perturb_delta) * (
-                1.0 if rng.random() < 0.5 else -1.0
-            )
             obs_frames = anchor_frames
-            observation = None
+            recovery_until = anchor + args.perturb_steps + recovery_steps
+            joint_err_pre = joint_err_post = None
+            obj_dev_rejoin = obj_dev_end = None
+
+            def full_qpos_dev(step_index):
+                ref_i = min(step_index, len(ref_qpos_full) - 1)
+                now = np.asarray(
+                    env.unwrapped.mojo.physics.data.qpos, np.float64
+                )
+                return float(np.abs(ref_qpos_full[ref_i] - now).max())
+
             for step_index in range(anchor, n):
-                action = actions[step_index].copy()
-                if step_index < anchor + args.perturb_steps:
-                    action[dim] = np.clip(action[dim] + delta, -1.0, 1.0)
+                if (
+                    recovery_steps > 0
+                    and anchor + args.perturb_steps <= step_index
+                    and step_index < recovery_until
+                    and step_index < len(ref_qpos)
+                ):
+                    # Ground-truth recovery: demo action as feedforward (the
+                    # env's per-step tracking gain is ~0.1-0.6, so a bare
+                    # offset servo cannot catch the moving demo reference)
+                    # plus proportional feedback toward the demo's recorded
+                    # joint configuration at this step.
+                    now = np.asarray(
+                        env.unwrapped.robot.qpos_actuated, np.float32
+                    )
+                    err = float(
+                        np.abs((ref_qpos[step_index] - now)[:-2]).max()
+                    )
+                    if joint_err_pre is None:
+                        joint_err_pre = err
+                    joint_err_post = err
+                    action = np.clip(
+                        actions[step_index]
+                        + feedback_correction(ref_qpos[step_index] - now),
+                        -1.0,
+                        1.0,
+                    )
+                else:
+                    action = actions[step_index].copy()
+                    if step_index < anchor + args.perturb_steps:
+                        action[dim] = np.clip(action[dim] + delta, -1.0, 1.0)
                 chunk = np.repeat(
                     action[None, :], int(cfg.action_sequence), axis=0
                 )
@@ -167,26 +251,77 @@ def main():
                     (obs_frames, action, float(reward), term, trunc)
                 )
                 obs_frames = last_frames(observation)
+                if (
+                    obj_dev_rejoin is None
+                    and step_index + 1 >= recovery_until
+                ):
+                    obj_dev_rejoin = full_qpos_dev(step_index)
                 if term or trunc:
                     break
+            obj_dev_end = full_qpos_dev(step_index)
+            return (branch_rows, obs_frames, joint_err_pre, joint_err_post,
+                    obj_dev_rejoin, obj_dev_end)
 
-            if len(branch_rows) < 14:
+        # Branch pass per anchor.
+        for anchor in anchors:
+            if anchor not in captured or n_written >= args.max_episodes:
                 continue
-            episode = _assemble_episode(
-                branch_rows, obs_frames, gamma, cfg, rb_utils
+            env_state, prefix_rows, anchor_frames = captured[anchor]
+            dim = int(rng.integers(0, len(actions[0])))
+            delta = float(args.perturb_delta) * (
+                1.0 if rng.random() < 0.5 else -1.0
             )
-            length = len(branch_rows)
-            name = f"{stamp}_{n_written}_{length}_{global_idx}.npz"
-            save_episode(episode, out / name, compression="zip")
-            global_idx += length
-            n_written += 1
-            total_reward = sum(r[2] for r in branch_rows)
-            print(
-                f"[gen] demo {demo_index} anchor {anchor} dim {dim} "
-                f"delta {delta:+.2f} len {length} "
-                f"return {total_reward:.2f} -> {name}",
-                flush=True,
+            variants = (
+                [(0, "open"), (args.recovery_steps, "recov")]
+                if args.paired
+                else [(args.recovery_steps, "")]
             )
+            for recovery_steps, tag in variants:
+                (branch_rows, obs_frames, joint_err_pre, joint_err_post,
+                 obj_dev_rejoin, obj_dev_end) = (
+                    rollout_branch(env_state, prefix_rows, anchor_frames,
+                                   anchor, dim, delta, recovery_steps)
+                )
+                if len(branch_rows) < 14:
+                    continue
+                episode = _assemble_episode(
+                    branch_rows, obs_frames, gamma, cfg, rb_utils
+                )
+                length = len(branch_rows)
+                name = f"{stamp}_{n_written}_{length}_{global_idx}.npz"
+                save_episode(episode, out / name, compression="zip")
+                global_idx += length
+                n_written += 1
+                total_reward = sum(r[2] for r in branch_rows)
+                err_note = (
+                    f" jerr {joint_err_pre:.3f}->{joint_err_post:.3f}"
+                    if joint_err_pre is not None
+                    else ""
+                )
+                tag_note = f" [{tag}]" if tag else ""
+                print(
+                    f"[gen] demo {demo_index} anchor {anchor} dim {dim} "
+                    f"delta {delta:+.2f} len {length} "
+                    f"return {total_reward:.2f}{err_note}{tag_note} -> {name}",
+                    flush=True,
+                )
+                import json
+                with open(out / "manifest.jsonl", "a") as mf:
+                    mf.write(json.dumps({
+                        "file": name,
+                        "demo_seed": int(demo.seed),
+                        "demo_index": demo_index,
+                        "anchor": anchor,
+                        "dim": dim,
+                        "delta": delta,
+                        "tag": tag or "single",
+                        "return": total_reward,
+                        "length": length,
+                        "jerr_pre": joint_err_pre,
+                        "jerr_post": joint_err_post,
+                        "obj_dev_rejoin": obj_dev_rejoin,
+                        "obj_dev_end": obj_dev_end,
+                    }) + "\n")
 
     print(f"[gen] wrote {n_written} episodes to {out}", flush=True)
 

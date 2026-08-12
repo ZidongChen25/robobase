@@ -120,7 +120,7 @@ if compgen -G "${RUN_DIR}/eval_checkpoints/*_checkpoint.pkl" > /dev/null; then
   CHECKPOINT_DIR="${RUN_DIR}/eval_checkpoints"
   CHECKPOINT_SUFFIX="_checkpoint.pkl"
   FINALIZE=(--finalize-artifacts \
-    --selection-csv "${RUN_DIR}/val50_seeds400.csv")
+    --selection-csv val50_seeds400.csv)
 fi
 SKIP="$(find "${CHECKPOINT_DIR}" -maxdepth 1 \( -type f -o -type l \) \
         | sed -n "s#^.*/\([0-9][0-9]*\)${CHECKPOINT_SUFFIX}\$#\1#p" | sort -n -u \

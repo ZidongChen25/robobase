@@ -657,3 +657,98 @@ anneal-A = 174 的从头压缩版（前 50k 降到 0.0125 ≈ 早期塑形期 λ
 全灭，分数线聚焦拓管数据。
 队列全序：combined-fc ×2 → anneal-A s2 → zero70 ×2（Wave-5 完整性
 保持，仅让位两个槽位）。
+
+### 优先级清算（2026-08-12 13:1x，用户质询"在跑的还有没有意义"）
+
+裁定：lowlam 双 seed 处死（纯论文题、双变量归因不净、让卡）；
+**anneal-A s1 保留**——它是 zero70 的直接对照（50k 前同形，70k 后分岔），
+无它则 zero70 不可归因。GPU1 即时转 combined-flipcup ×2（分数线头号，
+Wave-6 提前直发）。队列 v3：zero70 ×2 → anneal-A s2。
+代码已推送私仓（6f617e5），用户将在另一台机器分担队列臂；
+本机保留评估/探针链与恢复数据采集。
+
+## 重大勘误 #4：反事实生成器的重放从未对齐过（2026-08-12 18:1x 发现）
+
+**触发**：实现 ground-truth recovery（用户提议的"扰动后伺服回 demo 参考关节
+再续放"）时，伺服诊断显示关节误差在恢复段反而发散到 0.6。逐层排查后发现
+问题根本不在恢复，而在生成器的 demo 重放本身。
+
+**Bug 链（两层）**：
+1. 生成器重放的是 `ts.executed_action` —— 在 down-sample 后的 demo 里这
+   不是逐 tick 的 delta 命令（实测其 dim1 有 94.8% 的步幅超出 env 单步动作
+   边界，而真命令的幅度范围只有 [-0.045, 0.015]）。训练管线用的是
+   `ts.info["demo_action"]`（action stats 也源于它，bigym.py:795）。
+2. 即便换成 demo_action 也不能再过 `transform_to_tanh`：
+   `post_collect_or_fetch_demos`（bigym.py:693）已经**原地**把它 rescale 成
+   tanh 空间（指纹：gripper 命令恰为 -1.0）。再变换一次 = 双重变换。
+
+**实测后果**：重放从第 0 步就偏（qpos 误差 0.11 → 6.0 单调增长，reset 时
+逐维差恰为全 0，排除初始状态错位），重放 return 恒为 0。
+
+**波及面（全部在坏重放下生成）**：
+- 注入 cfaug 臂的 120 条 ±0.4 "围栏" episode（move_plate）；
+- flip_cup 60d 反事实目录；probe_data_composite 的 30 条分支；
+- v1 恢复采集的 ~822 条 ±0.15 episode。
+
+**结论改写**：
+- 这些数据不是"demo 旁一步之遥的 near-manifold 分支"，而是**从 reset 起
+  就发散的 off-manifold 乱舞轨迹**。cfaug 的密封行为判决与探针测量本身
+  仍是对该数据分布的真实测量（假上坡 +64% = 基线 critic 对远离流形轨迹
+  的 OOD 乐观；cfaug 复权 −19~−23% = 注入该类失败数据后的真贬值），但
+  §3 机制资产里"near-manifold/一格之差"的表述**作废**。
+- v1 恢复结论（"开环重放极脆，±0.15 仅 2/356 回得来"）**作废**——那是
+  坏重放的产物，不是开环脆性的测量。
+- 真正的 near-manifold 围栏实验**从未跑过**，现在才第一次可做。
+
+**修复与验证**：生成器改为逐字使用 rescale 后的 `demo_action`（不再任何
+变换）。验证：reset 对齐全 0；重放 return 4/5 demo = 1.00；零扰动分支
+（restore+续放）return = 1.00。恢复伺服 = demo 动作前馈 + tanh 仿射比例
+反馈（raw 偏差 e → tanh 修正 2e/span，gripper 维不反馈——绝对量；env
+单步跟踪增益实测仅 0.1-0.6，纯 offset 伺服追不上移动参考，前馈必需）。
+关节误差收敛（0.05→0.04 底噪）。
+
+**新铁律 10**：任何"重放/生成"管线在用于生产数据前，必须先过**零扰动
+对照**（重放 return 要能复现 demo 成功）。围栏数据"失败是设计预期"恰好
+掩护了坏重放整整两个 wave。
+
+## Wave-7 预注册：正确重放后的第一批真 near-manifold 数据（2026-08-12 18:2x）
+
+**背景**：勘误 #4 后，所有旧反事实数据判为 off-manifold。生成器修复 +
+recovery 伺服（前馈+反馈）落地，smoke 实测：
+- ±0.15×4 步：开环 9/12 成功；带恢复 11/12，jerr 全收敛。
+- ±0.4（一个 L0 bin）paired：开环 5/8，恢复 4/8；同锚点翻转 3 例
+  （1 例 0→1 被救回，2 例 1→0 被修正动作本身弄坏）。
+- 生产批：move_plate paired ±0.4×4 步 + 6 步恢复，51 demo × 6 锚 × 2 
+  变体（`exp_local/cqn_rline/counterfactual_v2_paired_moveplate/` 带
+  manifest.jsonl，pid 1841418）。
+
+**臂 A "fence-v2 / 邻域真值"**：注入 120 条开环分支（成败都要，带真实
+return）。这是用户"高斯邻域价值监督"的数据实测版——物理容忍的扰动
+（~60%）带 return 1 进 replay，不容忍的带 0，critic 学到的邻域形状由
+仿真而非人为核函数决定。与 cfaug-v1 唯一差异 = 数据分布（真 near-manifold
+vs 从 reset 发散的乱舞），故与 cfaug-v1 四种子直接同门对比可归因数据质量。
+
+**臂 B "recovery-teach"**：只注入同锚点 outcome 相反的配对（开环失败 +
+恢复成功），教 critic "扰动态下伺服回参考的动作序列有值，硬续走没有"。
+剂量按生产批实际翻转率定（smoke 翻转率 ~12%，预计需全部 306 锚点凑
+~30-40 对；不足则加锚点补采）。
+
+**门（不变）**：密封 200ep @100k 整，seeds 800-999，四种子配对 vs 基线
+76.0（n=4），声明门 = 配对均值 ≥ +3pp 且 ≥3/4 非负。机制门 = v2 held-out
+分支复权跨界贬值 + 兄弟 margin 无损。
+
+**在途臂的解释注记**：Wave-5（zero70/anneal）与 Wave-6（combined-fc）
+底座是 v1 fence 数据，判决照常执行，但其 cfaug 成分自此记为 "fence-v1
+（off-manifold）"。
+
+## Wave-7 生产批与 check 阴性记录（2026-08-12 19:4x）
+
+v2b 批（带 object-deviation manifest）612 条完成,分类分布与 v2 逐对一致
+（both_s 209 / both_f 43 / harm 21 / teach 33）——生成器确定性确认。
+
+**MILES 式场景扰动 check = 阴性**：rejoin 时的 max|Δqpos_full| 不能预测
+recovery 是否弄坏任务（harm 中位 0.026 vs 正常 0.023;最优阈值只抓 5/21）。
+反直觉信号:开环**成功**分支的 rejoin 偏差(0.134)高于失败分支(0.074)——
+max 范数被自由空间无关自由度支配,致命的是接触段 gripper-物体相对位姿的
+小偏差。改进方向(未实施):按物体 qpos 切片、按接触相位(gripper 闭合)分段
+判定。此 check 不作为 Wave-7 数据门;仅存 manifest 供后续分析。

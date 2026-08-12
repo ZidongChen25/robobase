@@ -905,3 +905,246 @@ Cal-QL/WSRL 对 F2 的机制解释：突然分布位移迫使全局 Q 重校准�
   配对 ≥ −2pp。
 - **风险预案**：若 L1/L2 纯 TD 因 F3（支撑饱和）学不到东西，此臂与
   `q_reward_scale=0.07` 组合成 R3b（只 scale 细层 TD 目标不动 L0）。
+
+
+---
+
+# 附录 S1:MILES 深读与对照(2026-08-12,用户指定调研)
+
+# MILES 对照分析与借鉴建议 — 针对我们的 counterfactual branch generator
+
+**范围**:MILES (Papagiannis & Johns, CoRL 2024, arXiv:2410.19693) vs 我们在 BiGym (CQN-AS, C51 distributional critic, K=16 action chunks) 上的 counterfactual branch generator。目标读者:项目负责人;归档入 survey 文档。
+
+---
+
+## 1. 对照表
+
+| 维度 | MILES | 我们的 generator |
+|---|---|---|
+| **数据预算 / 平台** | 1 条 demo + 1 次 reset,真机 Franka,无 simulator | 51–60 条 demo,BiGym MuJoCo simulator,seed 精确复现 |
+| **Perturbation 来源** | 每个 demo waypoint 处,EE pose 采样 4 cm / 4° 内的初始位姿,物理移动过去;幅度 = pose estimator 平均误差(有依据的标定,非 ablation) | 在 anchor step 处,对单一 action dim 加一个 coarse-bin delta(tanh 空间 ±0.4 或 ±0.15),连续 4 步;action 空间扰动而非 pose 空间扰动 |
+| **Recovery controller** | Impedance controller 直线回到 waypoint,compliance 吸收接触,弯曲路径本身就是有效数据 | Demo action 作 feedforward + joint error 的 proportional feedback,gripper 排除(绝对指令);因 env per-step tracking gain 仅 0.1–0.6,裸 offset servo 追不上移动 reference |
+| **Supervision 信号** | Recovery 轨迹事后 relabel 成 relative EE transform,作为 corrective action label(教"该做什么") | Branch 的 TRUE environment return(教"值多少");无 BC label,无人工 value floor |
+| **数据消费方** | ResNet-18 + FT-MLP + LSTM,纯 BC regression(fused dataset) | C51 distributional critic 的 replay buffer;目标是撤掉 DQfD-style BC large-margin loss |
+| **失败数据的地位** | 被丢弃(reachability check 不达 → discard;disturbance → 整段停采) | 一等公民:open-loop fence branch(多为 failure)恰恰是教 critic "off-demo action 掉价"的核心数据 |
+| **Validity check** | (a) proprioceptive reachability:确认真的回到了 waypoint;(b) DINO ViT cosine similarity ≥ 0.94 判断场景是否被扰动,否则停采并记录截断点 R | 目前没有等价机制;±0.4 recovery 变体 2/8 出现 1→0(corrective motion 在接触中扰动了物体),我们只是事后统计,没有在线判定 |
+| **在 demo 何处增广** | 每个 waypoint 都增广,Z=10 条/waypoint,严格 first-to-last 顺序(No Sequence ablation 87%→43%);接触/不可逆段由 disturbance check 自动截断,交给 open-loop replay | 少数 anchor step,branch 数量个位数(9/12、5/8、4/8 的样本量);无 per-segment 区分接触段与自由段 |
+| **State reset 假设** | 无 reset:顺序采集就是为了保场景一致;不可逆进度只能截断 | Seed replay 给出 exact state reproduction,任意 anchor 可无限次精确回放 — 这是 MILES 花大力气近似的东西,我们免费拥有 |
+| **接触处理** | Compliance 是 load-bearing:接触弯曲路径被记录为合法数据;高力段(lock 拧 90°)人工停采 | Delta joint-position 无 compliance 建模;recovery 在接触中可能"纠正动作本身破坏任务"(实测 2/8) |
+
+---
+
+## 2. MILES 做得更聪明、可移植的机制
+
+### 2.1 Disturbance check(场景扰动判定)— 最值得移植
+MILES 用 DINO similarity 判断"增广是否已经把场景弄坏",ablation 显示去掉后三个不可逆任务全部归零。我们在 sim 里可以做得更强:不需要 DINO,直接比较 recovery 收敛后的 object state(位姿、接触对)与 demo 在 resume 点的 ground-truth state,阈值化。
+**如何接入**:branch 生成时,在 servo 收敛、准备 resume demo 的时刻,计算 object-state deviation;超阈值则给这条 branch 打上 "scene-disturbed" 标签。注意与 MILES 的关键不同:MILES 必须丢弃(坏 label 会毒害 BC),我们不必丢 — 失败 branch 带 true return 对 critic 依然是合法数据;这个 check 的价值在于(a)诊断 2/8 的 1→0 到底是 servo 增益问题还是接触段本质不可 recover,(b)决定该 anchor 以后走 recovery 变体还是只出 fence 变体。
+**可测问题**:2/8 broken recovery 是否全部在 check 报警的 anchor 上发生?若是,gating 后 recovery 变体成功率应从 4/8 向 open-loop 小扰动的 9/12 水平靠拢。
+
+### 2.2 Reachability check(recovery 是否真的收敛)
+MILES 去掉这个 check 均值 87%→73%(power cable 85%→20%)。我们的等价物:servo 结束时 joint error 是否收敛到阈内。未收敛的 branch 不丢,但应单独标记 — 它的 return 反映的是"recovery 策略失败"而非"该扰动不可恢复",两者对 value landscape 的含义不同。
+**可测问题**:未收敛 branch 的占比随扰动幅度(±0.15 vs ±0.4)如何变化;critic 在这两类 branch 上学到的 Q-gap 是否可区分。
+
+### 2.3 覆盖策略:每个 waypoint × Z=10,而非稀疏 anchor
+MILES 的 data density ablation 很硬:precision 任务从 100% 数据降到 25% 时成功率 90→25%。我们目前 branch 总数是个位数到十位数,远低于能刻画 value landscape 的密度 — 而我们在 sim 里,采集成本比 MILES 真机(21–40 min/task)低几个量级。
+**如何接入**:anchor 铺满整条 demo(每步或每 4 步一个,对齐 4-step 扰动窗口),每个 anchor 出 Z≈8–10 条 branch,混合 ±0.15/±0.4、混合 fence/recovery 变体。
+**可测问题**:critic 对 "demo action vs 单 dim 扰动 action" 的 ranking accuracy(用现有 `scripts/analyze_cqn_value_fidelity.py` 一类 probe)随 branch 密度的曲线;以及 no-BC run 在同等 step 下的成功率差。
+
+### 2.4 扰动幅度的标定逻辑
+MILES 不是拍脑袋选 4 cm/4°,而是标定为 pose estimator 的实际误差 — "扰动范围应覆盖部署时真实会出现的偏差"。我们的等价物:测量当前 no-BC policy 早期 rollout 相对 demo action 的逐维偏差分布(tanh 空间),让扰动 delta 覆盖该分布的支撑,而不是固定绑在 coarse-bin 宽度上。
+**可测问题**:on-policy rollout 状态落在 branch 数据覆盖范围内的比例,标定前后对比;off-demo 状态上 TD target 的方差是否下降。
+
+### 2.5 Fuse recovery + demo suffix(结构上我们已做,但值得点名)
+MILES 每条合成轨迹都以 demo 后缀收尾,保证轨迹到达任务终点 — 对我们这是 return 能传播回扰动点的前提。我们的 "servo 回 reference 后 resume demo" 与之同构;区别只在监督信号。这条不是要改,而是写论文时的 framing 素材(见第 4 节)。
+
+---
+
+## 3. 不可迁移的部分及原因
+
+- **Impedance compliance 作为特性**:MILES 的接触鲁棒性一半来自控制器物理上的顺应 — 接触弯曲路径不出坏数据。我们的 delta joint-position + 低 tracking gain 没有这层保护,这正是 2/8 recovery 破坏任务的根源。能借的只有精神:接触段限制 recovery 的 P 增益或干脆不做 recovery,不是照搬机制。
+- **DINO visual similarity**:为真机无 ground-truth state 而设的替代品。Sim 里直接读 object state,更准更便宜,不必引入视觉相似度这层噪声。
+- **Sequential first-to-last 采集顺序**:其 43% 的 ablation 崩塌说明的是"场景状态一致性至关重要",而 MILES 只能靠顺序采集近似维持它。我们的 seed-exact reset 让任意 anchor 天然场景一致 — 这条巨大的 ablation 差距对我们是免费的,顺序本身无需移植。
+- **Wrist camera + relative EE-frame action 带来的 spatial generalization**:那是他们泛化性的来源,与我们 joint-space + floating base + 固定场景的 BiGym 设定正交。
+- **单 demo 极限预算与 open-loop replay tail、mode switch**:我们有 51–60 条 demo 和闭环 RL 目标,不需要 "网络连续输出 identity transform 就切 open-loop" 这种部署技巧。
+- **LSTM/BC 训练管线、去 proprioception 设计**:数据消费方完全不同,无对应物。
+
+---
+
+## 4. 关键概念差异与剩余 novelty 空间
+
+**本质区别一句话**:MILES 把 recovery 轨迹当 corrective action label 喂给 BC — 监督"在这个状态该做什么";我们把 perturbation branch(含 recovery 和 fence)连同 TRUE return 注入 critic 的 replay buffer — 监督"这个 action 在这个状态值多少"。由此派生一个结构性反差:**MILES 的 validity check 存在的目的是丢弃失败数据(坏 label 毒害 BC),而失败数据恰恰是我们最有信息量的部分** — fence branch 刻画的是 value landscape 的悬崖边缘,这类数据在 MILES 框架里根本没有容身之处。
+
+Adjacent family 梳理确认:这条谱系(DART、SPARTN、CCIL、IntervenGen、SART、1001 Demos、RaC)全部收敛到 BC;唯一入 critic 的是 AutoSERL (arXiv:2607.01651),但其 recovery point 是人工预定义的、机制是 guided exploration + mid-episode reset,不是 demo-anchored、self-supervised 的 counterfactual branch 生成。**"人类零介入的 demo 邻域扰动数据喂 critic" 这个组合,截至目前的 citation graph 是空白**,我们占住的正是这一格。
+
+我们可主张的 novelty:
+1. **Counterfactual branch generation with exact state reset**:利用 sim seed replay 得到严格反事实对(同一状态、仅一维 action 不同、真实 return 不同),这是真机方法原则上做不到的;
+2. **失败数据作为 value 证据**:fence branch 以 true return 入 buffer,替代 DQfD BC-margin 的人工 value floor;
+3. **目标是撤掉 BC loss**,让 critic 学到 demo 邻域的真实 value landscape,而非训练一个 IL policy。
+
+**引用 framing 建议**:"MILES (Papagiannis & Johns, 2024) shows that self-supervised perturb-and-recover trajectories collected around a single demonstration, fused with the demo suffix, suffice to train a robust closed-loop BC policy. We differ in three ways: (i) branches are consumed by a distributional critic with true environment returns rather than as corrective action labels; (ii) failed branches are retained as negative value evidence rather than discarded by validity checks; (iii) exact simulator state reset yields strict counterfactuals — same state, one perturbed action dimension, different return — which physical collection cannot provide." 同时引 AutoSERL 作最近邻并指出其 recovery point 预定义、非 demo-anchored 自监督。
+
+---
+
+## 5. 下一步实验建议(最多 3 条)
+
+### 实验 A:移植 disturbance + reachability 双 check,做 branch gating
+**改动**:recovery servo 收敛时刻,记录 (a) joint error 是否收敛,(b) object state 与 demo reference 的偏差;超阈值的 anchor 标记为 contact-critical,此后该 anchor 只出 fence 变体,不出 recovery 变体。
+**预期效果**:recovery 变体成功率从 4/8 提升(broken 的 2 例应被 check 提前捕获);contact-critical 段的划分同时给出"demo 哪些段不可扰动"的地图。
+**验证方式**:重跑 ±0.4 recovery 批次(样本量按 [50-ep 点须补测凑 100] 的纪律扩充到有统计意义,当前 8 条太少),统计 rescued/broken 与 check 报警的重合率;目标是 broken 案例 100% 被报警覆盖。
+
+### 实验 B:MILES 密度的覆盖扫描
+**改动**:anchor 铺满全 demo(步距 4),每 anchor Z≈8 branch(fence + recovery 混合,±0.15/±0.4 混合),在 move_plate 上生成完整 branch 数据集注入 replay buffer,跑 no-BC 训练。
+**预期效果**:critic 的 value landscape 从"少数点上的锚定"变成沿 demo 全程的梯度场,BC loss 撤除后不再 value collapse。
+**验证方式**:两个层次 — (1) probe 层:demo action vs perturbed action 的 Q-ranking accuracy 随 branch 密度(25%/50%/100% 子采样,复刻 MILES 的 data density ablation)的曲线;(2) 端到端:同 step 预算下 no-BC + branches vs no-BC baseline vs BC-margin baseline 的成功率,按 async eval protocol 50 eps 起评。
+
+### 实验 C:扰动幅度对齐 policy 误差分布
+**改动**:取当前 no-BC policy 的 rollout,统计其 action 相对 demo 的逐维偏差分布(tanh 空间);将扰动 delta 从固定 ±0.4/±0.15 改为覆盖该分布 80–95 分位的逐维取值(即 MILES "4 cm = pose estimator error" 的标定逻辑)。
+**预期效果**:branch 数据覆盖 learner 实际会到达的状态邻域,off-demo 状态上的 TD target 更可靠,减少 critic 在未覆盖区间的外推错误。
+**验证方式**:先测覆盖率指标(on-policy 状态落入 branch 覆盖范围的比例,标定前后对比),再看 value fidelity probe 与最终成功率;若覆盖率提升但成功率不动,说明瓶颈不在扰动幅度,可排除该方向。
+
+**优先级**:A → B → C。A 是 B 的前置(不 gating 就铺密度,会把接触段的坏 recovery 批量灌进 buffer);C 依赖 B 的基础设施但改动最小,可作为 B 的后续消融。
+
+## S1.a MILES 原文深读笔记
+
+# MILES: Making Imitation Learning Easy with Self-Supervision
+**Georgios Papagiannis, Edward Johns — The Robot Learning Lab, Imperial College London. CoRL 2024. arXiv:2410.19693.**
+
+## 1. Problem setting
+
+- **Data budget:** exactly **one human demonstration** and **one environment reset** (the reset after the demo itself). All demos in the paper were collected via **teleoperation** (project page says kinesthetic or teleop are both admissible). No further human intervention during data collection.
+- **Robot:** Franka Emika Panda (7-DoF), controlled with an **impedance controller** (compliance is load-bearing for the method; exact stiffness parameters not stated).
+- **Sensors:** a **wrist-mounted FLIR RGB camera** (no external cameras) + **6-D force-torque feedback** from the Panda's built-in joint-torque sensing. **No proprioception is fed to the policy** — deliberately, so the policy is a function of relative robot–object pose only.
+- **Action space:** **6-DoF relative end-effector pose transforms, expressed in the EE frame** (delta cartesian, not absolute, not joint-space), plus a binary gripper command. Relative-EE-frame actions + wrist camera are what give spatial generalization.
+- **Demonstration representation:** the demo ζ is a sequence of **waypoints**, where a waypoint w_n^ζ = the EE's 6-DoF pose at timestep n (every timestep is a waypoint, no subsampling). Real demos ranged **20–80 waypoints** per task (lock 32, USB 20, socket 40, power cable 29, screw 47, toaster 70, lid 80).
+
+## 2. Self-supervised data collection, step by step
+
+For each demo waypoint w_k^ζ, **starting from the first waypoint w_1^ζ and progressing sequentially through the demo** (order matters — see ablations):
+
+1. **Perturb:** sample an initial pose within **4 cm translation and 4° rotation** of w_k^ζ; the robot moves there. The 4 cm / 4° range was chosen to equal **the average error of their pose estimator** when reaching the demo's initial pose relative to the object (Sec. B.2.1: the range "is not limiting and can be set to any desirable range"). The sampling distribution (uniform vs other) and frame conventions are not stated.
+2. **Return:** the robot **attempts to move back to w_k^ζ in a straight line** (cartesian, no waypoints, no planner). Because the controller is compliant, **contact with objects bends the actual path** — the executed trajectory τ_k may be curved; that's a feature, not a failure: the recorded data shows contact-aware returns.
+3. **Record:** during the return, log **RGB + force-torque observations** {o_m^τk} and **actions computed post-hoc as the relative EE transform between consecutive timesteps**. Gripper actions are **copied from the demonstrated action** at that segment.
+4. **Validate** the trajectory (two checks, Sec. 3):
+   - **Reachability:** via proprioception, verify the final achieved pose w_M^τk actually equals w_k^ζ. If not (e.g., blocked by contact), **discard the trajectory**.
+   - **Environment disturbance:** compare **DINO ViT feature cosine similarity** between the demo image I_k^ζ and the post-return image I_M^τk. If similarity < **θ = 0.94** (one value for all tasks, tuned by running MILES on RLBench/CoppeliaSim sim tasks), the environment is deemed disturbed → **stop data collection entirely** and record the demo timestep **R** where the disturbance occurred.
+5. **Label / fuse:** each valid augmentation trajectory is concatenated with the **remaining demo segment from k onward**: {(o_m^τk, a_m^τk)}_{m=1..M} ∪ {(o_n^ζ, a_n^ζ)}_{n=k..R}. So every synthetic demo = "recover to waypoint k, then follow the demo to the end (or to R)". The supervision for recovery states is the recorded self-generated return actions; the supervision for on-demo states is the original demo actions.
+- **Volume:** **Z = 10 augmentation trajectories per waypoint** (≈1 minute of collection per waypoint); total collection time **21–40 min per task** (lock 24, USB 21, socket 37, cable 28, screw 22, toaster 40, lid 31; marker-throwing ≈34 min per bin).
+
+## 3. Contact-rich segments / unsafe augmentation
+
+- There is **no force-threshold-based failure detection**; the two checks above are the whole safety/validity mechanism. Contact during the return is *absorbed by impedance compliance* and simply recorded.
+- **Irreversible-progress segments are handled by the disturbance check:** in tasks that permanently change the scene (twist screw, bread-in-toaster, open lid), augmentation around later waypoints inevitably perturbs the environment; DINO similarity drops below θ, collection halts at timestep R, and everything after R is covered by **open-loop replay at deployment** (Case 2 below). The authors explicitly note there is little penalty as long as the disturbance occurs after the precision-critical portion.
+- **Hardware-safety manual override:** for lock-with-key they stopped collection halfway through the 90° key twist "for hardware safety" because of excessive forces — i.e., truly force-critical late segments are also delegated to open-loop replay.
+- Ablation evidence this matters: removing the disturbance check drops those three tasks to **0%** each (invalid observations/actions enter training and "following the demonstration's actions no longer leads to task completion"); removing the reachability check drops the mean from 87% → 73% (worst hit: power cable 85% → 20%, USB 70% → 40%).
+
+## 4. How the policy consumes the data
+
+- **Architecture:** ResNet-18 for the wrist RGB image; small MLP embeds force-torque into a **100-d** vector; concatenated features go into an **LSTM** that regresses the 6-DoF relative action (+ gripper). Trained with plain **behavioral cloning (regression) on the fused dataset D_new**. No proprioception input. No explicit reweighting between recovery and demo data is described — the fusion (every trajectory ends with the demo suffix) is the balancing mechanism.
+- **LSTM housekeeping:** the hidden state is **reset every 2× the number of augmented waypoints** during rollout.
+- **Recovery → demo-following transition:** there is no explicit mode switch inside the learned policy for the augmented portion — the fused trajectories teach "return, then continue" end-to-end. The explicit switch exists only when a disturbance truncated collection at R < N: the deployed policy is **(1) the learned network for states up to R, then (2) open-loop replay of the remaining demo actions ζ_remaining = {a_n^ζ}_{n=R..N}**. The switch triggers when the network **continuously predicts the identity transformation** (i.e., outputs "don't move").
+- **Getting near the object at test time:** the learned policy's coverage is only ~4 cm around the demo; for the 20 cm test randomization, "at deployment, to reach the object from far away we first **estimate the object's pose using pose estimation and approach it before switching to MILES**" — pose-estimation error (~4 cm/4°, by construction of the perturbation range) is then eaten by the learned recovery behavior.
+
+## 5. Key results and ablations
+
+**Real world (7 tasks, 20 trials each, robot–object relative pose randomized in a 20 cm sphere, object kept in camera view):**
+
+| Task | MILES | Demo replay | Reset-free residual RL (DDPG) | Reset-free FISH | Pose est. + replay |
+|---|---|---|---|---|---|
+| Lock with key | 90% | 0% | 0% | 0% | 50% |
+| Insert USB | 70% | 0% | 15% | 30% | 10% |
+| Plug into socket | 85% | 0% | 35% | 25% | 85% |
+| Insert power cable | 85% | 0% | 0% | 15% | 80% |
+| Twist screw | 85% | 0% | 0% | 0% | 70% |
+| Bread in toaster | 95% | 15% | 0% | 0% | 100% |
+| Open lid | 100% | 25% | 0% | 0% | 100% |
+| **Mean** | **87%** | 6% | 7% | 10% | 71% |
+
+Baselines got the **same observation budget** as MILES; pose-est.+replay even uses MILES' data. RLBench sim (5 tasks): MILES **88%** vs pose-est.+replay 80%, FISH 4%, RL 0%, replay 2%.
+
+**Component ablations (real-world means):** full MILES **87%** → No Sequence (collect waypoint anchors in random order instead of first-to-last) **43%**; No disturbance check **47%** (0% on screw/toaster/lid); No reachability check **73%**; No memory (LSTM removed) **74%** (biggest LSTM hits: lock 90→50, screw 85→35).
+
+**Modality ablation (4 contact-rich tasks):** force-only policies fail almost completely (~0%). Vision-only: lock 90%, USB 75%, socket 95%, cable 70% — i.e., dropping force *helps* USB/socket but hurts cable (and lock is a wash); force feedback is a net contributor only on some tasks.
+
+**Data density (fraction of the Z=10 dataset):** lock 90/75/35/25%, USB 70/55/30/20%, screw 85/80/40/30% at 100/75/50/25% of the data — precision tasks degrade steeply; open lid stays 100% even at 25%. Stated guideline: **Z=10 per waypoint for precise tasks, Z≈4 suffices for high-tolerance tasks**.
+
+**Perturbation magnitude:** *not ablated*; 4 cm/4° is justified only as matching their pose estimator's mean error.
+
+**Generalization probe (throw markers into bins):** trained on 5 green bins, tested on 2 unseen bins: pink 80%, gray 60% (10 trials each); ζ_remaining for the replay tail was retrieved by nearest-neighbor DINO similarity over the training bins.
+
+**Failure modes noted:** USB at 70% is attributed to sub-millimeter tolerance; the lock task's high-force twist forced early collection stop; anything after a detected disturbance is open-loop and inherits replay's brittleness.
+
+## 6. Limitations stated by the authors
+
+1. "MILES' reliance on a wrist camera enables MILES to obtain spatial generalization, however, simultaneously this limits its field of view and its applicability to larger task spaces."
+2. "While MILES is robust to distractors at deployment, before data collection begins it requires a human to set up the robot's workspace such that only the task-relevant object is in camera view for the policy to achieve spatial generalization."
+3. "Our current implementation of MILES trains a separate policy for each task and hence it is unclear how well MILES would generalize to completely new tasks."
+
+**Caveats on this report:** the paper does not state control frequency, image resolution, optimizer/epochs, the perturbation sampling distribution, impedance gains, or the DINO variant/preprocessing; those are genuinely absent (or appendix-only), not omitted here.
+
+Sources:
+- [arXiv abstract 2410.19693](https://arxiv.org/abs/2410.19693)
+- [arXiv HTML full text](https://arxiv.org/html/2410.19693)
+- [ar5iv HTML](https://ar5iv.labs.arxiv.org/html/2410.19693)
+- [Project page, robot-learning.uk/miles](https://www.robot-learning.uk/miles)
+- [PMLR proceedings v270](https://proceedings.mlr.press/v270/papagiannis25a.html)
+
+## S1.b 邻接家族扫描(recovery/corrective augmentation for IL)
+
+# Recovery / Corrective Data Augmentation for Imitation Learning — the MILES neighborhood
+
+**Anchor — MILES** ([Papagiannis & Johns, CoRL 2024, arXiv:2410.19693](https://arxiv.org/abs/2410.19693); [project page](https://www.robot-learning.uk/miles)). From a **single demo and a single environment reset**, the real robot autonomously perturbs its end-effector away from demo waypoints, then records controller-driven trajectories that return to the waypoint; each such "augmentation trajectory" is **fused with the remainder of the demo** from that waypoint onward, so the return motion itself provides corrective action labels for free. Validity is checked self-supervised: proprioceptive reachability (did the robot actually get back to the waypoint pose) and a DINO-feature image comparison at waypoints to detect scene disturbance (halts collection if the scene changed). A standard **BC policy** is trained on the fused trajectories and deployed closed-loop. Assumptions: real robot, static scene during collection, wrist camera; no simulator, no learned dynamics model, no human interventions after the demo.
+
+---
+
+## Classical ancestor
+
+### DART ([Laskey et al., CoRL 2017, arXiv:1703.09327](https://arxiv.org/abs/1703.09327))
+Injects noise into the **human supervisor's own actions during demo collection**, so the supervisor is forced to demonstrate recoveries from the perturbed states in real time; the noise magnitude is optimized to approximate the trained policy's error distribution. Corrective labels come directly from the human — the human is doing the recovering, live. Assumptions: an available (human or algorithmic) supervisor for every demo; works on real robots or sim, no resets or dynamics model beyond normal demo collection. **Vs MILES**: DART needs the human in the loop for all recovery data, whereas MILES generates recoveries autonomously after one demo. BC (it's a supervised off-policy variant of DAgger's idea without policy rollouts).
+
+## Synthesized corrective labels (no extra robot time)
+
+### SPARTN ([Zhou et al., CVPR 2023, arXiv:2301.08556](https://arxiv.org/abs/2301.08556))
+Fully **offline** augmentation for eye-in-hand grasping: fit a NeRF per demo scene, sample perturbed camera/gripper poses, render the perturbed view, and compute the corrective action as the transform that returns to the original demo trajectory — visual noise + corrective label pairs with zero robot or human time. Assumptions: eye-in-hand camera, static scenes suitable for NeRF, mostly-kinematic tasks (grasping) where the geometric "return-to-trajectory" action is valid; no simulator state reset or learned dynamics. **Vs MILES**: perturbations are synthesized in image space rather than physically executed, so it cannot capture contact dynamics — MILES's physical rollouts can (key-in-lock), but cost real robot time. BC.
+
+### CCIL ([Ke et al., ICLR 2024, arXiv:2310.12972](https://arxiv.org/abs/2310.12972); fine-manipulation follow-up [arXiv:2405.19307](https://arxiv.org/abs/2405.19307))
+Fits a **learned dynamics model** on the demo data with an enforced local Lipschitz-continuity regularizer, then uses it to synthesize corrective labels: for states in the neighborhood of demo states, back out the action that drives the system onto the demonstrated trajectory, with **provable error bounds** on the synthesized labels valid where the dynamics are locally continuous. Assumptions: only the offline demo dataset plus the learned dynamics model — no environment interaction, no human, no simulator reset; validity degrades near discontinuous contact events. **Vs MILES**: corrective labels come from a model rather than physically executed recoveries, so it's cheaper but trusts the learned dynamics where MILES trusts real rollouts. BC.
+
+### Diffusion Meets DAgger ([Zhang et al., RSS 2024, arXiv:2402.17768](https://arxiv.org/abs/2402.17768))
+DAgger-style coverage without extra collection: a diffusion model synthesizes out-of-distribution eye-in-hand observations around demo states and pairs them with geometrically computed corrective actions (SPARTN's recipe with a diffusion image model instead of per-scene NeRFs). Assumptions: eye-in-hand setup, offline demos only. **Vs MILES**: synthetic views vs physically executed recoveries. BC.
+
+### IntervenGen ([Hoque et al., IROS 2024, arXiv:2405.01472](https://arxiv.org/abs/2405.01472))
+Takes a **small number of real human corrective interventions** and replays/transforms them MimicGen-style across new object poses in simulation, autonomously multiplying ~10 interventions into broad state-space coverage (up to 39x robustness gain). Assumptions: a simulator with state reset and object-pose-relative action re-targeting; a few human interventions as seeds. **Vs MILES**: still human-seeded and simulator-replicated, vs MILES's fully self-supervised physical collection. BC.
+
+## Edward Johns lab precursors that MILES builds on
+
+### Coarse-to-Fine Imitation Learning ([Johns, ICRA 2021, arXiv:2105.06411](https://arxiv.org/abs/2105.06411))
+Splits a task into a coarse approach to a **bottleneck pose** followed by open-loop **replay of the demo's end-effector velocities**; the approach controller is trained self-supervised by autonomously moving the wrist camera around the object to collect pose-estimation data. Assumptions: real robot, static object, task completable by replay after reaching the bottleneck. **Vs MILES**: only the *approach* is learned and the interaction is blind replay, whereas MILES learns a closed-loop policy through the contact phase from recovery data.
+
+### Self-Replay ([Di Palo & Johns, CoRL 2021, arXiv:2111.07447](https://arxiv.org/abs/2111.07447))
+Extends coarse-to-fine to multi-stage tasks: after one demo, the robot autonomously collects reaching data for each stage's object and chains learned-reach + demo-replay segments. Same assumptions as above; the self-supervised "collect your own data around the demo" pattern is the direct ancestor of MILES's collection loop. **Vs MILES**: augments reaching only, not corrective behavior along the whole trajectory.
+
+### DOME ([Valassakis, Papagiannis, Di Palo & Johns, IROS 2022, arXiv:2204.02863](https://arxiv.org/abs/2204.02863))
+One-shot, **no post-demo data collection at all**: an image-conditioned segmentation network plus a learned visual servoing network (trained task-agnostically beforehand) drives the end-effector to the demo's relative pose to the object, then replays demo velocities. Assumptions: real robot, wrist camera, replayable interaction. **Vs MILES**: DOME deploys immediately but is open-loop during interaction and intolerant to contact disturbance; MILES trades a few hours of autonomous collection for a closed-loop contact-robust policy. (The lab's 2025 successor line, [Learning a Thousand Tasks in a Day / MT3, arXiv:2511.10110](https://arxiv.org/abs/2511.10110), scales the alignment+interaction decomposition via retrieval rather than recovery augmentation.)
+
+## Newer (2024–2026) extensions of self-supervised recovery collection
+
+### SART ([arXiv:2509.09893](https://arxiv.org/abs/2509.09893), 2025)
+MILES-style physical self-augmentation, but the demonstrator **annotates precision boundaries** (spheres around key waypoints) once; the robot then autonomously generates diverse collision-free trajectories inside those bounds and reconnects to the demo. Assumptions: real robot, one demo + one round of human annotation. **Vs MILES**: explicitly criticizes MILES's fixed-size augmentation regions around all waypoints; makes the perturbation envelope state-dependent and safer. BC.
+
+### MinInter ([arXiv:2606.24078](https://arxiv.org/abs/2606.24078), 2026)
+Cites MILES; reduces artifacts from the trajectory-interpolation step when stitching augmentation trajectories back onto demos. Same physical-augmentation family and assumptions. BC.
+
+### One Demo is Worth a Thousand Trajectories ([Pan et al., CoRL 2025, arXiv:2606.19586](https://arxiv.org/pdf/2606.19586); [project](https://chuerpan.com/1001-demos.github.io/))
+From one fisheye eye-in-hand demo, reconstructs the scene with a fisheye-adapted **Gaussian Splatting** formulation, then uses trajectory optimization to generate collision-free perturbed action trajectories and renders matching novel-view image sequences — 1001 synthetic demos from one real one. Assumptions: offline; scene reconstruction quality; no contact-rich fidelity. **Vs MILES**: the SPARTN lineage (synthesize, don't execute) upgraded to editable 3D scenes and physically-feasible full trajectories. BC.
+
+### RaC ([Hu et al., 2025, arXiv:2509.07953](https://arxiv.org/abs/2509.07953))
+Scales **human-in-the-loop recovery + correction**: after BC pre-training, human operators intervene during rollouts by first *rewinding* the robot to an in-distribution state (recovery) then completing the sub-task (correction); fine-tuning on these segments beats expert-demo scaling with 10x less collection time. Assumptions: real robot, human supervision during rollouts. **Vs MILES**: recovery data is human-provided and policy-rollout-driven rather than self-supervised around a demo. BC fine-tuning (no critic), despite coming from an RL-heavy group.
+
+### AutoSERL — **the RL one** ([Liu et al., 2026, arXiv:2607.01651](https://arxiv.org/abs/2607.01651), "One Demonstration Is Enough for Real-World Robotic Reinforcement Learning")
+**Explicit flag: this is the paper in this family that injects recovery/guidance data into an off-policy RL replay buffer with a critic, rather than doing BC.** Built on the SERL stack (sample-efficient off-policy actor-critic RL on real robots), it takes a single demo and replaces human reward/intervention engineering with: a sliding-window intervention mechanism that keeps exploration near the demo, **predefined trajectory recovery points** that detect failure and reset the robot to known-good states mid-episode, and an automatic criterion that switches guidance off once the policy is self-sufficient; all resulting transitions train the critic through the replay buffer. Assumptions: real robot, contact-rich tasks (insertion, hanging, hinges), executable recovery trajectories; no simulator or learned dynamics. **Vs MILES**: uses MILES as its one-shot IL baseline and beats it — the demo-anchored perturbation/recovery idea becomes guided exploration for value learning instead of corrective-label BC.
+
+---
+
+**RL replay-buffer flag summary**: everything above trains with behavior cloning on (real or synthesized) corrective labels **except AutoSERL (arXiv:2607.01651)**, which routes single-demo-anchored guided exploration and recovery resets into an off-policy actor-critic replay buffer. RaC is adjacent but stays BC. No paper found in the citation graph yet does MILES-style *self-supervised* (human-free) recovery collection feeding a critic — the AutoSERL recovery points are predefined, which is the closest existing bridge and leaves that combination open.
+
+Sources: [MILES arXiv](https://arxiv.org/abs/2410.19693) · [MILES project](https://www.robot-learning.uk/miles) · [DART](https://arxiv.org/abs/1703.09327) · [SPARTN](https://arxiv.org/abs/2301.08556) · [CCIL](https://arxiv.org/abs/2310.12972) · [CCIL fine-manip](https://arxiv.org/abs/2405.19307) · [DMD](https://arxiv.org/abs/2402.17768) · [IntervenGen](https://arxiv.org/abs/2405.01472) · [Coarse-to-Fine](https://arxiv.org/abs/2105.06411) · [Self-Replay](https://arxiv.org/abs/2111.07447) · [DOME](https://arxiv.org/abs/2204.02863) · [MT3](https://arxiv.org/abs/2511.10110) · [SART](https://arxiv.org/abs/2509.09893) · [1001 Demos](https://arxiv.org/pdf/2606.19586) · [RaC](https://arxiv.org/abs/2509.07953) · [AutoSERL](https://arxiv.org/abs/2607.01651)
