@@ -1015,3 +1015,13 @@ buffer 分布;head 冻结在 10k 的 demo 分布上,判官风险 #2 兑现)。
   λ 落零后 floor 接管。×2 seeds。
 判据:dev100 斜率(20k-100k 五点);2-seed 纪律(memory:
 seed-budget-policy),有苗头再扩 4。均在 swirl03。
+
+**Wave-10 修订(用户两次质询驱动,最终阵容)**:
+- 臂 B 三易其稿:floor+wean schedule(未适配截断,q_reward_scale 被
+  dense 护栏拒)→ dense+schedule(hinge 塑形)→ **purefloor(定稿)**:
+  fscqn 预设 − 面具 + q_reward_scale=2,即 10k 预训练塑形 + 全程 λ≡0
+  + dense(自带 floor/MC)+ 截断适配 scale。= 178A 从头+截断版,
+  且与臂 A(fstm)构成 target-面具单变量消融对(modulo scale)。
+- 用户修正记录:(1) floor 的截断适配(scale=2,余量翻倍;相对 floor
+  = A13 尸体不碰);(2) 178A 本无 λ——塑形应由预训练承担而非 hinge
+  schedule(FS-CQN 20k=54.7% 为从头可行性证据)。
