@@ -392,6 +392,7 @@ def unseen_return_floor_loss(
     floor_value: float,
     reduction: str = "mean",
     topk: int = 1,
+    support_mask: jax.Array | None = None,
 ) -> tuple[jax.Array, jax.Array]:
     """Regress only replay-unseen bins to a valid minimum return.
 
@@ -399,7 +400,10 @@ def unseen_return_floor_loss(
     ``[B, L, D]``.  The replayed bin is explicitly masked out: it is trained
     only by the Bellman/return objective.  This is the squared conservative-Q
     regularizer used by Q-Transformer, adapted to CQN's C51 expected values;
-    it is not an action likelihood, classification, or margin loss.
+    it is not an action likelihood, classification, or margin loss.  With a
+    ``support_mask`` of admissible bins ``[B, L, D, bins]``, the floored set
+    shrinks to unseen AND out-of-support bins; in-support unexecuted
+    siblings are left entirely to the TD objective.
     """
 
     all_probabilities = jax.nn.softmax(all_logits, axis=-1)
@@ -410,6 +414,10 @@ def unseen_return_floor_loss(
         dtype=all_q.dtype,
     )
     unseen_mask = 1.0 - chosen_mask
+    if support_mask is not None:
+        unseen_mask = unseen_mask * (
+            1.0 - support_mask.astype(all_q.dtype)
+        )
     reduction = str(reduction).lower()
     if reduction == "mean":
         reduce_axes = tuple(range(1, unseen_mask.ndim))
@@ -441,6 +449,12 @@ def unseen_return_floor_loss(
             axis=-1,
         )
         tail_unseen_q = sorted_unseen_q[..., -tail_count:]
+        if support_mask is not None:
+            tail_unseen_q = jnp.where(
+                jnp.isfinite(tail_unseen_q),
+                tail_unseen_q,
+                float(floor_value),
+            )
         reduce_axes = tuple(range(1, tail_unseen_q.ndim))
         per_sample_loss = jnp.mean(
             jnp.square(tail_unseen_q - float(floor_value)),
@@ -470,6 +484,7 @@ def dense_return_distributional_loss(
     label_smoothing: float = 0.0,
     floor_satisfaction_margin: float | None = None,
     relative_floor_margin: float | None = None,
+    support_mask: jax.Array | None = None,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     """Regress every action bin to an absolute return distribution.
 
@@ -492,6 +507,10 @@ def dense_return_distributional_loss(
     ``-alpha * (max_b Q(s,b) - Q(s,a))``. The shift is stop-gradient.
     With a clipping ratio, the shift is applied only to bins whose
     support-relative value is sufficiently close to the current maximum.
+    With a ``support_mask`` of admissible bins ``[B, L, D, bins]``,
+    in-support unexecuted siblings drop out of the loss entirely: they
+    receive no floor target and stay under TD control, while out-of-support
+    bins keep the floor regression.
     """
 
     atoms = int(support.shape[0])
@@ -659,6 +678,11 @@ def dense_return_distributional_loss(
         per_bin_loss = per_bin_loss * (
             1.0 - satisfied.astype(per_bin_loss.dtype)
         )
+    if support_mask is not None:
+        floor_exempt = support_mask.astype(per_bin_loss.dtype) * (
+            1.0 - chosen_mask
+        )
+        per_bin_loss = per_bin_loss * (1.0 - floor_exempt)
     per_sample_loss = per_bin_loss.sum(axis=-1).mean(axis=(1, 2))
 
     chosen_q = jnp.sum(all_q * chosen_mask, axis=-1).mean(axis=(1, 2))
@@ -1016,6 +1040,7 @@ class CQN(JaxRLMethodBase, OffPolicyMethod):
         replay_next_actions,
         demos,
         action_key,
+        policy_params=None,
     ):
         """Select the bootstrap action used by the single TD objective.
 
@@ -1024,7 +1049,7 @@ class CQN(JaxRLMethodBase, OffPolicyMethod):
         without duplicating the no-policy update path.
         """
 
-        del replay_actions, replay_next_actions, demos
+        del replay_actions, replay_next_actions, demos, policy_params
         return self._greedy_action_for_update(
             critic_params,
             features,
@@ -1141,6 +1166,9 @@ class CQN(JaxRLMethodBase, OffPolicyMethod):
             getattr(self, "bc_lambda_schedule", None) is not None
         )
         use_coarse_flow = bool(getattr(self, "coarse_flow", False))
+        use_support_mask_head = bool(
+            getattr(self, "use_frozen_support_mask", False)
+        )
 
         def array_all_finite(value):
             value = jnp.asarray(value)
@@ -1188,6 +1216,7 @@ class CQN(JaxRLMethodBase, OffPolicyMethod):
             demos,
             mc_returns,
             bc_weight,
+            support_mask_ce_weight,
             action_key,
             aux_next_obs_inputs=None,
             aux_next_actions=None,
@@ -1233,6 +1262,7 @@ class CQN(JaxRLMethodBase, OffPolicyMethod):
                         next_actions,
                         demos,
                         action_key,
+                        policy_params=current_params.get("policy", None),
                     )
                 )
                 target_logits, _ = self._critic_logits_per_level(
@@ -1270,6 +1300,7 @@ class CQN(JaxRLMethodBase, OffPolicyMethod):
                         aux_next_actions,
                         demos,
                         jax.random.fold_in(action_key, 4245),
+                        policy_params=current_params.get("policy", None),
                     )
                     aux_target_logits, _ = self._critic_logits_per_level(
                         target_critic_params,
@@ -1395,6 +1426,19 @@ class CQN(JaxRLMethodBase, OffPolicyMethod):
                     target_distribution * chosen_log_probabilities,
                     axis=-1,
                 ).mean(axis=(1, 2))
+                support_mask = None
+                support_mask_width = jnp.asarray(0.0, dtype=jnp.float32)
+                if use_support_mask_head and (
+                    use_dense_return_target or use_return_floor
+                ):
+                    support_mask = self._support_mask_for_actions(
+                        current_params["policy"],
+                        jax.lax.stop_gradient(features),
+                        actions,
+                    )[:, :, : all_logits.shape[2]]
+                    support_mask_width = jnp.mean(
+                        support_mask.astype(jnp.float32)
+                    )
                 dense_chosen_q = jnp.asarray(0.0, dtype=jnp.float32)
                 dense_unseen_q = jnp.asarray(0.0, dtype=jnp.float32)
                 dense_positive_fraction = jnp.asarray(0.0, dtype=jnp.float32)
@@ -1439,6 +1483,7 @@ class CQN(JaxRLMethodBase, OffPolicyMethod):
                             dense_return_label_smoothing,
                             dense_return_floor_satisfaction_margin,
                             dense_return_relative_floor_margin,
+                            support_mask=support_mask,
                         )
                     if dense_return_positive_only:
                         dense_positive_mask = mc_returns > 0.0
@@ -1501,6 +1546,7 @@ class CQN(JaxRLMethodBase, OffPolicyMethod):
                             return_floor_value,
                             reduction=return_floor_reduction,
                             topk=return_floor_topk,
+                            support_mask=support_mask,
                         )
                     )
                     return_floor_loss = return_floor_weight * jnp.mean(
@@ -1514,6 +1560,18 @@ class CQN(JaxRLMethodBase, OffPolicyMethod):
                             axis=-1,
                         )
                     )
+
+                support_mask_ce_loss = jnp.asarray(0.0, dtype=jnp.float32)
+                if use_support_mask_head:
+                    support_mask_ce_loss = support_mask_ce_weight * (
+                        self._support_mask_ce_loss(
+                            current_params["policy"],
+                            jax.lax.stop_gradient(features),
+                            actions,
+                            demos,
+                        )
+                    )
+                    critic_loss = critic_loss + support_mask_ce_loss
 
                 bc_fosd_term = jnp.asarray(0.0, dtype=jnp.float32)
                 bc_margin_term = jnp.asarray(0.0, dtype=jnp.float32)
@@ -1777,6 +1835,8 @@ class CQN(JaxRLMethodBase, OffPolicyMethod):
                     dense_positive_fraction,
                     token_split_aux_fraction,
                     token_split_aux_reward_mean,
+                    support_mask_ce_loss,
+                    support_mask_width,
                     target_action_info,
                     bc_diagnostics,
                     nan_diag,
@@ -1793,6 +1853,17 @@ class CQN(JaxRLMethodBase, OffPolicyMethod):
                 grads, opt_state, params
             )
             candidate_params = self.optax.apply_updates(params, updates)
+            if use_support_mask_head:
+                candidate_params = dict(candidate_params)
+                candidate_params["policy"] = jax.tree.map(
+                    lambda frozen, trained: jnp.where(
+                        support_mask_ce_weight > 0.0,
+                        trained,
+                        frozen,
+                    ),
+                    pre_params["policy"],
+                    candidate_params["policy"],
+                )
             candidate_target_critic_params = jax.tree.map(
                 lambda target, online: (1.0 - tau) * target + tau * online,
                 target_critic_params,
@@ -1813,6 +1884,8 @@ class CQN(JaxRLMethodBase, OffPolicyMethod):
                 dense_positive_fraction,
                 token_split_aux_fraction,
                 token_split_aux_reward_mean,
+                support_mask_ce_loss,
+                support_mask_width,
                 target_action_info,
                 bc_diagnostics,
                 nan_diag,
@@ -1914,6 +1987,10 @@ class CQN(JaxRLMethodBase, OffPolicyMethod):
                 metrics["token_split_aux_reward_mean"] = (
                     token_split_aux_reward_mean
                 )
+            if use_support_mask_head:
+                metrics["support_mask_ce_loss"] = support_mask_ce_loss
+                metrics["support_mask_ce_weight"] = support_mask_ce_weight
+                metrics["support_mask_width"] = support_mask_width
             if q_reward_scale != 1.0:
                 metrics["q_reward_scale"] = jnp.asarray(
                     q_reward_scale,
@@ -1990,39 +2067,73 @@ class CQN(JaxRLMethodBase, OffPolicyMethod):
                 return args, ()
             return args[:-5], args[-5:]
 
-        def call_impl(core_args, mc_returns, bc_weight, action_key, aux_tail):
+        def split_support_mask_weight(args):
+            # The frozen-support CE gate is threaded immediately before
+            # action_key; every other configuration passes none.
+            if not use_support_mask_head:
+                return args, jnp.asarray(0.0, dtype=jnp.float32)
+            (*rest, weight, action_key) = args
+            return (*rest, action_key), weight
+
+        def call_impl(
+            core_args,
+            mc_returns,
+            bc_weight,
+            support_mask_ce_weight,
+            action_key,
+            aux_tail,
+        ):
             return update_impl(
-                *core_args, mc_returns, bc_weight, action_key, *aux_tail
+                *core_args,
+                mc_returns,
+                bc_weight,
+                support_mask_ce_weight,
+                action_key,
+                *aux_tail,
             )
 
         if use_mc_returns and use_bc_schedule:
 
             def update_fn(*args):
                 args, aux_tail = split_aux_tail(args)
+                args, support_mask_ce_weight = split_support_mask_weight(args)
                 (*core, mc_returns, bc_weight, action_key) = args
                 return call_impl(
-                    core, mc_returns, bc_weight, action_key, aux_tail
+                    core,
+                    mc_returns,
+                    bc_weight,
+                    support_mask_ce_weight,
+                    action_key,
+                    aux_tail,
                 )
 
         elif use_mc_returns:
 
             def update_fn(*args):
                 args, aux_tail = split_aux_tail(args)
+                args, support_mask_ce_weight = split_support_mask_weight(args)
                 (*core, mc_returns, action_key) = args
                 return call_impl(
-                    core, mc_returns, base_bc_weight, action_key, aux_tail
+                    core,
+                    mc_returns,
+                    base_bc_weight,
+                    support_mask_ce_weight,
+                    action_key,
+                    aux_tail,
                 )
 
         elif use_bc_schedule:
 
             def update_fn(*args):
                 args, aux_tail = split_aux_tail(args)
+                args, support_mask_ce_weight = split_support_mask_weight(args)
                 (*core, bc_weight, action_key) = args
                 rewards = core[7]
                 return call_impl(
                     core,
                     jnp.zeros_like(rewards),
                     bc_weight,
+                    support_mask_ce_weight,
                     action_key,
                     aux_tail,
                 )
@@ -2031,12 +2142,14 @@ class CQN(JaxRLMethodBase, OffPolicyMethod):
 
             def update_fn(*args):
                 args, aux_tail = split_aux_tail(args)
+                args, support_mask_ce_weight = split_support_mask_weight(args)
                 (*core, action_key) = args
                 rewards = core[7]
                 return call_impl(
                     core,
                     jnp.zeros_like(rewards),
                     base_bc_weight,
+                    support_mask_ce_weight,
                     action_key,
                     aux_tail,
                 )
@@ -2177,6 +2290,19 @@ class CQN(JaxRLMethodBase, OffPolicyMethod):
             if getattr(self, "bc_lambda_schedule", None) is not None:
                 canonical_mc_args = canonical_mc_args + (
                     float(utils.schedule(self.bc_lambda_schedule, step)),
+                )
+            if getattr(self, "use_frozen_support_mask", False):
+                # Freeze counts gradient updates, not environment steps, so
+                # the head stops exactly at the offline/online seam even
+                # though pretraining passes step=0 for every update.
+                canonical_mc_args = canonical_mc_args + (
+                    jnp.asarray(
+                        1.0
+                        if self._update_step_count
+                        < int(self.support_mask_freeze_step)
+                        else 0.0,
+                        dtype=jnp.float32,
+                    ),
                 )
             auxiliary_args = ()
             needs_aux_horizon = (

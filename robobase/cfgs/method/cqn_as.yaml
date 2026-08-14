@@ -163,6 +163,14 @@ method:
   # The legacy CQN-AS path remains the default for checkpoint compatibility.
   separate_bc_policy: false
   bc_policy_stop_gradient: false
+  # FS-CQN frozen support mask (reports/fscqn_proposal_20260814.md): reuse the
+  # separate-BC bin head as a standalone demo-CE bin-probability model on the
+  # canonical critic path. Per level, decode AND target argmax are restricted
+  # to bins with pi_b >= tau * max pi_b; the head stops training after
+  # freeze_step gradient updates. False preserves the exact legacy graph.
+  use_frozen_support_mask: false
+  support_mask_tau: 0.3
+  support_mask_freeze_step: 10000
   # Direct-Q research arms may import a validation-selected clean CQN-AS
   # target critic as their exact behavior policy. `legacy_c51` preserves all
   # 51 atoms and ranks bins by expected return; freezing also protects the

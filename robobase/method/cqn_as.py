@@ -237,6 +237,9 @@ class CQNASpec(CQNSpec):
     bin_explore_persist_plans: int | None
     low_dim_mask_prob: float
     low_dim_mask_keep_last: int
+    use_frozen_support_mask: bool
+    support_mask_tau: float
+    support_mask_freeze_step: int
 
 
 def cqn_as_spec_from_cfg(cfg: DictConfig) -> CQNASpec:
@@ -311,6 +314,7 @@ def cqn_as_spec_from_cfg(cfg: DictConfig) -> CQNASpec:
             "coarse_flow_pure",
             "freeze_bc_policy",
             "direct_scalar_q",
+            "use_frozen_support_mask",
         )
         for name in forbidden_true:
             if bool(method.get(name, False)):
@@ -612,6 +616,13 @@ def cqn_as_spec_from_cfg(cfg: DictConfig) -> CQNASpec:
             None
             if method.get("bin_flip_level", None) is None
             else int(method.get("bin_flip_level"))
+        ),
+        use_frozen_support_mask=bool(
+            method.get("use_frozen_support_mask", False)
+        ),
+        support_mask_tau=float(method.get("support_mask_tau", 0.3)),
+        support_mask_freeze_step=int(
+            method.get("support_mask_freeze_step", 10000)
         ),
     )
 
@@ -1401,6 +1412,9 @@ class CQNAS(CQN):
         post_ensemble_l1_flip_prob: float = 0.0,
         post_ensemble_l2_flip_prob: float = 0.0,
         post_ensemble_l1_flip_horizon: int = 4,
+        use_frozen_support_mask: bool = False,
+        support_mask_tau: float = 0.3,
+        support_mask_freeze_step: int = 10000,
     ):
         JaxRLMethodBase.__init__(
             self,
@@ -1583,6 +1597,38 @@ class CQNAS(CQN):
             raise ValueError(
                 "dense_return_positive_only requires "
                 "mc_lower_bound_target=true so completed returns are present."
+            )
+        if use_frozen_support_mask:
+            support_mask_violations = []
+            if separate_bc_policy:
+                support_mask_violations.append("separate_bc_policy=false")
+            if autoregressive_action_dims:
+                support_mask_violations.append(
+                    "autoregressive_action_dims=false"
+                )
+            if pessimistic_twin_critic:
+                support_mask_violations.append(
+                    "pessimistic_twin_critic=false"
+                )
+            if twin_rollout_beam_width != 1:
+                support_mask_violations.append("twin_rollout_beam_width=1")
+            if coarse_flow:
+                support_mask_violations.append("coarse_flow=false")
+            if dense_return_expected_q_loss:
+                support_mask_violations.append(
+                    "dense_return_expected_q_loss=false"
+                )
+            if support_mask_violations:
+                raise ValueError(
+                    "use_frozen_support_mask requires the canonical "
+                    "single-critic decode path: "
+                    + "; ".join(support_mask_violations)
+                )
+        if not 0.0 < support_mask_tau <= 1.0:
+            raise ValueError("support_mask_tau must be in (0, 1].")
+        if support_mask_freeze_step < 0:
+            raise ValueError(
+                "support_mask_freeze_step must be non-negative."
             )
         if dense_return_expected_q_loss and not dense_return_q_target:
             raise ValueError(
@@ -2082,6 +2128,9 @@ class CQNAS(CQN):
         self.separate_bc_policy = bool(separate_bc_policy)
         self.bc_policy_stop_gradient = bool(bc_policy_stop_gradient)
         self.distinct_policy_encoder = bool(distinct_policy_encoder)
+        self.use_frozen_support_mask = bool(use_frozen_support_mask)
+        self.support_mask_tau = float(support_mask_tau)
+        self.support_mask_freeze_step = int(support_mask_freeze_step)
         self.td_target_action_source = td_target_action_source
         self.demo_behavior_force_probability = float(
             demo_behavior_force_probability
@@ -2410,10 +2459,12 @@ class CQNAS(CQN):
             critic_params = init_critic(self.rng_key)
             critic2_params = None
             self.params = {"critic": critic_params}
-        if self.separate_bc_policy:
+        if self.separate_bc_policy or self.use_frozen_support_mask:
             # The policy has its own coarse-to-fine bin logits.  It deliberately
             # has no value atoms: demo CE can train this head without changing
-            # the critic's return distribution or action ranking.
+            # the critic's return distribution or action ranking.  The frozen
+            # support mask reuses the same head as a standalone per-level
+            # bin-probability model on the canonical critic path.
             self.policy_model = C2FSequenceDistributionalCritic(
                 hidden_dims=model.hidden_dims,
                 action_sequence=self.action_sequence,
@@ -2738,6 +2789,56 @@ class CQNAS(CQN):
             )
         return jnp.stack(logits_per_level, axis=1), discrete_action
 
+    def _support_mask_bins(self, policy_params, features, one_hot, midpoint):
+        """Admissible bins from the frozen behavior head at one C2F level."""
+
+        logits = self.policy_model.apply(
+            jax.lax.stop_gradient(policy_params),
+            features,
+            one_hot,
+            midpoint,
+        )[..., 0]
+        probabilities = jax.nn.softmax(logits, axis=-1)
+        return probabilities >= (
+            self.support_mask_tau
+            * jnp.max(probabilities, axis=-1, keepdims=True)
+        )
+
+    def _support_mask_for_actions(self, policy_params, features, actions):
+        """Per-level admissible bins along the executed action's zoom path."""
+
+        policy_logits, _ = self._policy_logits_per_level(
+            jax.lax.stop_gradient(policy_params),
+            features,
+            actions,
+        )
+        probabilities = jax.nn.softmax(policy_logits, axis=-1)
+        return probabilities >= (
+            self.support_mask_tau
+            * jnp.max(probabilities, axis=-1, keepdims=True)
+        )
+
+    def _support_mask_ce_loss(self, policy_params, features, actions, demos):
+        """Demo-masked CE that trains only the bin-probability head."""
+
+        policy_logits, expert_bins = self._policy_logits_per_level(
+            policy_params,
+            features,
+            actions,
+        )
+        policy_log_probabilities = jax.nn.log_softmax(
+            policy_logits,
+            axis=-1,
+        )
+        expert_log_probabilities = jnp.take_along_axis(
+            policy_log_probabilities,
+            expert_bins[..., None],
+            axis=-1,
+        )[..., 0]
+        per_sample = -expert_log_probabilities.mean(axis=(1, 2))
+        demo_count = jnp.maximum(jnp.sum(demos), 1.0)
+        return jnp.sum(per_sample * demos) / demo_count
+
     def _policy_action(self, policy_params, features, key=None):
         """Autoregress over C2F levels using the independent BC policy head."""
 
@@ -2801,8 +2902,17 @@ class CQNAS(CQN):
             return values[:, :, : self.action_dim]
         return values
 
-    def _greedy_action(self, critic_params, features, key=None):
+    def _greedy_action(
+        self,
+        critic_params,
+        features,
+        key=None,
+        policy_params=None,
+    ):
         batch_size = features.shape[0]
+        use_support_mask = (
+            self.use_frozen_support_mask and policy_params is not None
+        )
         low = jnp.broadcast_to(
             self.action_low,
             (batch_size, self._flat_action_dim),
@@ -2853,18 +2963,38 @@ class CQNAS(CQN):
                     probabilities * self.support,
                     axis=-1,
                 )
+                admissible = None
+                if use_support_mask:
+                    admissible = self._support_mask_bins(
+                        policy_params,
+                        features,
+                        one_hot,
+                        midpoint,
+                    )
+                    q_values = jnp.where(admissible, q_values, -jnp.inf)
                 index = jnp.argmax(q_values, axis=-1)
                 if level_key is not None:
-                    random_index = jax.random.randint(
-                        level_key,
-                        index.shape,
-                        minval=0,
-                        maxval=self.bins,
-                    )
-                    q_span = (
-                        q_values.max(axis=-1)
-                        - q_values.min(axis=-1)
-                    )
+                    if admissible is None:
+                        random_index = jax.random.randint(
+                            level_key,
+                            index.shape,
+                            minval=0,
+                            maxval=self.bins,
+                        )
+                        q_span = (
+                            q_values.max(axis=-1)
+                            - q_values.min(axis=-1)
+                        )
+                    else:
+                        random_index = jax.random.categorical(
+                            level_key,
+                            jnp.where(admissible, 0.0, -jnp.inf),
+                            axis=-1,
+                        )
+                        q_span = q_values.max(axis=-1) - jnp.min(
+                            jnp.where(admissible, q_values, jnp.inf),
+                            axis=-1,
+                        )
                     index = jnp.where(
                         q_span < self.tie_break_delta,
                         random_index,
@@ -2889,19 +3019,39 @@ class CQNAS(CQN):
                         # Comparing against "random" separates two things the
                         # fine levels could be doing: making a decision, or
                         # merely dithering inside the parent cell.
-                        index = jnp.full_like(index, self.bins // 2)
+                        if admissible is None:
+                            index = jnp.full_like(index, self.bins // 2)
+                        else:
+                            centre_distance = jnp.abs(
+                                jnp.arange(self.bins) - self.bins // 2
+                            ).astype(jnp.float32)
+                            index = jnp.argmax(
+                                jnp.where(
+                                    admissible,
+                                    -centre_distance,
+                                    -jnp.inf,
+                                ),
+                                axis=-1,
+                            )
                     else:
                         if level_key is None:
                             raise ValueError(
                                 "random_levels_from needs an rng key; it is a "
                                 "diagnostic for eval-time action selection."
                             )
-                        index = jax.random.randint(
-                            level_key,
-                            index.shape,
-                            minval=0,
-                            maxval=self.bins,
-                        )
+                        if admissible is None:
+                            index = jax.random.randint(
+                                level_key,
+                                index.shape,
+                                minval=0,
+                                maxval=self.bins,
+                            )
+                        else:
+                            index = jax.random.categorical(
+                                level_key,
+                                jnp.where(admissible, 0.0, -jnp.inf),
+                                axis=-1,
+                            )
             selected.append(index)
             flat_index = index.reshape((batch_size, self._flat_action_dim))
             low, high = zoom_in(
@@ -3598,15 +3748,39 @@ class CQNAS(CQN):
                 )
             if self.twin_rollout_beam_width > 1:
                 return self._joint_beam_action(critic_params, features)[0]
-            return self._greedy_action(critic_params, features, key=key)[0]
+            return self._greedy_action(
+                critic_params,
+                features,
+                key=key,
+                policy_params=(
+                    params["policy"]
+                    if self.use_frozen_support_mask
+                    else None
+                ),
+            )[0]
 
         return action_fn
 
-    def _greedy_action_for_update(self, critic_params, features, action_key):
+    def _greedy_action_for_update(
+        self,
+        critic_params,
+        features,
+        action_key,
+        policy_params=None,
+    ):
+        if policy_params is None:
+            # Subclasses override _greedy_action without the support-mask
+            # keyword; only thread it when a mask head is actually supplied.
+            return self._greedy_action(
+                critic_params,
+                features,
+                key=action_key,
+            )
         return self._greedy_action(
             critic_params,
             features,
             key=action_key,
+            policy_params=policy_params,
         )
 
     def _td_target_action_for_update(
@@ -3617,6 +3791,7 @@ class CQNAS(CQN):
         replay_next_actions,
         demos,
         action_key,
+        policy_params=None,
     ):
         if self.td_target_action_source == "replay_next":
             # This hook is used by the no-policy/single-objective parent update
@@ -3635,6 +3810,7 @@ class CQNAS(CQN):
                 critic_params,
                 features,
                 action_key,
+                policy_params=policy_params,
             )
             behavior_action = jnp.asarray(
                 replay_next_actions,
@@ -3689,6 +3865,7 @@ class CQNAS(CQN):
             critic_params,
             features,
             action_key,
+            policy_params=policy_params,
         )
 
     def _score_action_sequence_for_backup(

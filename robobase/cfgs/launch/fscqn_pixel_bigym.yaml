@@ -1,0 +1,35 @@
+# @package _global_
+
+# FS-CQN (Frozen-Support CQN-AS, reports/fscqn_proposal_20260814.md): no-BC
+# dense reward-Q critic whose decode and bootstrap argmax are restricted to
+# the frozen demo-CE support mask. Offline phase = 10k demo-only pretrain
+# updates training critic and mask head together; the head freezes exactly at
+# the offline/online seam. Frozen expert replay only (no self-imitation).
+defaults:
+  - cqn_as_pixel_bigym_demo_driven
+  - _self_
+
+num_pretrain_steps: 10000
+use_self_imitation: false
+
+# The offline demo-only phase is num_pretrain_steps (the stage-36+ no-BC
+# knob): pretraining draws only from the demo replay, then online updates
+# use the ordinary mixed batches.
+replay:
+  demo_only_updates: false
+
+method:
+  bc_lambda: 0.0
+  bc_lambda_schedule: null
+  bc_margin: 0.0
+  demo_fosd: false
+  use_frozen_support_mask: true
+  support_mask_tau: 0.3
+  support_mask_freeze_step: 10000
+  dense_return_q_target: true
+  dense_return_positive_only: true
+  mc_lower_bound_target: true
+
+hydra:
+  run:
+    dir: ./exp_local/fscqn/bigym_${env.task_name}_${now:%Y%m%d%H%M%S}
