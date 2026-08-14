@@ -238,6 +238,7 @@ class CQNASpec(CQNSpec):
     low_dim_mask_prob: float
     low_dim_mask_keep_last: int
     use_frozen_support_mask: bool
+    support_mask_decode: bool
     support_mask_tau: float
     support_mask_freeze_step: int
 
@@ -620,6 +621,7 @@ def cqn_as_spec_from_cfg(cfg: DictConfig) -> CQNASpec:
         use_frozen_support_mask=bool(
             method.get("use_frozen_support_mask", False)
         ),
+        support_mask_decode=bool(method.get("support_mask_decode", True)),
         support_mask_tau=float(method.get("support_mask_tau", 0.3)),
         support_mask_freeze_step=int(
             method.get("support_mask_freeze_step", 10000)
@@ -1413,6 +1415,7 @@ class CQNAS(CQN):
         post_ensemble_l2_flip_prob: float = 0.0,
         post_ensemble_l1_flip_horizon: int = 4,
         use_frozen_support_mask: bool = False,
+        support_mask_decode: bool = True,
         support_mask_tau: float = 0.3,
         support_mask_freeze_step: int = 10000,
     ):
@@ -2129,6 +2132,7 @@ class CQNAS(CQN):
         self.bc_policy_stop_gradient = bool(bc_policy_stop_gradient)
         self.distinct_policy_encoder = bool(distinct_policy_encoder)
         self.use_frozen_support_mask = bool(use_frozen_support_mask)
+        self.support_mask_decode = bool(support_mask_decode)
         self.support_mask_tau = float(support_mask_tau)
         self.support_mask_freeze_step = int(support_mask_freeze_step)
         self.td_target_action_source = td_target_action_source
@@ -3755,6 +3759,7 @@ class CQNAS(CQN):
                 policy_params=(
                     params["policy"]
                     if self.use_frozen_support_mask
+                    and self.support_mask_decode
                     else None
                 ),
             )[0]

@@ -169,6 +169,7 @@ method:
   # to bins with pi_b >= tau * max pi_b; the head stops training after
   # freeze_step gradient updates. False preserves the exact legacy graph.
   use_frozen_support_mask: false
+  support_mask_decode: true
   support_mask_tau: 0.3
   support_mask_freeze_step: 10000
   # Direct-Q research arms may import a validation-selected clean CQN-AS

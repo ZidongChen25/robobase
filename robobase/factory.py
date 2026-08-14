@@ -465,6 +465,7 @@ def create_agent(
                 spec.coarse_flow_selfdistill_threshold
             ),
             use_frozen_support_mask=spec.use_frozen_support_mask,
+        support_mask_decode=spec.support_mask_decode,
             support_mask_tau=spec.support_mask_tau,
             support_mask_freeze_step=spec.support_mask_freeze_step,
             model=spec.model,

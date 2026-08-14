@@ -999,3 +999,19 @@ buffer 分布;head 冻结在 10k 的 demo 分布上,判官风险 #2 兑现)。
 
 学费定理更新:**限制解码域推迟(5k→~80k)但不阻止死亡;buffer 指标
 看不见 rollout 侧的病**——评估口径必须含 rollout-state 探针。
+
+## Wave-10 预注册:双方案并行,各 2 seeds(2026-08-15,用户裁定)
+
+判别测量定案:同一 100k 崩塌 critic,戴面具 5% / 摘面具 **36%**(20k:
+53/56)——**frozen decode mask 在漂移状态上是主动毒药;masked target
+保护了价值面**(critic 免疫角落,摘面具不归零)。
+
+- **臂 A "FS-CQN-TM"**(target-mask only):face fscqn 预设 +
+  `support_mask_decode=false`——TD target 仍戴面具(head 只在 replay
+  分布内被查询,可靠),解码放开。×2 seeds。
+- **臂 B "floor-wean"**(纯 critic-only,单网络):官方合同 +
+  unseen_return_floor(w=0.1,value 0,mean)+ zero70 schedule
+  (step_linear(1.0,0.0125,50k,0.0,20k))。= 178A 的从头+截断制度版,
+  λ 落零后 floor 接管。×2 seeds。
+判据:dev100 斜率(20k-100k 五点);2-seed 纪律(memory:
+seed-budget-policy),有苗头再扩 4。均在 swirl03。
