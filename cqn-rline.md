@@ -1025,3 +1025,105 @@ seed-budget-policy),有苗头再扩 4。均在 swirl03。
 - 用户修正记录:(1) floor 的截断适配(scale=2,余量翻倍;相对 floor
   = A13 尸体不碰);(2) 178A 本无 λ——塑形应由预训练承担而非 hinge
   schedule(FS-CQN 20k=54.7% 为从头可行性证据)。
+
+## Wave-10 阶段报告与执行（2026-08-15）
+
+### 1. Previous-stage result
+
+Wave-9 FS-CQN 的当前保留原始 artifact 是
+`exp_local/cqn_trunc_arms/fscqn_move_plate/seed{7..11}_20260814fs/dev100.csv`。
+五个 seed 的 dev100 曲线分别为：
+
+| seed | 20k | 40k | 60k | 80k | 100k | validation-selected best |
+|---|---:|---:|---:|---:|---:|---:|
+| 7 | 56 | 30 | 14 | 3 | 1 | 56 @ 20k |
+| 8 | 44 | 28 | 1 | 0 | 1 | 44 @ 20k |
+| 9 | 59 | 46 | 16 | 5 | 4 | 59 @ 20k |
+| 10 | 53 | 29 | 16 | 6 | 5 | 53 @ 20k |
+| 11 | 60 | 38 | 11 | 2 | 1 | 60 @ 20k |
+| mean | **54.4** | **34.2** | **11.6** | **3.2** | **2.4** | **54.4 @ 20k** |
+
+所以 best-checkpoint 与 endpoint 的公平比较是 54.4% @20k 对 2.4%
+@100k，而不是把 2.4% 当成该方法的最佳能力。此前完整 11-seed 账本的
+对应均值是 54.7→34.8→12.6→5.4→3.1，结论一致。固定同一 100k critic
+的解码尸检为 masked 5%、unmasked 36%（20k 为 53%/56%）。本阶段未读取
+seeds 800--999 held-out。
+
+### 2. Interpretation
+
+FS-CQN 证明 target support 能避免传统 λ=0 的 5k-step 瞬时相变，却没有
+带来正 scaling；冻结在 demo 分布上的 mask 一旦被 rollout 分布反复查询，
+从保护变成了执行期 OOD 毒药。摘掉 decode mask 后 100k 从 5% 回到 36%，
+同时仍远低于 20k 的 53%，所以 decode mask 是一部分原因，但不是全部原因。
+仍未解决的是：没有 action-label 约束时，dense floor/TD 是否能在 online
+分布上维持正确相对排序并继续提高，而不只是保存 demo 附近能力。
+
+### 3. Next-stage decision
+
+把两个问题放在独立实验中：
+
+- A / `fstm`：以 FS-CQN 为 matched baseline，只改
+  `support_mask_decode=false`；target argmax 继续使用冻结 mask。training seeds
+  7/8，直接逐 seed 配对 Wave-9 同 seed。
+- B / `purefloor`：10k demo-only reward-Q 预训练、λ=0、self-imitation off、
+  无 policy/mask head、positive-only dense return target + MC lower bound，且
+  `q_reward_scale=2`。它回答修正 demo-MDP/value scale 后纯 critic floor 能否
+  scaling，不与 A 混成一个因果比较。
+
+两臂预算均为 101k；selection split 是 seeds 400--499，每个 20/40/60/80/100k
+checkpoint 100 episodes；held-out split seeds 800--999 在二种子 gate 前保持
+封存。主指标为五点 OLS success slope、100k−20k endpoint delta、100k
+seed-min；报告 validation-selected best（平局取更早 checkpoint）。只有同时
+满足 mean slope > 0、mean(100k) >= mean(20k)、两个 seed 的 100k 均 >=40%，
+才扩到四 seed。mean slope <=0 且 endpoint 下降超过 10pp 直接 fail；其余为
+inconclusive，不开 held-out。四 seed 通过后才用 validation-selected best
+checkpoint 做 200-episode held-out，并与同样 validation-selected 的 matched
+baseline 比较。
+
+### 4. Execution
+
+已加入 `fscqn_target_mask_only_pixel_bigym.yaml`、
+`cqn_as_pixel_bigym_purefloor_gate.yaml`、单 seed runner
+`scripts/run_cqn_wave10_arm.sh` 和双卡调度器
+`scripts/launch_cqn_wave10.sh`。运行布局预注册为 GPU2/EGL2 seed7 与
+GPU3/EGL3 seed8；每卡先 A、120 秒后 B，`xla_mem_fraction=0.45`，并显式
+使用与 matched artifacts 一致的 `ROBOBASE_HOST_MERGE=1`。runner 只产生
+`dev100.csv`，不包含 held-out 评估。
+
+实际发射 stamp 为 `20260815wave10`。首次 `nohup` 尝试只写了 PID 文件便被
+外层执行环境回收，GPU 仍为 3 MiB、无 Hydra artifact，因此未计作启动；随后
+用独立 tmux session 在 09:32:42 BST 重发。已验证四个真实 trainer：
+
+- GPU2 UUID `GPU-80b9cc0d-...`：fstm s7 PID 2844845，purefloor s7
+  PID 2849606；
+- GPU3 UUID `GPU-03f1431f-...`：fstm s8 PID 2844846，purefloor s8
+  PID 2849605。
+
+两张卡的第二进程均精确晚 120 秒。09:37--09:40 的 artifact 证明不是空壳
+进程：四份 `.hydra/config.yaml` 与 `pretrain.csv` 均已落盘；fstm 两 seed
+各写 19 行有限 update（critic loss 0.794/0.788，support CE weight=1），
+purefloor 各写 7 行有限 update（critic loss=dense loss 0.404/0.402，
+`q_reward_scale=2`，无 support-CE 列），demo buffer 均为 8061，所有记录的
+finite guard 为 1。GPU2/GPU3 实测为 28.2/26.1 GiB、97/98% utilization，
+四个 PID 到各自 GPU UUID 的映射由 compute-app 表确认，无 failed/nonfinite
+artifact。
+
+执行链审计发现单臂 runner 若先结束会与同卡尾部 trainer 共置 eval。训练
+进程未暂停；仅把四个等待中的 wrapper shell 置为 STOP，并启动
+`scripts/guard_cqn_wave10_eval.sh`（GPU2/GPU3 guard PID 2858551/2858558）。
+守卫等同卡两 trainer 都退出后才恢复 fstm eval，20 秒后恢复 purefloor
+eval，因此保持“training/eval 不共卡”和 eval 构建错峰合同。按双跑历史
+约 7 env-step/s 粗估，training ETA 13:40--14:10 BST，五点 dev100 完成 ETA
+14:05--14:40；以首个 5k/20k checkpoint 的实测速率为准。
+
+## 容忍度三点谱(2026-08-15,导师论证补强,纯测量未注入)
+
+一格(L0,±0.4×4 步)开环容忍度:move_plate **75%**(306 对) /
+flip_cup **80%**(120) / sandwich **73%**(103)。
+**跨任务平坦(73-80%)**,与 L2 细尺度敏感度(−2/−13.75/−28,差 14 倍)
+完全解耦——粗尺度决策 gap 趋零为全套件普适性质,"gap 低于噪声地板"
+论证由单任务升为三任务;细/粗两轴独立获双向证据(剂量实验:细层事件
+move_plate 隐形;本谱:粗层偏离 sandwich 亦宽容)。
+事故记录:sandwich 首发要 60 demo 但缓存仅 36,9 秒崩;flip_cup 两分钟
+跑完 120 集经 npz 逐条核真(空载 EGL ~330 步/秒)。pgrep 自匹配第三次
+——进程判定一律 /proc/cmdline 精确匹配入铁律。
