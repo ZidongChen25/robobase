@@ -1116,6 +1116,84 @@ eval，因此保持“training/eval 不共卡”和 eval 构建错峰合同。�
 约 7 env-step/s 粗估，training ETA 13:40--14:10 BST，五点 dev100 完成 ETA
 14:05--14:40；以首个 5k/20k checkpoint 的实测速率为准。
 
+## Wave-10 完成判决（2026-08-15）
+
+### 1. Previous-stage result
+
+四个训练都自然完成到 101k，四份 `dev100.csv` 都在 seeds `400--499`
+完成了预注册的 20/40/60/80/100k 各 100 episode；没有读取 held-out
+seeds `800--999`。validation-selected best（同分取更早）与固定 endpoint
+如下：
+
+| arm / seed | 20k | 40k | 60k | 80k | 100k | selected best |
+|---|---:|---:|---:|---:|---:|---:|
+| FSTM / 7 | 37 | 26 | 22 | 14 | 21 | 37 @ 20k |
+| FSTM / 8 | 42 | 38 | 23 | 18 | 15 | 42 @ 20k |
+| **FSTM mean** | **39.5** | **32.0** | **22.5** | **16.0** | **18.0** | **39.5 @ 20k** |
+| purefloor / 7 | 41 | 27 | 25 | 23 | 24 | 41 @ 20k |
+| purefloor / 8 | 46 | 16 | 13 | 11 | 13 | 46 @ 20k |
+| **purefloor mean** | **43.5** | **21.5** | **19.0** | **17.0** | **18.5** | **43.5 @ 20k** |
+
+FSTM 两 seed 的 OLS slope 是每 20k `-4.4/-7.4pp`，100k−20k 是
+`-16/-27pp`；purefloor 是 `-3.8/-7.1pp` 与 `-17/-33pp`。两臂 mean
+slope 都为负、mean endpoint 分别下降 `21.5/25.0pp`、seed-min endpoint
+仅 `15/13%`，所以都触发预注册 fail，不扩 seed、不打开 held-out。
+
+与同 seed 的 Wave-9 masked-decode FS-CQN 配对，FSTM 的 100k 从
+`1/1%` 提到 `21/15%`（均值 `+17pp`），但 20k 从 `56/44%` 变为
+`37/42%`（均值 `-10.5pp`）。摘 decode mask 避免了接近归零，却没有得到
+正 scaling。
+
+训练日志、finite guard、artifact finalizer 与 completion markers 均正常；
+四 run 保存了 21 个 params-only eval checkpoints 并按生命周期合同清除了
+在线 replay/resume 文件。原始路径是：
+
+```text
+exp_local/cqn_wave10/fstm_move_plate/seed{7,8}_20260815wave10
+exp_local/cqn_wave10/purefloor_move_plate/seed{7,8}_20260815wave10
+```
+
+### 2. Interpretation
+
+结果排除“只要把 frozen mask 从 rollout decode 摘掉就能恢复 scaling”：它
+解释了 Wave-9 的末端归零，但不能解释剩余的持续下降。target-only mask 与
+无 mask dense floor 的 100k 均值几乎相同（18.0% vs 18.5%），两者都没有
+解决 action-facing value learning。
+
+这也不是 replay batch 上可见的 margin 融化。20k→100k 期间，FSTM 的
+demo-action agreement 约 `0.96--0.98`、sibling span 约 `0.47--0.53`；
+purefloor 的 agreement 约 `0.97--0.99`、span 约 `0.96--1.02`，但 dev
+success 仍显著下降。mini-batch positive fraction 同期从约 `0.78--0.83`
+降到 `0.65--0.68`，说明 rollout 正在收集更差的状态/结果；这些量是诊断，
+不是 policy quality。共同未解因素是 success-only 10k pretrain、factorized
+action extraction，以及缺少 online sibling outcome。因为两臂都共享 10k
+pretrain，本结果支持取消它，却不能单独把下降因果归给它。
+
+### 3. Next-stage decision
+
+停止 Wave-10 两臂。下一阶段用 DJCQN 单独检验 joint-chunk value 与 online
+counterfactual acquisition，不再做 success-only offline TD：
+
+- `num_pretrain_steps=0`；demo transitions 以固定 128-sample protected
+  half-batch 持续进入每次 online update，另一半来自随 rollout 演化的 replay。
+- matched arms 是完全相同的 DJCQN greedy 与 finest-level adjacent sibling
+  exploration（每步 2%，约 2,000 次/100k）；training seeds `1,2,3`。
+- selection split 为 seeds `400--449`，50 episode/checkpoint，报告
+  10/25/50/100k、逐 seed validation-best、trapezoid success-AUC 与 100k
+  endpoint；seeds `800--999` 继续封存。
+- exploration gate 要求 paired mean AUC 至少高 greedy `5pp`、至少 2/3 seed
+  的 paired AUC 为正、explore 的 mean 100k 不低于 greedy 超过 `2pp`，且
+  explore 自身 10k→100k mean slope 为正。否则不打开 held-out，也不把 loss
+  下降解释为 task improvement。
+
+### 4. Execution
+
+`djcqn_pixel_bigym.yaml` 已改为零 offline、100k 纯 online 计步、固定
+demo/online `128+128` batch 与 5k params-only checkpoints。单臂 runner
+`scripts/run_djcqn_wave1_arm.sh` 和六卡 controller
+`scripts/launch_djcqn_wave1_six_gpu.sh` 固化了上述 split、剂量和 artifact
+合同；远端启动与首个 artifact 验证记录在 `cqn-viability.md`。
+
 ## 容忍度三点谱(2026-08-15,导师论证补强,纯测量未注入)
 
 一格(L0,±0.4×4 步)开环容忍度:move_plate **75%**(306 对) /
@@ -1127,3 +1205,48 @@ move_plate 隐形;本谱:粗层偏离 sandwich 亦宽容)。
 事故记录:sandwich 首发要 60 demo 但缓存仅 36,9 秒崩;flip_cup 两分钟
 跑完 120 集经 npz 逐条核真(空载 EGL ~330 步/秒)。pgrep 自匹配第三次
 ——进程判定一律 /proc/cmdline 精确匹配入铁律。
+
+## 勘误 #5:剂量测量的 eval 槽位污染 + 三任务修正终表(2026-08-17)
+
+### Bug
+`scripts/eval_explore_dose.py`(手写 rollout 循环)只重置了 agent 的 train
+act-state 槽(`agent.reset(step, range(B))`,在 `cfg.num_train_envs=25` 下全部
+路由到 train 槽);eval_mode acting 使用的 `_eval_open_loop_plan/position/valid`
+(位于索引 `num_train_envs+i`)从未重置。第 2 轮起每集开头执行上一轮陈旧
+chunk 的尾段(最多 15 步)。greedy(eval 槽)被毒,探索档(train 槽,恰好被正确
+重置)是干净测量 —— 产生"加探索成功率反而上升"的假信号。move_plate 容忍度
+高,旧 harness 的 greedy 68≈val 70 是巧合性"验证通过",掩盖了 bug。
+
+### 验证链
+- 标准工具(walk `workspace.eval()`)当日对照:flip 60(ne1)=60(ne25);
+  修复版 harness flip greedy 54(其中 seeds 400-449 段=60,严格吻合);
+  sandwich 修复版 70 = 记录 val50 70(在 swirl03 测得,03 环境/checkpoint 无罪)。
+- 修复:双槽位重置 + final_info task_success 计数 + 逐轮打印。已提交。
+
+### 三任务修正终表(修复版 harness,100 eps,seeds 400-499,ckpt 100k)
+| task/run | greedy | asis 三层现状档 | ×4 档 | coarse-only |
+|---|---|---|---|---|
+| move_plate basestate s1 | 76 | 70 (−6) | 62 (−14) | 21 (−55) |
+| flip_cup flip4 s3 | 54 | 38 (−16) | 37 (−17) | — |
+| sandwich s2(0805) | 70 | 60 (−10) | 41 (−29) | — |
+(flip/sandwich 探索档为 b1+b2 两批各 50 eps 合并,train 槽路径本就干净)
+
+### 结论修订
+1. "现状档免费/负税"作废:三任务均付税 −6~−16。探索事件在现有剂量下已触碰
+   outcome 相关方向,"剂量太小行为不可见"不成立。
+2. 旧结论"×4 平坦=细层事件不携带成败信息"修订:仅 flip 饱和(−16→−17);
+   move_plate 额外 −8,sandwich 额外 −19(与其细尺度 L2 敏感度 −28 一致)。
+3. coarse-only 灾难性(−55)维持。
+
+### 附带发现
+- 时代退化:official_move_plate 0804 批 checkpoints 今日 eval 仅 36-40%
+  (记录 72.5,08-05 sweep)。sandwich 0805 批与 basestate 0806 批完好复现。
+  时代断层 ≈08-05 晨;候选原因:当日代码变更或 08-06 optstate strip 作业。
+  历史封榜数字不受影响(同代代码同代测量);今日起 re-eval 0804 代 checkpoint
+  必须先过时代门控。任务 #16 挂账。
+- qselect 系列探针脚本踩同款槽位坑(单环境版):绝对数字系统性压低,大间距
+  定性结论(9× 反选)稳;引用绝对值前须修复重测。
+- Codex baseline 勘误:其"原版"配置 ≠ 我们官方线(append_floating_base_to_low_dim
+  =true、无 obs_std_floor_relative、warmup 540)。我们官方 4-run val-best≤25k
+  带 56-62(紧);其 74.5/29.0 是另一配置的性质,seed2 全网格 max 30%(病 run),
+  +6.5pp 封榜靠该病 run 的 +32 支撑。"sandwich 25k 天然方差大"的旧归因作废。
