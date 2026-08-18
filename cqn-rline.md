@@ -1286,3 +1286,24 @@ flip s1 25k=44→45k=10;flip s2 25k=30→40k=26;sandwich s2 25k=34→50k=10。
 交互假说被否。用户指示中场停机(预注册标准satisfied:各点 ≤ W11 同点,无上翘)。
 剂量线(×4 探索家族)至此关闭:Wave-11 平台压低 + Wave-12 塌方 + m1/m2 无增益。
 卡位转予 progress potential shaping 臂(commit 28e88f4)。
+
+## 臂 B 判决:WSRL 阶段撤锚被证伪 —— 崩溃不是"接缝瞬态"(2026-08-18)
+协议:official sandwich s2 100k(70%)→冻结策略 50 集 warmup(64/74% 成功,
+buffer 71% 为在分布数据)→λ=0 高 UTD(4) 重校准 4000 updates→λ=0 在线 20k。
+预注册预测(不崩)被两个 seed 一致驳回:
+- **崩溃发生在重校准阶段内部**(环境冻结!):span 0.759→0.024 / 0.744→0.030;
+  在线 20k 无恢复(span 0.003-0.007,val50 = 0.00 vs 基线 0.70)。
+- 对照 1(λ=1 同协议):span 0.79→0.83,val50 0.74>0.70 —— 排除 params-only
+  warm-start 伪影(weanfc 教训不适用,带锚的 warm-start 完全健康)。
+- 对照 2(冷臂,0% warmup 数据):崩溃曲线与主臂噪声内一致 —— warmup 的
+  22.7k 在分布 transitions 贡献为零,WSRL 的"分布错配"诊断不适用于我们。
+- 失败形态修正:critic loss 不发散(0.216→0.148),binding→0.999,chosen_q
+  上升 0.129→0.28 而 span 塌 240× —— **所有 bin 向上摊平成动作无关常数**,
+  死的是 action-gap,不是值幅度。C51 支持已钳幅度,病灶是平滑+bootstrap-max
+  的摊平压力,与数据分布无关 —— 架构性,非数据性。
+结论:hinge 的不可替代职能=维持动作间隔;任何"数据侧替代锚"(warmup/
+replay 组成)都不针对病灶。候选池删除臂 B;指向 in-sample/支撑限制
+bootstrap(路线图臂 A)或 Cal-QL 掩码单侧下压。
+报告 reports/wsrl_armB_20260818.md;runs: wsrl_sandwich/{seed1,seed2,
+ctrl_lam1,cold_lam0}_20260818wsrlB。工程注:λ=0 会静默关闭 bc_* 诊断块
+(cqn.py:1694 门控),须用 bc_lambda_schedule="0.0" 表达。
