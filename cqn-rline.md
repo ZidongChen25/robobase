@@ -1307,3 +1307,19 @@ bootstrap(路线图臂 A)或 Cal-QL 掩码单侧下压。
 报告 reports/wsrl_armB_20260818.md;runs: wsrl_sandwich/{seed1,seed2,
 ctrl_lam1,cold_lam0}_20260818wsrlB。工程注:λ=0 会静默关闭 bc_* 诊断块
 (cqn.py:1694 门控),须用 bc_lambda_schedule="0.0" 表达。
+
+## T1 判决:固定 buffer 上 TD vs 纯MC vs max 的配对解剖(2026-08-18)
+同一冻结数据集(150集/66k transitions,80/20 训练-探针切分),同架构同步数,
+只换目标算子。探针为无 rollout 的判别组(600 态/组)。
+- TD:demo 区尚可,off-demo 平且盲目乐观(失败态 Q=0.569 vs 真值0;AUC 0.559
+  ≈硬币;81% 失败探针偏好正在失败的动作)。"会 stitching"预测不成立。
+- 纯 MC:AUC 0.723,失败态 Q=0.121(敢定罪,69% 偏好 demo 邻近动作),demo 区
+  校准近完美(r=0.990)、span 翻倍 —— 但 off-demo 比 TD 还平(0.35 vs 0.52):
+  value-space BC,预注册预测两半全中。
+- max(TD,MC):机制级死因坐实 —— off-demo TD 恒高于 MC,max 在出事区域
+  永选 TD 分支,MC 的判别资产被结构性排除。m1/m2/W12 阴性全部闭环。
+- 计划外最大发现:**分辨率-视界问题** —— 60% buffer 状态的真实 value 落差
+  < 单个 C51 atom(0.08);TD demo 区自身 MAE=0.141 吃掉一半信号。操作:
+  γ/support/q_reward_scale 重调为零代码候选臂;与势函数塑形同向。
+报告 reports/t1_td_mc_20260818.md;数据与臂 exp_local/t1_td_mc/;探针原始分
+reports/t1_probes/。合成方向:in-sample TD + MC 失败定罪 + 掩码 decode。
