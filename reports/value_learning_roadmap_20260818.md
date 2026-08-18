@@ -47,3 +47,16 @@ self-imitation, BC:Q 权重 = 1.0:0.1)。即:**SOTA 是朝着 self-imitation
 互为对照:A/B 治病1,C 治病3;都不新增剂量。进度估计(F/G)留作二波,
 除非 W13 双败。Wave-12(MC+explore)按在跑,预计关闭剂量线。
 原始调研全文: reports/sparse_value_survey_20260818_raw.txt
+
+## 六、TD-vs-MC 解耦对比实验设计(2026-08-18 预登记,任务 #19)
+**T1 固定 buffer 配对(先跑)**:冻结数据(demo buffer + 中断 w11 run 的 replay
+或用冻结 checkpoint 重滚采集);同架构同步数,只换目标算子:纯 TD / 纯 MC 回归
+(dense_return_q_target) / max(TD,MC)锚点 / expectile τ∈{0.5,0.7,0.9}。
+读出 = 判别探针组(健康-劫持-垃圾排序、argmax-demo 一致率、corner 峰锐度)
++ 限制解码 rollout。解耦逻辑:同数据消探索混杂,探针读出消 hinge/self-imitation
+混杂;expectile 是 MC 味(0.5)到 in-sample-max(→1)的连续旋钮。
+**T2 文献锚定(T1 有信号才建)**:DrQ-v2 + RLPD 三件套(50/50 demo 采样、
+LayerNorm、无 BC)on robomimic sparse(env 已在库),TD/MC/expectile 臂,
+2 seeds。不用 BiGym(SAC 系在 BiGym 全 0%,无对比度)。
+**预登记预测**:纯 MC = value 空间的 BC(成功轨迹信号好,但 0-return 把可恢复
+状态判死 —— m1/m2 压缩机制);TD = 会 stitching 但链慢。
