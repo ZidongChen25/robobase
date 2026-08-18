@@ -1323,3 +1323,23 @@ ctrl_lam1,cold_lam0}_20260818wsrlB。工程注:λ=0 会静默关闭 bc_* 诊断�
   γ/support/q_reward_scale 重调为零代码候选臂;与势函数塑形同向。
 报告 reports/t1_td_mc_20260818.md;数据与臂 exp_local/t1_td_mc/;探针原始分
 reports/t1_probes/。合成方向:in-sample TD + MC 失败定罪 + 掩码 decode。
+
+## T1 补测:五臂 rollout 成功率(离线 25k 更新,sandwich_remove,50 eps)
+td 58 | 纯mc 40 | max(TD,MC) 66 | sarsa@10k* 38(*只训到10k) | td_nobc **0**
+(数据源策略=70)。三个要点:(1) 探针与 rollout 分离 —— 纯 MC 判别探针最优
+(AUC .723)但 rollout 最差(40):off-demo 的平 Q 在闭环里被劫持,校准好 ≠ 决策好;
+(2) mclb 离线蒸馏反而最佳(66):demo 区锐度在闭环中兑现;其在线失利(51/65)
+是与数据回路交互的产物,离线无此回路;(3) td_nobc 纯离线也归零 ——
+**崩溃不需要 rollout 反馈回路**(与臂 B 重校准期崩溃、DR3 理论三方一致)。
+
+## A 流解剖:dueling 懒路假说 CONFIRMED + 双因子发现(2026-08-18)
+打开臂 B checkpoint(256 态,9 个 ckpt):λ=0 下 A 流 bin-spread 2.89→0.23
+logits(÷38),幅度 0.90→0.07;λ=1 对照反而增长(3.10/0.96)。E[V] 从 −0.44
+升到 +0.26,崩溃后 Q(s,a)=E[V]±0.003 —— "span 塌而均值升"= V 流顶替 A 流。
+**移植实验的意外发现**:100× 的 span 崩溃 = 两个 ~10× 乘性因子 ——
+(a) A 流萎缩(单独≈0.10);(b) V 分布变尖后,dueling 在 per-atom logit 层
+合流(cqn_as.py:1060-1064,softmax 之前),尖 V logits 淹没任何 A 结构
+(健康 A 移植进去也只剩 0.083;encoder 无罪 0.877;乘积 0.0096≈实测 0.0091)。
+即 **C51×dueling 交互**是崩溃的一半 —— scalar+no-dueling(HumanoidBench 变体)
+一刀切断两条交互路径,消融臂优先级升级。
+报告 reports/dueling_astream_autopsy_20260818.md + t1 成功率入 t1 报告目录。
