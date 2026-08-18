@@ -25,6 +25,7 @@ JAX_DRQV2_FEATURE_KEY = "vision_features_jax_drqv2_v3"
 JAX_CQN_FEATURE_KEY = "vision_features_jax_cqn_v3"
 JAX_CQN_AS_FEATURE_KEY = "vision_features_jax_cqn_as_v3"
 JAX_Q_CHUNKING_FEATURE_KEY = "vision_features_jax_q_chunking_v3"
+JAX_DJCQN_FEATURE_KEY = "vision_features_jax_djcqn_v3"
 VISION_CACHE_FINGERPRINT_KEY = "vision_feature_cache_fingerprint_v1"
 DEFAULT_CACHE_BACKENDS = ("jax",)
 _SUPPORTED_FUSION_MODES = {"flatten", "average", "sum"}
@@ -45,6 +46,7 @@ def cached_feature_observation_key(method_name: str, backend_name: str = "jax") 
         "cqn_as": JAX_CQN_AS_FEATURE_KEY,
         "q_chunking": JAX_Q_CHUNKING_FEATURE_KEY,
         "qchunking": JAX_Q_CHUNKING_FEATURE_KEY,
+        "djcqn": JAX_DJCQN_FEATURE_KEY,
         # CQN-Flow uses the identical state/image feature adapter as CQN-AS,
         # so both methods can reuse one frozen-feature cache.
         "cqn_flow": JAX_CQN_AS_FEATURE_KEY,
@@ -181,6 +183,7 @@ def build_vision_feature_cache_plan(
         "flow_matching",
         "ppo",
         "q_chunking",
+        "djcqn",
         "sac",
     }
     if method_name not in supported_methods:

@@ -213,3 +213,91 @@ if __name__ == "__main__":
     test_add_demo_to_replay_buffer(2, 1, 1)
     test_add_demo_to_replay_buffer(2, 5, 1)
     test_add_demo_to_replay_buffer(2, 5, 5)
+
+
+def _progress_info_elements():
+    return spaces.Dict(
+        {
+            "demo": spaces.Box(0, 1, shape=(), dtype=np.uint8),
+            "progress": spaces.Box(0.0, 1.0, shape=(), dtype=np.float32),
+            "progress_valid": spaces.Box(0, 1, shape=(), dtype=np.uint8),
+        }
+    )
+
+
+def _load_one_demo_with_progress(episode_len, zero_rewards=False):
+    env = DummyEnv(episode_len=episode_len)
+    demos = collect_demo_from_dummy_env(env, num_demo=1)
+    if zero_rewards:
+        # A failed demonstration: identical time indices, no reward at all.
+        for step in demos[0][1:]:
+            step[1] = 0.0
+    demo_env = DemoEnv(demos, env.action_space, env.observation_space)
+    demo_env = wrap_env(
+        demo_env,
+        frame_stack=1,
+        action_sequence=1,
+        execution_step=1,
+        demo_env=True,
+    )
+    replay_env = wrap_env(
+        env,
+        frame_stack=1,
+        action_sequence=1,
+        execution_step=1,
+        demo_env=False,
+    )
+    replay_buffer = UniformReplayBuffer(
+        action_shape=replay_env.action_space.shape,
+        action_dtype=replay_env.action_space.dtype,
+        nstep=1,
+        gamma=0.99,
+        reward_shape=(),
+        reward_dtype=np.float32,
+        observation_elements=replay_env.observation_space,
+        extra_replay_elements=_progress_info_elements(),
+    )
+    add_demo_to_replay_buffer(demo_env, replay_buffer)
+    replay_buffer._try_fetch()
+    episode, _ = replay_buffer._sample_episode()
+    return episode
+
+
+def test_add_demo_to_replay_buffer_stores_monotone_raw_progress_labels():
+    episode_len = 4
+    episode = _load_one_demo_with_progress(episode_len)
+
+    labels = np.asarray(episode["progress"][:-1], dtype=np.float32)
+    # Same closed form the online episode-close path uses: (t + 1) / T.
+    np.testing.assert_allclose(
+        labels,
+        np.arange(1, episode_len + 1, dtype=np.float32) / episode_len,
+        atol=1e-7,
+    )
+    assert np.all(np.diff(labels) > 0.0)
+    assert labels[0] > 0.0 and labels[-1] == pytest.approx(1.0)
+    np.testing.assert_array_equal(
+        episode["progress_valid"][:-1],
+        np.ones(episode_len, dtype=np.uint8),
+    )
+
+
+def test_add_demo_progress_validity_reads_raw_reward_not_the_demo_label():
+    episode_len = 4
+    episode = _load_one_demo_with_progress(episode_len, zero_rewards=True)
+
+    # env.treat_all_demos_as_expert can force info["demo"] = 1 on a failed
+    # demonstration; progress validity must still come from the reward sum.
+    np.testing.assert_array_equal(
+        episode["demo"][:-1],
+        np.ones(episode_len, dtype=np.uint8),
+    )
+    np.testing.assert_array_equal(
+        episode["progress_valid"][:-1],
+        np.zeros(episode_len, dtype=np.uint8),
+    )
+    np.testing.assert_allclose(
+        np.asarray(episode["progress"][:-1], dtype=np.float32),
+        np.arange(1, episode_len + 1, dtype=np.float32) / episode_len,
+        atol=1e-7,
+    )

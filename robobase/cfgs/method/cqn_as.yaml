@@ -233,6 +233,27 @@ method:
   cv_rct_weight: null
   cv_rct_level: null
   cv_rct_baseline: target_q
+  # Progress-potential shaping (reports/progress_shaping_impl_20260818.md).
+  # Ng-form potential F = lambda * (gamma * bootstrap * Phi(s') - Phi(s)) added
+  # to the reward scalar inside the C51 target ONLY -- replay rewards and
+  # mc_returns stay raw. Phi is an auxiliary state-only expectile head trained
+  # to regress the raw per-transition progress label (t+1)/T stored in replay.
+  # Zero weight + zero head weight is the exact legacy graph and param tree.
+  progress_potential_weight: 0.0
+  # Optional schedule string ("linear(0.25,0.0,50000)") replacing the constant
+  # lambda. Annealing is the recommended answer to the nonstationary-Phi
+  # invariance break (Devlin-Kudenko 2012 licenses online Phi training).
+  progress_potential_schedule: null
+  # Loss weight on the auxiliary progress head. It reads stop-gradient encoder
+  # features only and never queries an action, so it cannot leak counterfactual
+  # action claims. Zero disables the loss (but the head is still created when
+  # progress_potential_weight > 0).
+  progress_head_weight: 0.0
+  progress_expectile_tau: 0.9
+  # Regress only transitions whose episode actually succeeded (or is a genuine
+  # demo by raw reward sum). Failed-episode time indices are censored, not
+  # taught as progress.
+  progress_success_gated: true
   # Route-(c) support-only improvement (cqn-flow.md 26.2): IQL-style
   # expectile state value + advantage-weighted BC over demo AND online
   # transitions. Null disables both (legacy graph and params unchanged).

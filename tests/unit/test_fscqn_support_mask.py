@@ -292,6 +292,59 @@ def test_target_side_greedy_inherits_the_mask():
     )
 
 
+def test_target_mask_only_unmasks_decode_but_keeps_target_masked():
+    agent = _make_agent(
+        _compose(
+            *_fscqn_overrides("method.support_mask_decode=false")
+        )
+    )
+    batch = _batch()
+    obs_inputs = agent._prepare_rl_obs_inputs(batch)
+    features = agent._rl_features(
+        agent.params.get("encoder"), obs_inputs, stop_gradient=True
+    )
+    agent.critic_model = _CriticStub([0, 0, 0, ATOMS - 1, 0])
+    agent.policy_model = _PolicyStub([8.0, 0.0, 0.0, 0.0, 0.0])
+
+    rollout_action = agent._greedy_action_impl(
+        agent.params,
+        agent.target_critic_params,
+        obs_inputs,
+        False,
+        jax.random.PRNGKey(7),
+        jnp.full((features.shape[0],), -1, dtype=jnp.int32),
+    )
+    unmasked_action, unmasked_bins = agent._greedy_action(
+        agent.params["critic"],
+        features,
+        key=jax.random.PRNGKey(7),
+    )
+    assert np.all(np.asarray(unmasked_bins) == 3)
+    assert np.allclose(np.asarray(rollout_action), np.asarray(unmasked_action))
+
+    actions = jnp.asarray(
+        batch["action"].reshape(batch["action"].shape[0], -1)
+    )
+    demos = jnp.ones((features.shape[0],), dtype=jnp.float32)
+    target_action, _ = agent._td_target_action_for_update(
+        agent.params["critic"],
+        features,
+        actions,
+        actions,
+        demos,
+        jax.random.PRNGKey(7),
+        policy_params=agent.params["policy"],
+    )
+    masked_action, masked_bins = agent._greedy_action(
+        agent.params["critic"],
+        features,
+        key=jax.random.PRNGKey(7),
+        policy_params=agent.params["policy"],
+    )
+    assert np.all(np.asarray(masked_bins) == 0)
+    assert np.allclose(np.asarray(target_action), np.asarray(masked_action))
+
+
 def test_head_frozen_after_freeze_step():
     agent = _make_agent(
         _compose(*_fscqn_overrides("method.support_mask_freeze_step=1"))

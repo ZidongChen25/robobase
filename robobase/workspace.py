@@ -268,7 +268,7 @@ def _validate_rl_action_sequence(cfg: DictConfig) -> None:
     """Restrict multi-step RL chunks to methods that implement chunk rollout."""
 
     method_name = method_name_from_cfg(cfg)
-    supported_methods = {"cqn_as", "cqn_flow", "q_chunking"}
+    supported_methods = {"cqn_as", "cqn_flow", "q_chunking", "djcqn"}
     if (
         cfg.method.is_rl
         and cfg.action_sequence != 1
@@ -276,7 +276,7 @@ def _validate_rl_action_sequence(cfg: DictConfig) -> None:
     ):
         raise ValueError(
             "Action sequence > 1 is only supported for the CQN-AS, "
-            "CQN-Flow, and Q-Chunking RL methods"
+            "CQN-Flow, Q-Chunking, and DJCQN RL methods"
         )
 
 
@@ -310,6 +310,24 @@ def _mc_return_anchor_enabled(cfg: DictConfig) -> bool:
     )
 
 
+def _progress_label_enabled(cfg: DictConfig) -> bool:
+    """Whether raw per-transition progress labels must be stored in replay.
+
+    Mirrors ``CQNAS.progress_head_enabled``: the head is created whenever
+    either the auxiliary regression or the target-side potential is on, and
+    both consumers read the same stored label.
+    """
+
+    method_name = method_name_from_cfg(cfg)
+    return bool(
+        method_name in {"cqn_as", "cqn_flow"}
+        and (
+            float(cfg.method.get("progress_head_weight", 0.0)) > 0.0
+            or float(cfg.method.get("progress_potential_weight", 0.0)) > 0.0
+        )
+    )
+
+
 def _structured_exploration_enabled(cfg: DictConfig) -> bool:
     return (
         method_name_from_cfg(cfg) in {"cqn_as", "cqn_flow"}
@@ -328,12 +346,19 @@ def _create_default_replay_buffer(
     reuse_saved: bool = False,
 ) -> ReplayBuffer:
     use_mc_return_anchor = _mc_return_anchor_enabled(cfg)
+    use_progress_labels = _progress_label_enabled(cfg)
     use_structured_exploration = _structured_exploration_enabled(cfg)
     if lazy_replay_enabled(cfg):
         if use_mc_return_anchor:
             raise NotImplementedError(
                 "CQN-AS MC-return targets require episode-backed replay; "
                 "set lazy_replay.use=false."
+            )
+        if use_progress_labels:
+            raise NotImplementedError(
+                "progress-potential shaping requires episode-backed replay "
+                "(the (t+1)/T label is stamped at episode close); set "
+                "lazy_replay.use=false."
             )
         if demo_replay:
             raise NotImplementedError("lazy_replay does not support demo replay.")
@@ -424,6 +449,22 @@ def _create_default_replay_buffer(
             np.inf,
             shape=(),
             dtype=np.float32,
+        )
+    if use_progress_labels:
+        # RAW time index only. Nothing gamma- or lambda-dependent is stored,
+        # so the shared demo cache stays valid across every shaping sweep
+        # (demo_cache_key hashes the element set, not the method knobs).
+        extra_replay_elements["progress"] = spaces.Box(
+            0.0,
+            1.0,
+            shape=(),
+            dtype=np.float32,
+        )
+        extra_replay_elements["progress_valid"] = spaces.Box(
+            0,
+            1,
+            shape=(),
+            dtype=np.uint8,
         )
     if use_structured_exploration:
         extra_replay_elements["structured_explore"] = spaces.Box(
@@ -1534,10 +1575,17 @@ class Workspace:
                     and self.cfg.use_self_imitation
                 )
                 store_mc_return = "mc_return" in self.extra_replay_elements.keys()
+                store_progress = "progress" in self.extra_replay_elements.keys()
                 mc_returns = utils.discounted_episode_returns(
                     [transition[2] for transition in ep],
                     self.cfg.replay.gamma,
                 )
+                # Raw progress label: normalized position of the transition in
+                # the episode actually stored. Only successful episodes carry
+                # a meaningful "1 == done" endpoint, so failures are censored
+                # via progress_valid rather than taught as anti-progress.
+                episode_length = max(len(ep), 1)
+                progress_valid = np.uint8(1 if task_success else 0)
                 for transition_index, (
                     act,
                     obs,
@@ -1567,6 +1615,11 @@ class Workspace:
                         info["demo"] = 0
                     if store_mc_return:
                         info["mc_return"] = mc_returns[transition_index]
+                    if store_progress:
+                        info["progress"] = np.float32(
+                            (transition_index + 1) / episode_length
+                        )
+                        info["progress_valid"] = progress_valid
 
                     # Filter out unwanted keys in info
                     extra_replay_elements = {

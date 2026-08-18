@@ -9,6 +9,7 @@ from robobase.replay_buffer.uniform_replay_buffer import UniformReplayBuffer
 from robobase.replay_buffer.vision_feature_cache import (
     JAX_ACT_FEATURE_KEY,
     JAX_CQN_AS_FEATURE_KEY,
+    JAX_DJCQN_FEATURE_KEY,
     JAX_DIFFUSION_FEATURE_KEY,
     JAX_FLOW_MATCHING_FEATURE_KEY,
     JAX_Q_CHUNKING_FEATURE_KEY,
@@ -143,6 +144,12 @@ def _make_q_chunking_cfg(cache_setting="auto"):
     return cfg
 
 
+def _make_djcqn_cfg(cache_setting="auto"):
+    cfg = _make_q_chunking_cfg(cache_setting)
+    cfg.method.name = "djcqn"
+    return cfg
+
+
 def _make_pixel_obs_space():
     return spaces.Dict(
         {
@@ -206,6 +213,12 @@ def test_cache_plan_supports_flow_matching_act_and_rl_value_feature_keys():
         save_dir=None,
         reuse_saved=False,
     )
+    djcqn_plan = build_vision_feature_cache_plan(
+        cfg=_make_djcqn_cfg(),
+        observation_space=_make_pixel_obs_space(),
+        save_dir=None,
+        reuse_saved=False,
+    )
 
     assert JAX_FLOW_MATCHING_FEATURE_KEY in flow_plan.observation_space.spaces
     assert flow_plan.observation_space[JAX_FLOW_MATCHING_FEATURE_KEY].shape == (1, 1024)
@@ -221,6 +234,8 @@ def test_cache_plan_supports_flow_matching_act_and_rl_value_feature_keys():
         1,
         1024,
     )
+    assert JAX_DJCQN_FEATURE_KEY in djcqn_plan.observation_space.spaces
+    assert djcqn_plan.observation_space[JAX_DJCQN_FEATURE_KEY].shape == (1, 1024)
 
 
 def test_feature_preprocessor_rewrites_raw_transition(monkeypatch):

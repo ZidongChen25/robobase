@@ -31,6 +31,10 @@ def __getattr__(name):
         from robobase.method.drqv2 import DrQV2
 
         return DrQV2
+    if name == "DJCQN":
+        from robobase.method.djcqn import DJCQN
+
+        return DJCQN
     if name == "FlowMatching":
         from robobase.method.flow_matching import FlowMatching
 
@@ -55,6 +59,7 @@ __all__ = [
     "CQNFlowAS",
     "Diffusion",
     "DrQV2",
+    "DJCQN",
     "FlowMatching",
     "Legato",
     "QChunking",

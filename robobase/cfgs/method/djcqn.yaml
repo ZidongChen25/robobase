@@ -1,0 +1,55 @@
+# @package _global_
+
+# Critic horizon H. The environment executes only the first action and the
+# replay buffer assembles the actual consecutive H-step chunk.
+action_sequence: 5
+execution_length: 1
+temporal_ensemble: false
+
+replay:
+  nstep: ${action_sequence}
+  include_tp1: true
+  action_sequence_start_offset: 0
+  action_padding: zero
+
+method:
+  name: djcqn
+  _target_: robobase.method.djcqn.DJCQN
+  is_rl: true
+  num_train_steps: ${num_train_frames}
+  num_explore_steps: ${num_explore_steps}
+
+  # Joint Q_H and prefix Q_P share one observation encoder, but have separate
+  # value heads. There is deliberately no actor/BC/self-imitation parameter.
+  critic_lr: 3e-4
+  critic_target_tau: 0.005
+  critic_grad_clip: null
+  weight_decay: 0.0
+  num_critics: 5
+  q_aggregate: min
+
+  prefix_horizon: 1
+  prefix_expectile: 0.8
+  levels: 3
+  bins: 5
+  beam_width: 8
+  eval_lcb_beta: 1.0
+
+  # Online local sibling intervention. Disabled for the first matched gate.
+  sibling_exploration_prob: 0.0
+  sibling_level: -1
+
+  model:
+    hidden_dims: [512, 512, 512, 512]
+    activation: gelu
+
+  encoder_model:
+    type: resnet
+    model: resnet18
+    trainable: true
+    pretrained: false
+    use_plucker: false
+
+  view_fusion_model:
+    type: multicam_feature
+    mode: flatten

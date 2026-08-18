@@ -114,7 +114,7 @@ class _DeviceMergedIterator:
 class WorkspaceFast(Workspace):
     """Workspace with device-side merge, relaxed syncs, no wandb/videos."""
 
-    def __init__(self, cfg):
+    def __init__(self, cfg, work_dir: str = None):
         with open_dict(cfg):
             cfg.wandb.use = False
             cfg.log_eval_video = False
@@ -123,7 +123,10 @@ class WorkspaceFast(Workspace):
                 backend.get("update_block_every_steps", 1)
             ) == 1:
                 cfg.backend.update_block_every_steps = 10
-        super().__init__(cfg)
+        # ``work_dir`` mirrors ``Workspace``: None means "take the Hydra run
+        # dir", which is what train_fast.py relies on. Driver scripts that
+        # build a workspace outside Hydra pass an explicit directory.
+        super().__init__(cfg, work_dir=work_dir)
 
     def _make_merged_replay_iter(self, replay_iter, demo_replay_iter):
         # Hook runs before the prefetch wrapper is added, so the device-side

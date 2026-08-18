@@ -6,7 +6,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from flax.core import freeze, unfreeze
-from flax.traverse_util import flatten_dict
+from flax.traverse_util import flatten_dict, unflatten_dict
 from gymnasium import spaces
 from hydra import compose, initialize_config_dir
 from hydra.core.global_hydra import GlobalHydra
@@ -21,6 +21,7 @@ from robobase.method.cqn import (
     dense_return_expected_q_loss,
     episodic_success_returns,
     ordered_success_returns,
+    progress_shaped_rewards,
     sequence_aligned_sparse_returns,
     shift_categorical_distribution,
     unseen_return_floor_loss,
@@ -28,6 +29,7 @@ from robobase.method.cqn import (
 from robobase.method.cqn_as import (
     AutoregressiveActionCorrection,
     C2FSequenceDistributionalCritic,
+    cqn_as_spec_from_cfg,
     pessimistic_categorical_q,
     select_episodic_twin_actions,
     shift_replay_action_sequence,
@@ -39,6 +41,7 @@ from robobase.workspace import (
     Workspace,
     _effective_episode_length,
     _mc_return_anchor_enabled,
+    _progress_label_enabled,
     _replay_action_from_step,
 )
 from tests.unit.wrappers.utils import DummyEnv
@@ -6013,3 +6016,495 @@ def test_cqn_as_bin_explore_schedule_scales_activation():
     agent._bin_explore_scale = 0.0
     agent._apply_bin_explore(chunk)
     assert agent._bin_explore_remaining[0] == 0
+
+
+# ---------------------------------------------------------------------------
+# Progress-potential shaping (reports/progress_shaping_impl_20260818.md)
+# ---------------------------------------------------------------------------
+
+
+def _progress_batch(batch_size=4, action_sequence=3, terminal_last=True):
+    batch = _batch(batch_size=batch_size, action_sequence=action_sequence)
+    batch["progress"] = (
+        np.arange(1, batch_size + 1, dtype=np.float32) / batch_size
+    )
+    batch["progress_valid"] = np.ones((batch_size,), dtype=np.uint8)
+    if terminal_last:
+        terminal = np.zeros((batch_size,), dtype=bool)
+        terminal[-1] = True
+        batch["terminal"] = terminal
+    return batch
+
+
+def _set_constant_progress_potential(agent, value):
+    """Force ``Phi(s) == value`` by writing the zero-kernel head's bias."""
+
+    flat = flatten_dict(unfreeze(agent.params["progress_value"]))
+    bias_key = next(key for key in flat if key[-2:] == ("value_out", "bias"))
+    flat[bias_key] = jnp.full_like(flat[bias_key], float(value))
+    agent.params = {
+        **agent.params,
+        "progress_value": unflatten_dict(flat),
+    }
+
+
+def test_progress_knobs_default_to_exact_legacy_and_add_no_params():
+    cfg = _compose_cqn_as()
+    assert cfg.method.progress_potential_weight == pytest.approx(0.0)
+    assert cfg.method.progress_head_weight == pytest.approx(0.0)
+    assert cfg.method.progress_potential_schedule is None
+    assert cfg.method.progress_expectile_tau == pytest.approx(0.9)
+    assert cfg.method.progress_success_gated is True
+    assert not _progress_label_enabled(cfg)
+
+    observation_space, action_space = _spaces()
+    agent = create_agent(
+        cfg,
+        observation_space=observation_space,
+        action_space=action_space,
+    )
+    assert "progress_value" not in agent.params
+    assert not agent.progress_head_enabled
+    agent.logging = True
+    metrics = agent.update(iter([_batch()]), step=1)
+    assert not [key for key in metrics if key.startswith("progress")]
+
+
+def test_progress_label_gate_tracks_either_consumer():
+    assert _progress_label_enabled(
+        _compose_cqn_as("method.progress_head_weight=1.0")
+    )
+    assert _progress_label_enabled(
+        _compose_cqn_as("method.progress_potential_weight=0.25")
+    )
+
+
+def test_progress_shaped_rewards_terminal_drops_the_next_potential():
+    rewards = jnp.asarray([0.0, 1.0], dtype=jnp.float32)
+    discounts = jnp.asarray([0.99, 0.99], dtype=jnp.float32)
+    bootstrap = jnp.asarray([1.0, 0.0], dtype=jnp.float32)
+    phi = jnp.asarray([0.3, 0.8], dtype=jnp.float32)
+    phi_next = jnp.asarray([0.5, 0.9], dtype=jnp.float32)
+
+    shaped = progress_shaped_rewards(
+        rewards,
+        discounts,
+        bootstrap,
+        phi,
+        phi_next,
+        0.25,
+    )
+    np.testing.assert_allclose(
+        shaped,
+        [
+            0.0 + 0.25 * (0.99 * 0.5 - 0.3),
+            # bootstrap == 0 kills Phi(s'): the success target deflates to
+            # exactly 1 - lambda * Phi(s).
+            1.0 - 0.25 * 0.8,
+        ],
+        atol=1e-6,
+    )
+    np.testing.assert_allclose(
+        progress_shaped_rewards(
+            rewards,
+            discounts,
+            bootstrap,
+            phi,
+            phi_next,
+            0.0,
+        ),
+        rewards,
+        atol=0.0,
+    )
+
+
+def test_progress_shaping_telescopes_over_a_whole_episode():
+    gamma = 0.9
+    lam = 0.4
+    phi = np.asarray([0.1, 0.35, 0.6, 0.95], dtype=np.float32)
+    horizon = phi.shape[0]
+    rewards = np.zeros((horizon,), dtype=np.float32)
+    discounts = np.full((horizon,), gamma, dtype=np.float32)
+    bootstrap = np.ones((horizon,), dtype=np.float32)
+    phi_next = np.concatenate([phi[1:], np.asarray([0.0], dtype=np.float32)])
+    # Terminal transition: Phi(s_T) = 0 by the bootstrap mask.
+    bootstrap[-1] = 0.0
+
+    shaped = np.asarray(
+        progress_shaped_rewards(
+            jnp.asarray(rewards),
+            jnp.asarray(discounts),
+            jnp.asarray(bootstrap),
+            jnp.asarray(phi),
+            jnp.asarray(phi_next),
+            lam,
+        )
+    )
+    discounted_sum = float(
+        sum(gamma**t * shaped[t] for t in range(horizon))
+    )
+    # sum_t gamma^t F_t = -lambda * Phi(s_0) once Phi(terminal) = 0.
+    np.testing.assert_allclose(discounted_sum, -lam * phi[0], atol=1e-6)
+
+
+def test_cqn_as_progress_head_is_created_on_the_canonical_platform():
+    observation_space, action_space = _spaces()
+    agent = create_agent(
+        _compose_cqn_as(
+            "method.progress_head_weight=1.0",
+            "method.weight_decay=0.0",
+        ),
+        observation_space=observation_space,
+        action_space=action_space,
+    )
+    # Unlike awr_beta the progress head does NOT require separate_bc_policy.
+    assert not agent.separate_bc_policy
+    assert "progress_value" in agent.params
+
+    batch = _progress_batch()
+    before = jax.tree.map(np.asarray, agent.params["progress_value"])
+    agent.logging = True
+    metrics = agent.update(iter([batch]), step=1)
+
+    assert _tree_changed(before, agent.params["progress_value"])
+    assert metrics["progress_head_loss"] > 0.0
+    assert metrics["progress_valid_fraction"] == pytest.approx(1.0)
+    assert metrics["progress_label_mean"] == pytest.approx(
+        float(np.mean(batch["progress"])),
+        abs=1e-6,
+    )
+    assert np.isfinite(metrics["progress_head_value_mean"])
+    assert "progress_shaping_clip_frac" not in metrics
+
+
+def test_cqn_as_progress_head_leaves_the_legacy_critic_update_bitwise():
+    observation_space, action_space = _spaces()
+    legacy = create_agent(
+        _compose_cqn_as("method.weight_decay=0.0"),
+        observation_space=observation_space,
+        action_space=action_space,
+    )
+    shaped = create_agent(
+        _compose_cqn_as(
+            "method.progress_head_weight=1.0",
+            "method.weight_decay=0.0",
+        ),
+        observation_space=observation_space,
+        action_space=action_space,
+    )
+    batch = _progress_batch()
+    legacy_batch = {key: np.array(value, copy=True) for key, value in batch.items()}
+    legacy_batch.pop("progress")
+    legacy_batch.pop("progress_valid")
+
+    legacy.update(iter([legacy_batch]), step=1)
+    shaped.update(iter([batch]), step=1)
+
+    legacy_leaves = jax.tree.leaves(legacy.params["critic"])
+    shaped_leaves = jax.tree.leaves(shaped.params["critic"])
+    for left, right in zip(legacy_leaves, shaped_leaves, strict=True):
+        np.testing.assert_array_equal(np.asarray(left), np.asarray(right))
+
+
+def test_cqn_as_zero_initialized_potential_is_the_exact_legacy_target():
+    observation_space, action_space = _spaces()
+    legacy = create_agent(
+        _compose_cqn_as("method.weight_decay=0.0"),
+        observation_space=observation_space,
+        action_space=action_space,
+    )
+    shaped = create_agent(
+        _compose_cqn_as(
+            "method.progress_potential_weight=0.25",
+            "method.progress_head_weight=0.0",
+            "method.weight_decay=0.0",
+        ),
+        observation_space=observation_space,
+        action_space=action_space,
+    )
+    batch = _progress_batch()
+    legacy_batch = {key: np.array(value, copy=True) for key, value in batch.items()}
+    legacy_batch.pop("progress")
+    legacy_batch.pop("progress_valid")
+
+    legacy.update(iter([legacy_batch]), step=1)
+    shaped.logging = True
+    metrics = shaped.update(iter([batch]), step=1)
+
+    # The head is zero-initialised, so Phi == 0 and the shaped target is the
+    # legacy target bit for bit.
+    assert metrics["progress_head_value_mean"] == pytest.approx(0.0)
+    assert metrics["progress_potential_lambda"] == pytest.approx(0.25)
+    for left, right in zip(
+        jax.tree.leaves(legacy.params["critic"]),
+        jax.tree.leaves(shaped.params["critic"]),
+        strict=True,
+    ):
+        np.testing.assert_array_equal(np.asarray(left), np.asarray(right))
+
+
+def test_cqn_as_constant_potential_equals_pre_shifted_rewards():
+    observation_space, action_space = _spaces()
+    lam = 0.25
+    potential = 0.4
+    shaped = create_agent(
+        _compose_cqn_as(
+            f"method.progress_potential_weight={lam}",
+            "method.progress_head_weight=0.0",
+            "method.weight_decay=0.0",
+        ),
+        observation_space=observation_space,
+        action_space=action_space,
+    )
+    _set_constant_progress_potential(shaped, potential)
+    legacy = create_agent(
+        _compose_cqn_as("method.weight_decay=0.0"),
+        observation_space=observation_space,
+        action_space=action_space,
+    )
+
+    batch = _progress_batch()
+    legacy_batch = {key: np.array(value, copy=True) for key, value in batch.items()}
+    legacy_batch.pop("progress")
+    legacy_batch.pop("progress_valid")
+    bootstrap = 1.0 - batch["terminal"].astype(np.float32)
+    legacy_batch["reward"] = (
+        batch["reward"]
+        + lam * (batch["discount"] * bootstrap * potential - potential)
+    ).astype(np.float32)
+
+    shaped.logging = True
+    metrics = shaped.update(iter([batch]), step=1)
+    legacy.update(iter([legacy_batch]), step=1)
+
+    assert metrics["progress_head_value_mean"] == pytest.approx(potential)
+    for left, right in zip(
+        jax.tree.leaves(legacy.params["critic"]),
+        jax.tree.leaves(shaped.params["critic"]),
+        strict=True,
+    ):
+        np.testing.assert_allclose(
+            np.asarray(left),
+            np.asarray(right),
+            atol=1e-7,
+        )
+
+
+def test_cqn_as_progress_success_gate_censors_failed_episodes():
+    observation_space, action_space = _spaces()
+    gated = create_agent(
+        _compose_cqn_as(
+            "method.progress_head_weight=1.0",
+            "method.progress_success_gated=true",
+            "method.weight_decay=0.0",
+        ),
+        observation_space=observation_space,
+        action_space=action_space,
+    )
+    ungated = create_agent(
+        _compose_cqn_as(
+            "method.progress_head_weight=1.0",
+            "method.progress_success_gated=false",
+            "method.weight_decay=0.0",
+        ),
+        observation_space=observation_space,
+        action_space=action_space,
+    )
+    batch = _progress_batch()
+    batch["progress_valid"] = np.zeros_like(batch["progress_valid"])
+
+    gated_before = jax.tree.map(np.asarray, gated.params["progress_value"])
+    ungated_before = jax.tree.map(np.asarray, ungated.params["progress_value"])
+    gated.logging = True
+    ungated.logging = True
+    gated_metrics = gated.update(iter([batch]), step=1)
+    ungated_metrics = ungated.update(iter([batch]), step=1)
+
+    assert gated_metrics["progress_valid_fraction"] == pytest.approx(0.0)
+    assert gated_metrics["progress_head_loss"] == pytest.approx(0.0)
+    assert not _tree_changed(gated_before, gated.params["progress_value"])
+    assert ungated_metrics["progress_valid_fraction"] == pytest.approx(1.0)
+    assert ungated_metrics["progress_head_loss"] > 0.0
+    assert _tree_changed(ungated_before, ungated.params["progress_value"])
+
+
+def test_cqn_as_progress_potential_schedule_anneals_lambda():
+    observation_space, action_space = _spaces()
+    agent = create_agent(
+        _compose_cqn_as(
+            "method.progress_potential_weight=0.25",
+            "method.progress_head_weight=1.0",
+            "method.progress_potential_schedule='linear(0.25,0.0,100)'",
+            "method.weight_decay=0.0",
+        ),
+        observation_space=observation_space,
+        action_space=action_space,
+    )
+    agent.logging = True
+    early = agent.update(iter([_progress_batch()]), step=0)
+    late = agent.update(iter([_progress_batch()]), step=100)
+    assert early["progress_potential_lambda"] == pytest.approx(0.25)
+    assert late["progress_potential_lambda"] == pytest.approx(0.0)
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    (
+        ("method.mc_lower_bound_target=true", "method.mc_return_weight=0.1"),
+        (
+            "method.episodic_success_q_target=true",
+            "method.dense_return_q_target=true",
+        ),
+    ),
+)
+def test_cqn_as_progress_potential_rejects_raw_mc_targets(overrides):
+    observation_space, action_space = _spaces()
+    with pytest.raises(ValueError, match="raw Monte-Carlo targets"):
+        create_agent(
+            _compose_cqn_as(
+                "method.progress_potential_weight=0.25",
+                *overrides,
+            ),
+            observation_space=observation_space,
+            action_space=action_space,
+        )
+
+
+def test_cqn_as_progress_potential_must_fit_the_c51_support():
+    observation_space, action_space = _spaces()
+    with pytest.raises(ValueError, match="exceeds v_max"):
+        create_agent(
+            _compose_cqn_as("method.progress_potential_weight=1.5"),
+            observation_space=observation_space,
+            action_space=action_space,
+        )
+
+
+def test_cqn_as_progress_requires_truncated_demo_tails_on_bigym():
+    GlobalHydra.instance().clear()
+    with initialize_config_dir(config_dir=CONFIG_DIR, version_base=None):
+        cfg = compose(
+            config_name="robobase_config",
+            overrides=[
+                "launch=cqn_as_pixel_bigym_demo_driven",
+                "env=bigym/move_plate",
+                "method.progress_head_weight=1.0",
+                "env.truncate_demo_at_success=false",
+            ],
+        )
+    with pytest.raises(ValueError, match="truncate_demo_at_success"):
+        cqn_as_spec_from_cfg(cfg)
+
+
+def test_cqn_as_progress_launch_composes_on_the_demo_driven_platform():
+    GlobalHydra.instance().clear()
+    with initialize_config_dir(config_dir=CONFIG_DIR, version_base=None):
+        cfg = compose(
+            config_name="robobase_config",
+            overrides=[
+                "launch=cqn_as_pixel_bigym_demo_driven",
+                "env=bigym/move_plate",
+                "method.progress_head_weight=1.0",
+                "method.progress_potential_weight=0.25",
+                "method.progress_potential_schedule='linear(0.25,0.0,50000)'",
+            ],
+        )
+    assert cfg.env.truncate_demo_at_success is True
+    assert cfg.lazy_replay.use is False
+    assert _progress_label_enabled(cfg)
+    spec = cqn_as_spec_from_cfg(cfg)
+    assert spec.progress_potential_weight == pytest.approx(0.25)
+    assert spec.progress_head_weight == pytest.approx(1.0)
+    assert spec.progress_potential_schedule == "linear(0.25,0.0,50000)"
+    assert spec.progress_success_gated is True
+
+
+def _progress_workspace_stub(recorded):
+    workspace = object.__new__(Workspace)
+    workspace.train_envs = SimpleNamespace(num_envs=1)
+    workspace.agent = SimpleNamespace(reset=lambda *args, **kwargs: None)
+    workspace.cfg = OmegaConf.create(
+        {
+            "use_self_imitation": False,
+            "method": {"is_rl": False},
+            "replay": {"gamma": 0.99},
+        }
+    )
+    workspace.use_demo_replay = False
+    workspace.extra_replay_elements = spaces.Dict(
+        {
+            "demo": spaces.Box(0, 1, shape=(), dtype=np.uint8),
+            "progress": spaces.Box(0.0, 1.0, shape=(), dtype=np.float32),
+            "progress_valid": spaces.Box(0, 1, shape=(), dtype=np.uint8),
+        }
+    )
+    workspace._episode_rollouts = [[]]
+    workspace._global_env_episode = 0
+    workspace._main_loop_iterations = 0
+    workspace.replay_buffer = SimpleNamespace(
+        add=lambda obs, act, rew, term, trunc, **extra: recorded.append(extra),
+        add_final=lambda obs: None,
+    )
+    return workspace
+
+
+def _run_progress_episode(horizon, task_success):
+    recorded = []
+    workspace = _progress_workspace_stub(recorded)
+    for step in range(horizon):
+        terminal = step == horizon - 1
+        observations = {
+            "low_dim_state": np.zeros((1, 2, 3), dtype=np.float32)
+        }
+        next_infos = {}
+        if terminal:
+            next_infos = {
+                "_final_observation": np.asarray([True]),
+                "final_observation": np.asarray(
+                    [{"low_dim_state": np.zeros((2, 3), dtype=np.float32)}],
+                    dtype=object,
+                ),
+                "final_info": np.asarray(
+                    [{"task_success": float(task_success)}],
+                    dtype=object,
+                ),
+            }
+        workspace._add_to_replay(
+            actions=np.zeros((1, 3, 2), dtype=np.float32),
+            observations=observations,
+            rewards=np.asarray([1.0 if terminal and task_success else 0.0]),
+            terminations=np.asarray([terminal]),
+            truncations=np.asarray([False]),
+            infos={},
+            next_infos=next_infos,
+        )
+    return recorded
+
+
+def test_online_progress_labels_are_monotone_and_success_gated():
+    horizon = 5
+    recorded = _run_progress_episode(horizon, task_success=True)
+    labels = np.asarray([entry["progress"] for entry in recorded])
+    valid = np.asarray([entry["progress_valid"] for entry in recorded])
+
+    # Same closed form the demo loader uses: (t + 1) / T, so demo and online
+    # transitions land on one label scale.
+    np.testing.assert_allclose(
+        labels,
+        np.arange(1, horizon + 1, dtype=np.float32) / horizon,
+        atol=1e-7,
+    )
+    assert np.all(np.diff(labels) > 0.0)
+    assert labels[-1] == pytest.approx(1.0)
+    np.testing.assert_array_equal(valid, np.ones(horizon, dtype=np.uint8))
+
+    failed = _run_progress_episode(horizon, task_success=False)
+    np.testing.assert_allclose(
+        np.asarray([entry["progress"] for entry in failed]),
+        np.arange(1, horizon + 1, dtype=np.float32) / horizon,
+        atol=1e-7,
+    )
+    np.testing.assert_array_equal(
+        np.asarray([entry["progress_valid"] for entry in failed]),
+        np.zeros(horizon, dtype=np.uint8),
+    )

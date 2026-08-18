@@ -277,6 +277,28 @@ def project_categorical(
     return projected.reshape((batch, levels, action_dim, atoms))
 
 
+def progress_shaped_rewards(
+    rewards: jax.Array,
+    discounts: jax.Array,
+    bootstrap: jax.Array,
+    phi: jax.Array,
+    phi_next: jax.Array,
+    weight: jax.Array | float,
+) -> jax.Array:
+    """Ng-form potential shaping of the per-transition reward scalar.
+
+    ``r~ = r + lambda * (gamma * bootstrap * Phi(s') - Phi(s))``.
+
+    ``bootstrap`` supplies ``Phi(terminal) = 0`` for free, so a terminal
+    success target becomes exactly ``1 - lambda * Phi(s_T-1)``.  ``discounts``
+    must be the per-transition discount actually multiplied into the C51
+    target (``gamma^n`` for an n-step backup), otherwise the shaping does not
+    telescope and degenerates into an arbitrary dense reward.
+    """
+
+    return rewards + weight * (discounts * bootstrap * phi_next - phi)
+
+
 def categorical_point_mass(
     values: jax.Array,
     support: jax.Array,
@@ -1169,6 +1191,23 @@ class CQN(JaxRLMethodBase, OffPolicyMethod):
         use_support_mask_head = bool(
             getattr(self, "use_frozen_support_mask", False)
         )
+        # Progress-potential shaping. ``use_progress_head`` gates the whole
+        # block (parameter group + batch elements + metrics);
+        # ``use_progress_shaping`` additionally rewrites the target reward
+        # scalar. Both false is the exact legacy graph.
+        use_progress_head = bool(getattr(self, "progress_head_enabled", False))
+        use_progress_shaping = bool(
+            getattr(self, "progress_shaping_enabled", False)
+        )
+        progress_head_weight = float(
+            getattr(self, "progress_head_weight", 0.0)
+        )
+        progress_expectile_tau = float(
+            getattr(self, "progress_expectile_tau", 0.9)
+        )
+        progress_success_gated = bool(
+            getattr(self, "progress_success_gated", True)
+        )
 
         def array_all_finite(value):
             value = jnp.asarray(value)
@@ -1217,6 +1256,9 @@ class CQN(JaxRLMethodBase, OffPolicyMethod):
             mc_returns,
             bc_weight,
             support_mask_ce_weight,
+            progress_labels,
+            progress_valid,
+            progress_lambda,
             action_key,
             aux_next_obs_inputs=None,
             aux_next_actions=None,
@@ -1271,13 +1313,64 @@ class CQN(JaxRLMethodBase, OffPolicyMethod):
                     next_action,
                 )
                 target_probabilities = jax.nn.softmax(target_logits, axis=-1)
+                # Ng-form potential shaping. ``progress_phi_raw`` is the
+                # unclipped head output kept for the regression loss; the
+                # potential itself is clipped into [0, 1] and stop-gradient so
+                # the shaping term is a pure per-state constant.
+                progress_zero = jnp.asarray(0.0, dtype=jnp.float32)
+                progress_phi_raw = jnp.zeros_like(rewards)
+                progress_phi = jnp.zeros_like(rewards)
+                progress_phi_next = jnp.zeros_like(rewards)
+                if use_progress_head:
+                    progress_phi_raw = self.progress_value_model.apply(
+                        current_params["progress_value"],
+                        jax.lax.stop_gradient(features),
+                    )
+                    progress_phi = jax.lax.stop_gradient(
+                        jnp.clip(progress_phi_raw, 0.0, 1.0)
+                    )
+                    progress_phi_next = jax.lax.stop_gradient(
+                        jnp.clip(
+                            self.progress_value_model.apply(
+                                current_params["progress_value"],
+                                next_features,
+                            ),
+                            0.0,
+                            1.0,
+                        )
+                    )
+                shaped_rewards = rewards
+                if use_progress_shaping:
+                    shaped_rewards = progress_shaped_rewards(
+                        rewards,
+                        discounts,
+                        bootstrap,
+                        progress_phi,
+                        progress_phi_next,
+                        progress_lambda,
+                    )
                 target_distribution = project_categorical(
                     target_probabilities,
-                    rewards * q_reward_scale,
+                    shaped_rewards * q_reward_scale,
                     discounts,
                     bootstrap,
                     self.support,
                 )
+                progress_clip_fraction = progress_zero
+                if use_progress_shaping:
+                    # project_categorical clips silently at the support edges
+                    # and clipping breaks the telescope, so measure it.
+                    shaped_atom_targets = (
+                        shaped_rewards * q_reward_scale
+                    )[:, None] + (bootstrap * discounts)[:, None] * (
+                        self.support[None, :]
+                    )
+                    progress_clip_fraction = jnp.mean(
+                        (
+                            (shaped_atom_targets < self.support[0])
+                            | (shaped_atom_targets > self.support[-1])
+                        ).astype(jnp.float32)
+                    )
                 if self.centralized_critic:
                     target_distribution = jnp.broadcast_to(
                         target_distribution.mean(axis=-2, keepdims=True),
@@ -1311,9 +1404,32 @@ class CQN(JaxRLMethodBase, OffPolicyMethod):
                         aux_target_logits,
                         axis=-1,
                     )
+                    shaped_aux_rewards = aux_rewards
+                    if use_progress_shaping:
+                        # n-step telescoping keeps only the two endpoints, so
+                        # the auxiliary-horizon backup uses Phi at its own
+                        # (aux) next state with its own gamma^n and bootstrap.
+                        aux_phi_next = jax.lax.stop_gradient(
+                            jnp.clip(
+                                self.progress_value_model.apply(
+                                    current_params["progress_value"],
+                                    aux_features,
+                                ),
+                                0.0,
+                                1.0,
+                            )
+                        )
+                        shaped_aux_rewards = progress_shaped_rewards(
+                            aux_rewards,
+                            aux_discounts,
+                            aux_bootstrap,
+                            progress_phi,
+                            aux_phi_next,
+                            progress_lambda,
+                        )
                     aux_target_distribution = project_categorical(
                         aux_target_probabilities,
-                        aux_rewards * q_reward_scale,
+                        shaped_aux_rewards * q_reward_scale,
                         aux_discounts,
                         aux_bootstrap,
                         self.support,
@@ -1702,6 +1818,37 @@ class CQN(JaxRLMethodBase, OffPolicyMethod):
                             - mc_returns[:, None, None]
                         )
                     )
+                progress_head_loss = progress_zero
+                progress_value_mean = progress_zero
+                progress_valid_fraction = progress_zero
+                if use_progress_head:
+                    # Expectile regression of the state-only head onto the raw
+                    # (t+1)/T replay label.  tau > 0.5 fits the optimistic
+                    # envelope, absorbing the fact that a time index is a
+                    # task clock rather than a task state.
+                    progress_error = progress_labels - progress_phi_raw
+                    expectile_weight = jnp.where(
+                        progress_error < 0.0,
+                        1.0 - progress_expectile_tau,
+                        progress_expectile_tau,
+                    )
+                    progress_mask = (
+                        progress_valid
+                        if progress_success_gated
+                        else jnp.ones_like(progress_valid)
+                    )
+                    progress_valid_fraction = jnp.mean(progress_mask)
+                    progress_head_loss = progress_head_weight * (
+                        jnp.sum(
+                            expectile_weight
+                            * jnp.square(progress_error)
+                            * progress_mask
+                        )
+                        / jnp.maximum(jnp.sum(progress_mask), 1.0)
+                    )
+                    progress_value_mean = jnp.mean(progress_phi)
+                    if progress_head_weight > 0.0:
+                        critic_loss = critic_loss + progress_head_loss
                 coarse_flow_loss = jnp.asarray(0.0, dtype=jnp.float32)
                 if use_coarse_flow:
                     # Stage-152 coarse-flow: bin-conditioned CFM on the
@@ -1837,6 +1984,10 @@ class CQN(JaxRLMethodBase, OffPolicyMethod):
                     token_split_aux_reward_mean,
                     support_mask_ce_loss,
                     support_mask_width,
+                    progress_head_loss,
+                    progress_value_mean,
+                    progress_valid_fraction,
+                    progress_clip_fraction,
                     target_action_info,
                     bc_diagnostics,
                     nan_diag,
@@ -1886,6 +2037,10 @@ class CQN(JaxRLMethodBase, OffPolicyMethod):
                 token_split_aux_reward_mean,
                 support_mask_ce_loss,
                 support_mask_width,
+                progress_head_loss,
+                progress_value_mean,
+                progress_valid_fraction,
+                progress_clip_fraction,
                 target_action_info,
                 bc_diagnostics,
                 nan_diag,
@@ -2050,6 +2205,17 @@ class CQN(JaxRLMethodBase, OffPolicyMethod):
                 )
             if use_coarse_flow:
                 metrics["coarse_flow_loss"] = coarse_flow_loss
+            if use_progress_head:
+                metrics["progress_head_loss"] = progress_head_loss
+                metrics["progress_head_value_mean"] = progress_value_mean
+                metrics["progress_label_mean"] = jnp.mean(progress_labels)
+                metrics["progress_valid_fraction"] = progress_valid_fraction
+            if use_progress_shaping:
+                metrics["progress_potential_lambda"] = jnp.asarray(
+                    progress_lambda,
+                    dtype=jnp.float32,
+                )
+                metrics["progress_shaping_clip_frac"] = progress_clip_fraction
             return (
                 params,
                 target_critic_params,
@@ -2067,6 +2233,15 @@ class CQN(JaxRLMethodBase, OffPolicyMethod):
                 return args, ()
             return args[:-5], args[-5:]
 
+        def split_progress_args(args):
+            # (progress, progress_valid, lambda) are threaded immediately
+            # before action_key and after the frozen-support CE gate; every
+            # other configuration passes none.
+            if not use_progress_head:
+                return args, None
+            (*rest, labels, valid, weight, action_key) = args
+            return (*rest, action_key), (labels, valid, weight)
+
         def split_support_mask_weight(args):
             # The frozen-support CE gate is threaded immediately before
             # action_key; every other configuration passes none.
@@ -2080,14 +2255,23 @@ class CQN(JaxRLMethodBase, OffPolicyMethod):
             mc_returns,
             bc_weight,
             support_mask_ce_weight,
+            progress_args,
             action_key,
             aux_tail,
         ):
+            if progress_args is None:
+                rewards = core_args[7]
+                progress_args = (
+                    jnp.zeros_like(rewards),
+                    jnp.zeros_like(rewards),
+                    jnp.asarray(0.0, dtype=jnp.float32),
+                )
             return update_impl(
                 *core_args,
                 mc_returns,
                 bc_weight,
                 support_mask_ce_weight,
+                *progress_args,
                 action_key,
                 *aux_tail,
             )
@@ -2096,6 +2280,7 @@ class CQN(JaxRLMethodBase, OffPolicyMethod):
 
             def update_fn(*args):
                 args, aux_tail = split_aux_tail(args)
+                args, progress_args = split_progress_args(args)
                 args, support_mask_ce_weight = split_support_mask_weight(args)
                 (*core, mc_returns, bc_weight, action_key) = args
                 return call_impl(
@@ -2103,6 +2288,7 @@ class CQN(JaxRLMethodBase, OffPolicyMethod):
                     mc_returns,
                     bc_weight,
                     support_mask_ce_weight,
+                    progress_args,
                     action_key,
                     aux_tail,
                 )
@@ -2111,6 +2297,7 @@ class CQN(JaxRLMethodBase, OffPolicyMethod):
 
             def update_fn(*args):
                 args, aux_tail = split_aux_tail(args)
+                args, progress_args = split_progress_args(args)
                 args, support_mask_ce_weight = split_support_mask_weight(args)
                 (*core, mc_returns, action_key) = args
                 return call_impl(
@@ -2118,6 +2305,7 @@ class CQN(JaxRLMethodBase, OffPolicyMethod):
                     mc_returns,
                     base_bc_weight,
                     support_mask_ce_weight,
+                    progress_args,
                     action_key,
                     aux_tail,
                 )
@@ -2126,6 +2314,7 @@ class CQN(JaxRLMethodBase, OffPolicyMethod):
 
             def update_fn(*args):
                 args, aux_tail = split_aux_tail(args)
+                args, progress_args = split_progress_args(args)
                 args, support_mask_ce_weight = split_support_mask_weight(args)
                 (*core, bc_weight, action_key) = args
                 rewards = core[7]
@@ -2134,6 +2323,7 @@ class CQN(JaxRLMethodBase, OffPolicyMethod):
                     jnp.zeros_like(rewards),
                     bc_weight,
                     support_mask_ce_weight,
+                    progress_args,
                     action_key,
                     aux_tail,
                 )
@@ -2142,6 +2332,7 @@ class CQN(JaxRLMethodBase, OffPolicyMethod):
 
             def update_fn(*args):
                 args, aux_tail = split_aux_tail(args)
+                args, progress_args = split_progress_args(args)
                 args, support_mask_ce_weight = split_support_mask_weight(args)
                 (*core, action_key) = args
                 rewards = core[7]
@@ -2150,6 +2341,7 @@ class CQN(JaxRLMethodBase, OffPolicyMethod):
                     jnp.zeros_like(rewards),
                     base_bc_weight,
                     support_mask_ce_weight,
+                    progress_args,
                     action_key,
                     aux_tail,
                 )
@@ -2227,6 +2419,40 @@ class CQN(JaxRLMethodBase, OffPolicyMethod):
             )
         return self._prepare_rl_obs_inputs(auxiliary_batch)
 
+    def _progress_update_args(self, batch: dict, step: int) -> tuple:
+        """Raw progress labels plus the current shaping lambda.
+
+        The label is the stored time index ``(t+1)/T``; nothing gamma- or
+        lambda-dependent is ever read from replay, so a lambda sweep never
+        invalidates the shared demo cache.
+        """
+
+        missing = [
+            name
+            for name in ("progress", "progress_valid")
+            if name not in batch
+        ]
+        if missing:
+            raise KeyError(
+                "progress shaping requires episode-backed replay elements; "
+                "missing: " + ", ".join(missing)
+            )
+        progress_labels = self._as_jax_array(
+            batch["progress"], self.jnp.float32
+        ).reshape(-1)
+        progress_valid = self._as_jax_array(
+            batch["progress_valid"], self.jnp.float32
+        ).reshape(-1)
+        schedule = getattr(self, "progress_potential_schedule", None)
+        weight = float(getattr(self, "progress_potential_weight", 0.0))
+        if schedule is not None:
+            weight = float(utils.schedule(schedule, step))
+        return (
+            progress_labels,
+            progress_valid,
+            jnp.asarray(weight, dtype=jnp.float32),
+        )
+
     def update(
         self,
         replay_iter: Iterator[dict],
@@ -2303,6 +2529,10 @@ class CQN(JaxRLMethodBase, OffPolicyMethod):
                         else 0.0,
                         dtype=jnp.float32,
                     ),
+                )
+            if getattr(self, "progress_head_enabled", False):
+                canonical_mc_args = (
+                    canonical_mc_args + self._progress_update_args(batch, step)
                 )
             auxiliary_args = ()
             needs_aux_horizon = (
@@ -2442,6 +2672,7 @@ __all__ = [
     "dense_return_expected_q_loss",
     "episodic_success_returns",
     "ordered_success_returns",
+    "progress_shaped_rewards",
     "cqn_spec_from_cfg",
     "decode_action",
     "encode_action",

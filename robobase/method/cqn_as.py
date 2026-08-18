@@ -25,6 +25,7 @@ from robobase.method.cqn import (
     CQNSpec,
     cqn_spec_from_cfg,
     encode_action,
+    progress_shaped_rewards,
     project_categorical,
     zoom_in,
 )
@@ -219,6 +220,11 @@ class CQNASpec(CQNSpec):
     awr_beta: float | None
     awr_weight_max: float
     awr_expectile_tau: float
+    progress_potential_weight: float
+    progress_potential_schedule: str | None
+    progress_head_weight: float
+    progress_expectile_tau: float
+    progress_success_gated: bool
     flow_policy: bool
     flow_policy_candidates: int
     flow_policy_steps: int
@@ -284,6 +290,46 @@ def cqn_as_spec_from_cfg(cfg: DictConfig) -> CQNASpec:
             raise ValueError(
                 "token_split_horizon_targets requires the auxiliary-horizon "
                 "replay fields: " + "; ".join(token_split_violations)
+            )
+    progress_enabled = (
+        float(method.get("progress_potential_weight", 0.0)) > 0.0
+        or float(method.get("progress_head_weight", 0.0)) > 0.0
+    )
+    if progress_enabled:
+        # Only the canonical / separate-BC CQN-AS update graphs thread the
+        # potential; every other graph would silently ignore it.
+        method_name = str(method.get("name", "cqn_as")).lower()
+        if method_name != "cqn_as":
+            raise NotImplementedError(
+                "progress shaping is implemented for method=cqn_as only; got "
+                f"method.name={method_name}."
+            )
+        if bool(method.get("direct_scalar_q", False)):
+            raise NotImplementedError(
+                "progress shaping is not implemented on the direct scalar-Q "
+                "update graph."
+            )
+        # The (t+1)/T label is only progress toward success when the demo
+        # episode ends at its first success frame; 96% of untruncated BiGym
+        # demo transitions sit in a post-success tail where the label is flat.
+        if "env" in cfg:
+            env_cfg = cfg.env
+            if str(env_cfg.get("env_name", "")) == "bigym" and not bool(
+                env_cfg.get("truncate_demo_at_success", False)
+            ):
+                raise ValueError(
+                    "progress labels require env.truncate_demo_at_success="
+                    "true; untruncated demo tails make (t+1)/T flat and "
+                    "misleading."
+                )
+        from robobase.replay_buffer.bigym_lazy_replay import (
+            lazy_replay_enabled,
+        )
+
+        if lazy_replay_enabled(cfg):
+            raise ValueError(
+                "progress labels require episode-backed replay; set "
+                "lazy_replay.use=false."
             )
     strict_demo_rl_only = bool(method.get("strict_demo_rl_only", False))
     if strict_demo_rl_only:
@@ -562,6 +608,21 @@ def cqn_as_spec_from_cfg(cfg: DictConfig) -> CQNASpec:
         ),
         awr_weight_max=float(method.get("awr_weight_max", 10.0)),
         awr_expectile_tau=float(method.get("awr_expectile_tau", 0.7)),
+        progress_potential_weight=float(
+            method.get("progress_potential_weight", 0.0)
+        ),
+        progress_potential_schedule=(
+            None
+            if method.get("progress_potential_schedule", None) is None
+            else str(method.get("progress_potential_schedule"))
+        ),
+        progress_head_weight=float(method.get("progress_head_weight", 0.0)),
+        progress_expectile_tau=float(
+            method.get("progress_expectile_tau", 0.9)
+        ),
+        progress_success_gated=bool(
+            method.get("progress_success_gated", True)
+        ),
         flow_policy=bool(method.get("flow_policy", False)),
         flow_policy_candidates=int(method.get("flow_policy_candidates", 8)),
         flow_policy_steps=int(method.get("flow_policy_steps", 8)),
@@ -1388,6 +1449,11 @@ class CQNAS(CQN):
         awr_beta: float | None = None,
         awr_weight_max: float = 10.0,
         awr_expectile_tau: float = 0.7,
+        progress_potential_weight: float = 0.0,
+        progress_potential_schedule: str | None = None,
+        progress_head_weight: float = 0.0,
+        progress_expectile_tau: float = 0.9,
+        progress_success_gated: bool = True,
         flow_policy: bool = False,
         flow_policy_candidates: int = 8,
         flow_policy_steps: int = 8,
@@ -2310,6 +2376,94 @@ class CQNAS(CQN):
         self.awr_beta = None if awr_beta is None else float(awr_beta)
         self.awr_weight_max = float(awr_weight_max)
         self.awr_expectile_tau = float(awr_expectile_tau)
+        # ---- Progress-potential shaping (Ng et al. 1999 potential form) ----
+        # Phi is a state-only auxiliary head; the potential enters the C51
+        # target's reward scalar only.  Replay rewards and mc_returns stay raw
+        # so no stored quantity depends on lambda or gamma.
+        progress_potential_weight = float(progress_potential_weight)
+        progress_head_weight = float(progress_head_weight)
+        if progress_potential_weight < 0.0:
+            raise ValueError(
+                "progress_potential_weight must be non-negative."
+            )
+        if progress_head_weight < 0.0:
+            raise ValueError("progress_head_weight must be non-negative.")
+        if not 0.0 < float(progress_expectile_tau) < 1.0:
+            raise ValueError("progress_expectile_tau must be in (0, 1).")
+        if progress_potential_schedule is not None:
+            # Fail fast on an unparsable schedule string instead of at the
+            # first update.
+            utils.schedule(str(progress_potential_schedule), 0)
+            if progress_potential_weight <= 0.0:
+                raise ValueError(
+                    "progress_potential_schedule requires "
+                    "progress_potential_weight > 0 (the weight is the "
+                    "schedule's enable gate and its bound check)."
+                )
+        self.progress_potential_weight = progress_potential_weight
+        self.progress_potential_schedule = (
+            None
+            if progress_potential_schedule is None
+            else str(progress_potential_schedule)
+        )
+        self.progress_head_weight = progress_head_weight
+        self.progress_expectile_tau = float(progress_expectile_tau)
+        self.progress_success_gated = bool(progress_success_gated)
+        # The head is instantiated whenever either consumer needs it; unlike
+        # awr_beta it is NOT restricted to the separate_bc_policy platform.
+        self.progress_head_enabled = bool(
+            progress_head_weight > 0.0 or progress_potential_weight > 0.0
+        )
+        self.progress_shaping_enabled = progress_potential_weight > 0.0
+        if self.progress_head_enabled:
+            if self.pessimistic_twin_critic:
+                raise NotImplementedError(
+                    "progress shaping is not implemented on the "
+                    "pessimistic_twin_critic update graph."
+                )
+            if bool(getattr(self, "direct_scalar_q", False)):
+                raise NotImplementedError(
+                    "progress shaping is not implemented on the direct "
+                    "scalar-Q update graph."
+                )
+        if self.progress_shaping_enabled:
+            # Raw Monte-Carlo consumers assume UNSHAPED {0,1}-scale returns.
+            # Mixing them with shaped Bellman targets silently inverts the
+            # lower-bound mask, so refuse instead of guessing the shift.
+            mc_conflicts = [
+                name
+                for name, active in (
+                    ("mc_lower_bound_target", self.mc_lower_bound_target),
+                    (
+                        "episodic_success_q_target",
+                        self.episodic_success_q_target,
+                    ),
+                    (
+                        "ordered_success_return_mix",
+                        self.ordered_success_return_mix > 0.0,
+                    ),
+                )
+                if active
+            ]
+            if mc_conflicts:
+                raise ValueError(
+                    "progress_potential_weight > 0 cannot be combined with "
+                    "raw Monte-Carlo targets ("
+                    + ", ".join(mc_conflicts)
+                    + "); the shifted-MC variant is not implemented."
+                )
+            # C51 support headroom: the largest shaped reward scalar is
+            # (max sparse return + lambda) * q_reward_scale and
+            # project_categorical clips silently at v_max.
+            shaped_bound = (1.0 + progress_potential_weight) * float(
+                q_reward_scale
+            )
+            if shaped_bound > float(v_max) + 1e-6:
+                raise ValueError(
+                    "shaped target bound (1 + progress_potential_weight) * "
+                    f"q_reward_scale = {shaped_bound:.4f} exceeds v_max="
+                    f"{float(v_max):.4f}; C51 projection would clip silently."
+                )
         if flow_policy and not separate_bc_policy:
             raise ValueError("flow_policy requires separate_bc_policy=true.")
         if flow_policy_candidates < 1:
@@ -2533,6 +2687,22 @@ class CQNAS(CQN):
                         jnp.array,
                         self.params["flow_policy"],
                     )
+        self.progress_value_model = None
+        if self.progress_head_enabled:
+            # Same scalar state-value head as AWR, but on the canonical
+            # platform too: it reads stop-gradient features and never an
+            # action, so it adds no action-label objective.
+            self.progress_value_model = ExpectileValueHead(
+                hidden_dims=model.hidden_dims,
+                activation_name=model.activation,
+            )
+            # fold_in rather than split: adding the head must not consume the
+            # rollout/update RNG stream, so a progress-enabled arm keeps the
+            # exact legacy action keys and stays comparable to its control.
+            self.params["progress_value"] = self.progress_value_model.init(
+                jax.random.fold_in(self.rng_key, 0x9209),
+                dummy_features,
+            )
         if self.coarse_flow:
             self.flow_policy_model = FlowPolicyHead(
                 hidden_dims=(
@@ -3678,7 +3848,7 @@ class CQNAS(CQN):
                         key=key,
                     )[0]
 
-                if self.episodic_twin_head_exploration:
+                if getattr(self, "episodic_twin_head_exploration", False):
                     def sampled_head_action(_):
                         key1 = (
                             None
@@ -4634,6 +4804,19 @@ class CQNAS(CQN):
         optimizer = self.optimizer
         tau = self.critic_target_tau
         use_cv_rct = getattr(self, "cv_rct_weight", None) is not None
+        use_progress_head = bool(getattr(self, "progress_head_enabled", False))
+        use_progress_shaping = bool(
+            getattr(self, "progress_shaping_enabled", False)
+        )
+        progress_head_weight = float(
+            getattr(self, "progress_head_weight", 0.0)
+        )
+        progress_expectile_tau = float(
+            getattr(self, "progress_expectile_tau", 0.9)
+        )
+        progress_success_gated = bool(
+            getattr(self, "progress_success_gated", True)
+        )
 
         def update_impl(
             params,
@@ -4649,6 +4832,9 @@ class CQNAS(CQN):
             demos,
             mc_returns,
             structured,
+            progress_labels,
+            progress_valid,
+            progress_lambda,
             action_key,
         ):
             obs_inputs, next_obs_inputs, action_key = (
@@ -4722,9 +4908,51 @@ class CQNAS(CQN):
                 )
                 target_logits = self._critic_training_slice(target_logits)
                 target_probabilities = jax.nn.softmax(target_logits, axis=-1)
+                progress_zero = jnp.asarray(0.0, dtype=jnp.float32)
+                progress_phi_raw = jnp.zeros_like(rewards)
+                progress_phi = jnp.zeros_like(rewards)
+                progress_phi_next = jnp.zeros_like(rewards)
+                if use_progress_head:
+                    progress_phi_raw = self.progress_value_model.apply(
+                        current_params["progress_value"],
+                        jax.lax.stop_gradient(features),
+                    )
+                    progress_phi = jax.lax.stop_gradient(
+                        jnp.clip(progress_phi_raw, 0.0, 1.0)
+                    )
+                    progress_phi_next = jax.lax.stop_gradient(
+                        jnp.clip(
+                            self.progress_value_model.apply(
+                                current_params["progress_value"],
+                                next_features,
+                            ),
+                            0.0,
+                            1.0,
+                        )
+                    )
+                shaped_rewards = rewards
+                progress_clip_fraction = progress_zero
+                if use_progress_shaping:
+                    shaped_rewards = progress_shaped_rewards(
+                        rewards,
+                        discounts,
+                        bootstrap,
+                        progress_phi,
+                        progress_phi_next,
+                        progress_lambda,
+                    )
+                    shaped_atom_targets = shaped_rewards[:, None] + (
+                        bootstrap * discounts
+                    )[:, None] * self.support[None, :]
+                    progress_clip_fraction = jnp.mean(
+                        (
+                            (shaped_atom_targets < self.support[0])
+                            | (shaped_atom_targets > self.support[-1])
+                        ).astype(jnp.float32)
+                    )
                 target_distribution = project_categorical(
                     target_probabilities,
-                    rewards,
+                    shaped_rewards,
                     discounts,
                     bootstrap,
                     self.support,
@@ -5125,11 +5353,37 @@ class CQNAS(CQN):
                     flow_policy_loss = self.flow_policy_lambda * (
                         jnp.sum(flow_per_sample * demos) / demo_count
                     )
+                progress_head_loss = progress_zero
+                progress_value_mean = progress_zero
+                progress_valid_fraction = progress_zero
+                if use_progress_head:
+                    progress_error = progress_labels - progress_phi_raw
+                    progress_expectile_weight = jnp.where(
+                        progress_error < 0.0,
+                        1.0 - progress_expectile_tau,
+                        progress_expectile_tau,
+                    )
+                    progress_mask = (
+                        progress_valid
+                        if progress_success_gated
+                        else jnp.ones_like(progress_valid)
+                    )
+                    progress_valid_fraction = jnp.mean(progress_mask)
+                    progress_head_loss = progress_head_weight * (
+                        jnp.sum(
+                            progress_expectile_weight
+                            * jnp.square(progress_error)
+                            * progress_mask
+                        )
+                        / jnp.maximum(jnp.sum(progress_mask), 1.0)
+                    )
+                    progress_value_mean = jnp.mean(progress_phi)
                 total_loss = (
                     critic_loss
                     + policy_loss
                     + awr_value_loss
                     + flow_policy_loss
+                    + progress_head_loss
                 )
 
                 policy_correct = (
@@ -5183,6 +5437,10 @@ class CQNAS(CQN):
                     awr_weight_mean,
                     awr_weight_ess,
                     flow_policy_loss,
+                    progress_head_loss,
+                    progress_value_mean,
+                    progress_valid_fraction,
+                    progress_clip_fraction,
                 )
 
             (total_loss, aux), grads = jax.value_and_grad(
@@ -5225,15 +5483,40 @@ class CQNAS(CQN):
                 awr_weight_mean,
                 awr_weight_ess,
                 flow_policy_loss,
+                progress_head_loss,
+                progress_value_mean,
+                progress_valid_fraction,
+                progress_clip_fraction,
             ) = aux
             priority = jnp.sqrt(per_sample + 1e-10)
             priority = priority / jnp.maximum(jnp.max(priority), 1e-10)
+            progress_metrics = {}
+            if use_progress_head:
+                progress_metrics["progress_head_loss"] = progress_head_loss
+                progress_metrics["progress_head_value_mean"] = (
+                    progress_value_mean
+                )
+                progress_metrics["progress_label_mean"] = jnp.mean(
+                    progress_labels
+                )
+                progress_metrics["progress_valid_fraction"] = (
+                    progress_valid_fraction
+                )
+            if use_progress_shaping:
+                progress_metrics["progress_potential_lambda"] = jnp.asarray(
+                    progress_lambda,
+                    dtype=jnp.float32,
+                )
+                progress_metrics["progress_shaping_clip_frac"] = (
+                    progress_clip_fraction
+                )
             return (
                 params,
                 target_critic_params,
                 opt_state,
                 priority,
                 {
+                    **progress_metrics,
                     "critic_loss": critic_loss,
                     "td_critic_loss": td_critic_loss,
                     "mc_return_loss": mc_return_loss,
@@ -5263,39 +5546,35 @@ class CQNAS(CQN):
                 },
             )
 
+        def split_progress_args(args):
+            # (progress, progress_valid, lambda) are threaded immediately
+            # before action_key; every other configuration passes none and
+            # gets the exact legacy zero-potential graph.
+            if not use_progress_head:
+                rewards = args[6]
+                return args, (
+                    jnp.zeros_like(rewards),
+                    jnp.zeros_like(rewards),
+                    jnp.asarray(0.0, dtype=jnp.float32),
+                )
+            (*rest, labels, valid, weight, action_key) = args
+            return (*rest, action_key), (labels, valid, weight)
+
         if use_cv_rct:
 
-            def update_fn(
-                params,
-                target_critic_params,
-                opt_state,
-                obs_inputs,
-                next_obs_inputs,
-                actions,
-                rewards,
-                discounts,
-                bootstrap,
-                loss_weights,
-                demos,
-                mc_returns,
-                structured_explore_start,
-                structured_explore_dimension,
-                structured_explore_delta,
-                structured_explore_assignment_prob,
-                action_key,
-            ):
+            def update_fn(*args):
+                args, progress_args = split_progress_args(args)
+                (
+                    *core,
+                    mc_returns,
+                    structured_explore_start,
+                    structured_explore_dimension,
+                    structured_explore_delta,
+                    structured_explore_assignment_prob,
+                    action_key,
+                ) = args
                 return update_impl(
-                    params,
-                    target_critic_params,
-                    opt_state,
-                    obs_inputs,
-                    next_obs_inputs,
-                    actions,
-                    rewards,
-                    discounts,
-                    bootstrap,
-                    loss_weights,
-                    demos,
+                    *core,
                     mc_returns,
                     (
                         structured_explore_start,
@@ -5303,40 +5582,20 @@ class CQNAS(CQN):
                         structured_explore_delta,
                         structured_explore_assignment_prob,
                     ),
+                    *progress_args,
                     action_key,
                 )
 
         else:
 
-            def update_fn(
-                params,
-                target_critic_params,
-                opt_state,
-                obs_inputs,
-                next_obs_inputs,
-                actions,
-                rewards,
-                discounts,
-                bootstrap,
-                loss_weights,
-                demos,
-                mc_returns,
-                action_key,
-            ):
+            def update_fn(*args):
+                args, progress_args = split_progress_args(args)
+                (*core, mc_returns, action_key) = args
                 return update_impl(
-                    params,
-                    target_critic_params,
-                    opt_state,
-                    obs_inputs,
-                    next_obs_inputs,
-                    actions,
-                    rewards,
-                    discounts,
-                    bootstrap,
-                    loss_weights,
-                    demos,
+                    *core,
                     mc_returns,
                     None,
+                    *progress_args,
                     action_key,
                 )
 
@@ -5402,14 +5661,18 @@ class CQNAS(CQN):
         weights /= np.maximum(weights.sum(axis=1, keepdims=True), 1e-8)
         out = np.sum(candidates * weights[..., None], axis=1)
         if (not eval_mode) and (
-            self.post_ensemble_l1_flip_prob > 0.0
-            or self.post_ensemble_l2_flip_prob > 0.0
+            getattr(self, "post_ensemble_l1_flip_prob", 0.0) > 0.0
+            or getattr(self, "post_ensemble_l2_flip_prob", 0.0) > 0.0
         ):
             out = self._post_ensemble_bin_flip(out)
         if eval_mode and getattr(self, "log_ensemble_consensus", False):
             self._accumulate_ensemble_consensus(candidates, valid)
         pre = out
-        if eval_mode and self.post_ensemble_random_keep_levels is not None:
+        if (
+            eval_mode
+            and getattr(self, "post_ensemble_random_keep_levels", None)
+            is not None
+        ):
             out = self._post_ensemble_randomize(out)
         if eval_mode and getattr(self, "log_executed_actions", False):
             trace = getattr(self, "_action_trace", None)
@@ -5833,7 +6096,7 @@ class CQNAS(CQN):
             self.rng_key, action_key = jax.random.split(self.rng_key)
             twin_head_indices = np.full((batch_size,), -1, dtype=np.int32)
             if (
-                self.episodic_twin_head_exploration
+                getattr(self, "episodic_twin_head_exploration", False)
                 and not eval_mode
                 and step >= self.num_explore_steps
             ):
@@ -6100,29 +6363,37 @@ class CQNAS(CQN):
         the exact cross-episode intervention that reset() forbids
         (cqn-flow.md 48.3).
         """
-        return {
-            "bin_flip_rng_state": self._bin_flip_rng.bit_generator.state,
-            "bin_explore_rng_state": self._bin_explore_rng.bit_generator.state,
-            "episodic_twin_head_rng_state": (
-                self._episodic_twin_head_rng.bit_generator.state
-            ),
-        }
+        state = {}
+        for key, attribute in (
+            ("bin_flip_rng_state", "_bin_flip_rng"),
+            ("bin_explore_rng_state", "_bin_explore_rng"),
+            ("episodic_twin_head_rng_state", "_episodic_twin_head_rng"),
+        ):
+            generator = getattr(self, attribute, None)
+            if generator is not None:
+                state[key] = generator.bit_generator.state
+        return state
 
     def _load_exploration_checkpoint_state(self, state_dict: dict) -> None:
         # Older snapshots predate these keys; keep their fresh-init behavior.
         stored = state_dict.get("bin_flip_rng_state")
-        if stored is not None:
-            self._bin_flip_rng.bit_generator.state = stored
+        generator = getattr(self, "_bin_flip_rng", None)
+        if stored is not None and generator is not None:
+            generator.bit_generator.state = stored
         stored = state_dict.get("bin_explore_rng_state")
-        if stored is not None:
-            self._bin_explore_rng.bit_generator.state = stored
+        generator = getattr(self, "_bin_explore_rng", None)
+        if stored is not None and generator is not None:
+            generator.bit_generator.state = stored
         stored = state_dict.get("episodic_twin_head_rng_state")
-        if stored is not None:
-            self._episodic_twin_head_rng.bit_generator.state = stored
+        generator = getattr(self, "_episodic_twin_head_rng", None)
+        if stored is not None and generator is not None:
+            generator.bit_generator.state = stored
         # Workspace snapshots do not carry environment state. A resumed
         # online phase therefore starts fresh episodes and samples fresh
         # episode heads on its first action rather than leaking old heads.
-        self._episodic_twin_heads.fill(-1)
+        episodic_heads = getattr(self, "_episodic_twin_heads", None)
+        if episodic_heads is not None:
+            episodic_heads.fill(-1)
         # Snapshots from the short-lived 48.2 format may carry
         # bin_explore_{remaining,dimension,level,sibling}; ignore them so
         # resumed runs start their fresh episodes windowless.
@@ -6161,17 +6432,22 @@ class CQNAS(CQN):
                 ),
             }
         )
-        assignments = int(self._episodic_twin_head_assignments.sum())
+        head_assignments = getattr(
+            self,
+            "_episodic_twin_head_assignments",
+            np.zeros((2,), dtype=np.int64),
+        )
+        assignments = int(head_assignments.sum())
         diagnostics.update(
             {
                 "episodic_twin_head_assignments": float(assignments),
                 "episodic_twin_head0_rate": (
-                    float(self._episodic_twin_head_assignments[0] / assignments)
+                    float(head_assignments[0] / assignments)
                     if assignments
                     else 0.0
                 ),
                 "episodic_twin_head1_rate": (
-                    float(self._episodic_twin_head_assignments[1] / assignments)
+                    float(head_assignments[1] / assignments)
                     if assignments
                     else 0.0
                 ),
@@ -6267,6 +6543,9 @@ class CQNAS(CQN):
                         self.jnp.float32,
                     ).reshape(-1),
                 )
+            progress_args = ()
+            if getattr(self, "progress_head_enabled", False):
+                progress_args = self._progress_update_args(batch, step)
             start_time = time.perf_counter()
             (
                 self.params,
@@ -6288,6 +6567,7 @@ class CQNAS(CQN):
                 demos,
                 mc_returns,
                 *direct_q_extra_args,
+                *progress_args,
                 self._next_action_key(),
             )
             if (
@@ -6338,7 +6618,10 @@ class CQNAS(CQN):
         return metrics
 
     def _resample_episodic_twin_heads(self, agent_indices: list[int]) -> None:
-        if not self.episodic_twin_head_exploration or not agent_indices:
+        if (
+            not getattr(self, "episodic_twin_head_exploration", False)
+            or not agent_indices
+        ):
             return
         valid = np.asarray(
             [

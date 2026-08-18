@@ -3965,7 +3965,19 @@ class CQNFlowAS(CQNAS):
     def _build_greedy_action_fn(self):
         """Build rollout inference with optional strict policy/value towers."""
 
-        def action_fn(params, target_critic_params, obs_inputs, use_target, key):
+        def action_fn(
+            params,
+            target_critic_params,
+            obs_inputs,
+            use_target,
+            key,
+            twin_head_indices,
+        ):
+            # CQNFlowAS does not implement episodic twin-head selection, but
+            # CQNAS.act now passes this argument to every rollout function.
+            # Keep the shared call contract without turning the unused value
+            # into Flow-specific behavior.
+            del twin_head_indices
             if self.flow_distill_action_readout:
                 value_features = self._rl_features(
                     params.get("encoder", None),

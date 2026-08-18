@@ -1,0 +1,15 @@
+# @package _global_
+
+# Wave-10 arm A: keep FS-CQN's frozen demo-support mask only inside the
+# Bellman target.  Rollout/evaluation decode is the unrestricted critic
+# argmax.  This is a one-switch ablation of fscqn_pixel_bigym.
+defaults:
+  - fscqn_pixel_bigym
+  - _self_
+
+method:
+  support_mask_decode: false
+
+hydra:
+  run:
+    dir: ./exp_local/cqn_wave10/fstm_move_plate/bigym_${env.task_name}_${now:%Y%m%d%H%M%S}

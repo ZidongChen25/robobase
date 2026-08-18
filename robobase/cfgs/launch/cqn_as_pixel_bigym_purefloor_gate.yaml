@@ -1,0 +1,20 @@
+# @package _global_
+
+# Wave-10 arm B: critic-only, no-BC/no-policy-head control.  Retain FS-CQN's
+# 10k demo-only reward-Q shaping and dense positive-return target, remove both
+# support-mask uses, and use the truncated-demo reward scale registered in
+# cqn-rline.md.  The dense target assigns the valid zero floor to unexecuted
+# bins; no auxiliary imitation or action-label loss is present.
+defaults:
+  - fscqn_pixel_bigym
+  - _self_
+
+method:
+  strict_demo_rl_only: true
+  use_frozen_support_mask: false
+  support_mask_decode: false
+  q_reward_scale: 2.0
+
+hydra:
+  run:
+    dir: ./exp_local/cqn_wave10/purefloor_move_plate/bigym_${env.task_name}_${now:%Y%m%d%H%M%S}

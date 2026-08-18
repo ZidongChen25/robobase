@@ -1,0 +1,21 @@
+# @package _global_
+
+defaults:
+  - ../env: null
+  - ../method: djcqn
+  - _self_
+
+pixels: false
+frame_stack: 1
+action_repeat: 1
+action_sequence: 5
+execution_length: 1
+temporal_ensemble: false
+update_every_steps: 1
+
+replay:
+  nstep: ${action_sequence}
+
+hydra:
+  run:
+    dir: ./exp_local/djcqn/dmc_${env.task_name}_${now:%Y%m%d%H%M%S}

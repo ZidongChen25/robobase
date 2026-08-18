@@ -26,6 +26,7 @@ LEGACY_TARGETS = {
         ("robobase.method.cqn.CQN", "cqn"),
         ("robobase.method.cqn_as.CQNAS", "cqn_as"),
         ("robobase.method.cqn_flow.CQNFlowAS", "cqn_flow"),
+        ("robobase.method.djcqn.DJCQN", "djcqn"),
         ("robobase.method.ppo.PPO", "ppo"),
         ("robobase.method.q_chunking.QChunking", "q_chunking"),
         ("robobase.method.sac.SAC", "sac"),

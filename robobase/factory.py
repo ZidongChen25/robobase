@@ -15,6 +15,7 @@ from robobase.method.cqn import cqn_spec_from_cfg
 from robobase.method.cqn_as import cqn_as_spec_from_cfg
 from robobase.method.cqn_flow import cqn_flow_spec_from_cfg
 from robobase.method.drqv2 import drqv2_spec_from_cfg
+from robobase.method.djcqn import djcqn_spec_from_cfg, validate_djcqn_config
 from robobase.method.ppo import ppo_spec_from_cfg
 from robobase.method.q_chunking import (
     q_chunking_spec_from_cfg,
@@ -54,6 +55,7 @@ def method_name_from_cfg(cfg: DictConfig) -> str:
         "robobase.method.dreamerv3.DreamerV3": "dreamerv3",
         "robobase.method.drm.DrM": "drm",
         "robobase.method.drqv2.DrQV2": "drqv2",
+        "robobase.method.djcqn.DJCQN": "djcqn",
         "robobase.method.edp.DiffusionRL": "edp",
         "robobase.method.iql_drqv2.IQLDrQV2": "iql_drqv2",
         "robobase.method.mwm.MaskedWorldModel": "mwm",
@@ -91,14 +93,14 @@ def create_agent(
             "has no implementation in this JAX-only runtime. Supported JAX "
             "methods: a2a, act, bc, cqn, cqn_as, cqn_flow, diffusion, drqv2, "
             "flow_matching, "
-            "legato, ppo, q_chunking, sac."
+            "legato, ppo, q_chunking, djcqn, sac."
         )
     unsupported_reason = cfg.method.get("unsupported_reason", None)
     if unsupported_reason is not None:
         raise NotImplementedError(
             f"Method '{method_name}' is disabled: {unsupported_reason}. "
             "Supported JAX methods: a2a, act, bc, cqn, cqn_as, cqn_flow, "
-            "diffusion, drqv2, flow_matching, legato, ppo, q_chunking, sac."
+            "diffusion, drqv2, flow_matching, legato, ppo, q_chunking, djcqn, sac."
         )
     common_kwargs = dict(
         observation_space=observation_space,
@@ -221,6 +223,41 @@ def create_agent(
             actor_num_samples=spec.actor_num_samples,
             q_aggregate=spec.q_aggregate,
             actor_grad_clip=spec.actor_grad_clip,
+            critic_grad_clip=spec.critic_grad_clip,
+            weight_decay=spec.weight_decay,
+            model=spec.model,
+            jit=jit,
+            platform=platform,
+            seed=int(cfg.seed),
+            **common_kwargs,
+        )
+
+    if method_name == "djcqn":
+        from robobase.method.djcqn import DJCQN
+
+        validate_djcqn_config(
+            action_sequence=int(cfg.action_sequence),
+            execution_length=int(cfg.execution_length),
+            replay_nstep=int(cfg.replay.nstep),
+            temporal_ensemble=bool(cfg.get("temporal_ensemble", False)),
+            prefix_horizon=int(cfg.method.get("prefix_horizon", 1)),
+            action_execution_start=int(cfg.get("action_execution_start", 0)),
+        )
+        spec = djcqn_spec_from_cfg(cfg)
+        return DJCQN(
+            critic_lr=spec.critic_lr,
+            num_train_steps=spec.num_train_steps,
+            num_explore_steps=spec.num_explore_steps,
+            critic_target_tau=spec.critic_target_tau,
+            levels=spec.levels,
+            bins=spec.bins,
+            beam_width=spec.beam_width,
+            num_critics=spec.num_critics,
+            prefix_expectile=spec.prefix_expectile,
+            q_aggregate=spec.q_aggregate,
+            eval_lcb_beta=spec.eval_lcb_beta,
+            sibling_exploration_prob=spec.sibling_exploration_prob,
+            sibling_level=spec.sibling_level,
             critic_grad_clip=spec.critic_grad_clip,
             weight_decay=spec.weight_decay,
             model=spec.model,
@@ -449,6 +486,11 @@ def create_agent(
             awr_beta=spec.awr_beta,
             awr_weight_max=spec.awr_weight_max,
             awr_expectile_tau=spec.awr_expectile_tau,
+            progress_potential_weight=spec.progress_potential_weight,
+            progress_potential_schedule=spec.progress_potential_schedule,
+            progress_head_weight=spec.progress_head_weight,
+            progress_expectile_tau=spec.progress_expectile_tau,
+            progress_success_gated=spec.progress_success_gated,
             flow_policy=spec.flow_policy,
             flow_policy_candidates=spec.flow_policy_candidates,
             flow_policy_steps=spec.flow_policy_steps,
@@ -759,5 +801,5 @@ def create_agent(
     raise NotImplementedError(
         f"Unsupported method '{method_name}'. Supported: a2a, act, bc, cqn, "
         "cqn_as, cqn_flow, diffusion, drqv2, flow_matching, legato, ppo, "
-        "q_chunking, sac."
+        "q_chunking, djcqn, sac."
     )

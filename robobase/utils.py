@@ -361,6 +361,7 @@ def add_demo_to_replay_buffer(wrapped_env: DemoEnv, replay_buffer: ReplayBuffer)
     final_obs, _ = obs, info
 
     store_mc_return = "mc_return" in replay_buffer.extra_replay_elements.keys()
+    store_progress = "progress" in replay_buffer.extra_replay_elements.keys()
     store_structured_explore = (
         "structured_explore" in replay_buffer.extra_replay_elements.keys()
     )
@@ -368,12 +369,23 @@ def add_demo_to_replay_buffer(wrapped_env: DemoEnv, replay_buffer: ReplayBuffer)
         [transition[2] for transition in ep],
         getattr(replay_buffer, "_gamma", 1.0),
     )
+    # Demo twin of the online progress label. Validity is derived from the RAW
+    # reward sum, never from info["demo"]: env.treat_all_demos_as_expert can
+    # relabel a failed demo as expert, and a failed demo's time index is not
+    # progress toward success.
+    episode_length = max(len(ep), 1)
+    demo_progress_valid = np.uint8(
+        1 if sum(float(transition[2]) for transition in ep) > 0.25 else 0
+    )
     for index, (obs, action, rew, term, trunc, info, _) in enumerate(ep):
         extra = {"demo": info["demo"]}
         if "explored" in replay_buffer.extra_replay_elements.keys():
             extra["explored"] = np.uint8(0)
         if store_mc_return:
             extra["mc_return"] = mc_returns[index]
+        if store_progress:
+            extra["progress"] = np.float32((index + 1) / episode_length)
+            extra["progress_valid"] = demo_progress_valid
         if store_structured_explore:
             extra["structured_explore"] = np.uint8(0)
             if (
