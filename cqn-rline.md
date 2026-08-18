@@ -1277,3 +1277,12 @@ linear(1.0,0.0125,50000)。flip_cup/sandwich_remove 各 2 seeds,swirl03。
 - 事故记录:看护 v2 判完成 bug 重启已完成 run,流氓世代污染 flip s1(5-95k)
   与 sandwich s2(5-80k)网格;终点文件抢救完好(w11_rescue/),曲线分析只用
   两个单世代 run。判进度以 eval_checkpoints 顶点为准已固化到 v3。
+
+## Wave-12 中场判决:MC 下界救不回 ×4 配方,提前终止(2026-08-18,用户裁定)
+配方 = Wave-11 + mc_lower_bound_target。中场(50 eps,seeds 400-449):
+flip s1 25k=44→45k=10;flip s2 25k=30→40k=26;sandwich s2 25k=34→50k=10。
+对照 Wave-11 同点(flip 22-36/18-36,sandwich 42):不但未拉起,λ 落地后
+直接塌方(两个 run 跌到 10)——与 m1/m2 的 MC 值域压缩机制一致,MC×探索
+交互假说被否。用户指示中场停机(预注册标准satisfied:各点 ≤ W11 同点,无上翘)。
+剂量线(×4 探索家族)至此关闭:Wave-11 平台压低 + Wave-12 塌方 + m1/m2 无增益。
+卡位转予 progress potential shaping 臂(commit 28e88f4)。
