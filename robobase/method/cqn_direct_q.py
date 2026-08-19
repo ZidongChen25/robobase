@@ -16,8 +16,8 @@ import pickle
 import jax
 import jax.numpy as jnp
 
-from robobase.method.cqn import encode_action, zoom_in
-from robobase.method.cqn_as import (
+from robobase.method.cqn_research import encode_action, zoom_in
+from robobase.method.cqn_as_research import (
     C2FSequenceDistributionalCritic,
     CQNAS,
     action_centered_moment_loss,

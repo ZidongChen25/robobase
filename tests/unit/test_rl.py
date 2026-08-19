@@ -9,7 +9,7 @@ from hydra import compose, initialize_config_dir
 from hydra.core.global_hydra import GlobalHydra
 
 from robobase.factory import create_agent
-from robobase.method.cqn import (
+from robobase.method.cqn_research import (
     decode_action,
     encode_action,
     project_categorical,

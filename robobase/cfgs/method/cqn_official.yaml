@@ -1,8 +1,8 @@
 # @package _global_
 
 method:
-  name: cqn
-  _target_: robobase.method.cqn_research.CQN
+  name: cqn_official
+  _target_: robobase.method.cqn.CQN
   is_rl: true
   num_train_steps: ${num_train_frames}
   num_explore_steps: ${num_explore_steps}

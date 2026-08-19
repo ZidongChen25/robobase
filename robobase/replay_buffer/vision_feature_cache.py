@@ -50,6 +50,10 @@ def cached_feature_observation_key(method_name: str, backend_name: str = "jax") 
         # CQN-Flow uses the identical state/image feature adapter as CQN-AS,
         # so both methods can reuse one frozen-feature cache.
         "cqn_flow": JAX_CQN_AS_FEATURE_KEY,
+        # The pristine official CQN / CQN-AS classes share the research
+        # variants' feature adapter, so they reuse the same cache keys.
+        "cqn_official": JAX_CQN_FEATURE_KEY,
+        "cqn_as_official": JAX_CQN_AS_FEATURE_KEY,
     }
     try:
         return mapping[method_name]
@@ -177,7 +181,9 @@ def build_vision_feature_cache_plan(
         "bc",
         "cqn",
         "cqn_as",
+        "cqn_as_official",
         "cqn_flow",
+        "cqn_official",
         "diffusion",
         "drqv2",
         "flow_matching",
@@ -310,7 +316,11 @@ def build_vision_feature_cache_plan(
 
     encoder_seed = int(cfg.get("seed", 0))
 
-    cache_method_name = "cqn_as" if method_name == "cqn_flow" else method_name
+    cache_method_name = method_name
+    if method_name in {"cqn_flow", "cqn_as_official"}:
+        cache_method_name = "cqn_as"
+    elif method_name == "cqn_official":
+        cache_method_name = "cqn"
     fingerprint_payload = {
         "schema": 3,
         "method": cache_method_name,

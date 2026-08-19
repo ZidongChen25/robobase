@@ -9,7 +9,7 @@ temporal_ensemble: false
 
 method:
   name: cqn_as
-  _target_: robobase.method.cqn_as.CQNAS
+  _target_: robobase.method.cqn_as_research.CQNAS
   is_rl: true
   num_train_steps: ${num_train_frames}
   num_explore_steps: ${num_explore_steps}

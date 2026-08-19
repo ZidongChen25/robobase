@@ -268,7 +268,13 @@ def _validate_rl_action_sequence(cfg: DictConfig) -> None:
     """Restrict multi-step RL chunks to methods that implement chunk rollout."""
 
     method_name = method_name_from_cfg(cfg)
-    supported_methods = {"cqn_as", "cqn_flow", "q_chunking", "djcqn"}
+    supported_methods = {
+        "cqn_as",
+        "cqn_as_official",
+        "cqn_flow",
+        "q_chunking",
+        "djcqn",
+    }
     if (
         cfg.method.is_rl
         and cfg.action_sequence != 1

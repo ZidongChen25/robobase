@@ -1,4 +1,4 @@
-from robobase.method.cqn_as import CQNAS
+from robobase.method.cqn_as_research import CQNAS
 
 
 def test_exploration_checkpoint_helpers_allow_subclass_without_cqn_as_rngs():

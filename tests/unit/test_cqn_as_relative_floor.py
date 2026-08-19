@@ -11,7 +11,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from robobase.method.cqn import dense_return_distributional_loss
+from robobase.method.cqn_research import dense_return_distributional_loss
 
 
 def _setup(seed=0):

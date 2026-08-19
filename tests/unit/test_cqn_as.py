@@ -14,7 +14,7 @@ from omegaconf import OmegaConf
 
 from robobase.envs.wrappers import RecedingHorizonControl
 from robobase.factory import create_agent
-from robobase.method.cqn import (
+from robobase.method.cqn_research import (
     advantage_learning_target_shift,
     categorical_point_mass,
     dense_return_distributional_loss,
@@ -26,7 +26,7 @@ from robobase.method.cqn import (
     shift_categorical_distribution,
     unseen_return_floor_loss,
 )
-from robobase.method.cqn_as import (
+from robobase.method.cqn_as_research import (
     AutoregressiveActionCorrection,
     C2FSequenceDistributionalCritic,
     cqn_as_spec_from_cfg,
@@ -5571,7 +5571,7 @@ def test_cqn_as_bin_flip_is_alias_free_and_coherent():
     chunk = rng.uniform(-0.9, 0.9, size=(2, 3, 2)).astype(np.float32)
     flipped = agent._apply_bin_flip(chunk.copy())
 
-    from robobase.method.cqn import encode_action
+    from robobase.method.cqn_research import encode_action
 
     def bins_of(a):
         flat = jnp.asarray(a.reshape(a.shape[0], -1))
@@ -5651,7 +5651,7 @@ def test_cqn_as_coarse_flow_cell_roundtrips_recorded_actions():
         observation_space=observation_space,
         action_space=action_space,
     )
-    from robobase.method.cqn import encode_action
+    from robobase.method.cqn_research import encode_action
 
     rng = np.random.default_rng(3)
     actions = jnp.asarray(

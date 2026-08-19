@@ -23,8 +23,10 @@ LEGACY_TARGETS = {
 @pytest.mark.parametrize(
     ("target", "expected_name"),
     [
-        ("robobase.method.cqn.CQN", "cqn"),
-        ("robobase.method.cqn_as.CQNAS", "cqn_as"),
+        ("robobase.method.cqn_research.CQN", "cqn"),
+        ("robobase.method.cqn_as_research.CQNAS", "cqn_as"),
+        ("robobase.method.cqn.CQN", "cqn_official"),
+        ("robobase.method.cqn_as.CQNAS", "cqn_as_official"),
         ("robobase.method.cqn_flow.CQNFlowAS", "cqn_flow"),
         ("robobase.method.djcqn.DJCQN", "djcqn"),
         ("robobase.method.ppo.PPO", "ppo"),

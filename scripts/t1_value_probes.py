@@ -119,7 +119,7 @@ def main():
     import jax.numpy as jnp
     from omegaconf import OmegaConf
     from robobase.workspace import Workspace
-    from robobase.method.cqn import encode_action
+    from robobase.method.cqn_research import encode_action
 
     arm_dir = Path(args.arm_dir).resolve()
     frozen_dir = Path(args.frozen_dir).resolve()

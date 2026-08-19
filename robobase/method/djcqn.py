@@ -25,7 +25,7 @@ from gymnasium import spaces
 from omegaconf import DictConfig
 
 from robobase.method.core import OffPolicyMethod
-from robobase.method.cqn import encode_action, zoom_in
+from robobase.method.cqn_research import encode_action, zoom_in
 from robobase.method.q_chunking import QChunkCritic, q_chunking_td_target
 from robobase.method.rl_common import (
     JaxRLMethodBase,

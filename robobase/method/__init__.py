@@ -12,10 +12,19 @@ def __getattr__(name):
 
         return BC
     if name == "CQN":
-        from robobase.method.cqn import CQN
+        from robobase.method.cqn_research import CQN
 
         return CQN
     if name == "CQNAS":
+        from robobase.method.cqn_as_research import CQNAS
+
+        return CQNAS
+    # Pristine official-fidelity JAX port (import commit 173a01f), frozen.
+    if name == "CQNOfficial":
+        from robobase.method.cqn import CQN
+
+        return CQN
+    if name == "CQNASOfficial":
         from robobase.method.cqn_as import CQNAS
 
         return CQNAS
@@ -56,7 +65,9 @@ __all__ = [
     "BC",
     "CQN",
     "CQNAS",
+    "CQNASOfficial",
     "CQNFlowAS",
+    "CQNOfficial",
     "Diffusion",
     "DrQV2",
     "DJCQN",

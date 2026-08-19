@@ -22,8 +22,8 @@ import numpy as np
 from gymnasium import spaces
 from omegaconf import DictConfig
 
-from robobase.method.cqn import encode_action, project_categorical, zoom_in
-from robobase.method.cqn_as import (
+from robobase.method.cqn_research import encode_action, project_categorical, zoom_in
+from robobase.method.cqn_as_research import (
     C2FSequenceDistributionalCritic,
     CQNAS,
     CQNASpec,

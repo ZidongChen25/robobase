@@ -397,7 +397,7 @@ def _checkpoint_q_batch(agent, observations, actions, *, use_target, seed):
     import jax
     import jax.numpy as jnp
 
-    from robobase.method.cqn import encode_action
+    from robobase.method.cqn_research import encode_action
 
     obs_inputs = agent._prepare_rl_obs_inputs(observations)
     features = agent._rl_features(

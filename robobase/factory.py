@@ -11,8 +11,8 @@ from robobase.method.flow_matching import (
     flow_matching_spec_from_cfg,
     validate_legato_overlap,
 )
-from robobase.method.cqn import cqn_spec_from_cfg
-from robobase.method.cqn_as import cqn_as_spec_from_cfg
+from robobase.method.cqn_research import cqn_spec_from_cfg
+from robobase.method.cqn_as_research import cqn_as_spec_from_cfg
 from robobase.method.cqn_flow import cqn_flow_spec_from_cfg
 from robobase.method.drqv2 import drqv2_spec_from_cfg
 from robobase.method.djcqn import djcqn_spec_from_cfg, validate_djcqn_config
@@ -49,8 +49,12 @@ def method_name_from_cfg(cfg: DictConfig) -> str:
         "robobase.method.q_chunking.QChunking": "q_chunking",
         "robobase.method.sac.SAC": "sac",
         "robobase.method.alix.ALIX": "alix",
-        "robobase.method.cqn.CQN": "cqn",
-        "robobase.method.cqn_as.CQNAS": "cqn_as",
+        "robobase.method.cqn_research.CQN": "cqn",
+        "robobase.method.cqn_as_research.CQNAS": "cqn_as",
+        # The pristine official-fidelity JAX port kept frozen in
+        # ``robobase/method/cqn.py`` / ``cqn_as.py``.
+        "robobase.method.cqn.CQN": "cqn_official",
+        "robobase.method.cqn_as.CQNAS": "cqn_as_official",
         "robobase.method.cqn_flow.CQNFlowAS": "cqn_flow",
         "robobase.method.dreamerv3.DreamerV3": "dreamerv3",
         "robobase.method.drm.DrM": "drm",
@@ -268,10 +272,46 @@ def create_agent(
         )
 
     if method_name == "cqn":
-        from robobase.method.cqn import CQN
+        from robobase.method.cqn_research import CQN
 
         spec = cqn_spec_from_cfg(cfg)
         return CQN(
+            critic_lr=spec.critic_lr,
+            num_train_steps=spec.num_train_steps,
+            num_explore_steps=spec.num_explore_steps,
+            critic_target_tau=spec.critic_target_tau,
+            critic_grad_clip=spec.critic_grad_clip,
+            weight_decay=spec.weight_decay,
+            levels=spec.levels,
+            bins=spec.bins,
+            atoms=spec.atoms,
+            v_min=spec.v_min,
+            v_max=spec.v_max,
+            critic_lambda=spec.critic_lambda,
+            centralized_critic=spec.centralized_critic,
+            use_dueling=spec.use_dueling,
+            always_bootstrap=spec.always_bootstrap,
+            stddev_schedule=spec.stddev_schedule,
+            bc_lambda=spec.bc_lambda,
+            bc_margin=spec.bc_margin,
+            use_target_network_for_rollout=spec.use_target_network_for_rollout,
+            num_update_steps=spec.num_update_steps,
+            model=spec.model,
+            jit=jit,
+            platform=platform,
+            seed=int(cfg.seed),
+            **common_kwargs,
+        )
+
+    if method_name == "cqn_official":
+        # Pristine official-fidelity JAX port (import commit 173a01f), frozen.
+        from robobase.method.cqn import CQN as OfficialCQN
+        from robobase.method.cqn import (
+            cqn_spec_from_cfg as official_cqn_spec_from_cfg,
+        )
+
+        spec = official_cqn_spec_from_cfg(cfg)
+        return OfficialCQN(
             critic_lr=spec.critic_lr,
             num_train_steps=spec.num_train_steps,
             num_explore_steps=spec.num_explore_steps,
@@ -305,7 +345,7 @@ def create_agent(
 
             cqn_as_cls = CQNDirectQAS
         else:
-            from robobase.method.cqn_as import CQNAS
+            from robobase.method.cqn_as_research import CQNAS
 
             cqn_as_cls = CQNAS
 
@@ -515,6 +555,59 @@ def create_agent(
             platform=platform,
             seed=int(cfg.seed),
             **direct_q_kwargs,
+            **common_kwargs,
+        )
+
+    if method_name == "cqn_as_official":
+        # Pristine official-fidelity JAX port (import commit 173a01f), frozen.
+        from robobase.method.cqn_as import CQNAS as OfficialCQNAS
+        from robobase.method.cqn_as import (
+            cqn_as_spec_from_cfg as official_cqn_as_spec_from_cfg,
+        )
+
+        spec = official_cqn_as_spec_from_cfg(cfg)
+        if int(cfg.execution_length) != 1:
+            raise ValueError("CQN-AS requires execution_length=1.")
+        if int(cfg.get("action_execution_start", 0)) != 0:
+            raise ValueError("CQN-AS requires action_execution_start=0.")
+        if bool(cfg.get("temporal_ensemble", False)):
+            raise ValueError(
+                "CQN-AS rollout control is implemented inside the agent so "
+                "exploration noise is applied after action selection; set the "
+                "root temporal_ensemble=false."
+            )
+        return OfficialCQNAS(
+            critic_lr=spec.critic_lr,
+            num_train_steps=spec.num_train_steps,
+            num_explore_steps=spec.num_explore_steps,
+            critic_target_tau=spec.critic_target_tau,
+            critic_grad_clip=spec.critic_grad_clip,
+            weight_decay=spec.weight_decay,
+            levels=spec.levels,
+            bins=spec.bins,
+            atoms=spec.atoms,
+            v_min=spec.v_min,
+            v_max=spec.v_max,
+            critic_lambda=spec.critic_lambda,
+            centralized_critic=spec.centralized_critic,
+            use_dueling=spec.use_dueling,
+            always_bootstrap=spec.always_bootstrap,
+            stddev_schedule=spec.stddev_schedule,
+            bc_lambda=spec.bc_lambda,
+            bc_margin=spec.bc_margin,
+            use_target_network_for_rollout=spec.use_target_network_for_rollout,
+            num_update_steps=spec.num_update_steps,
+            gru_layers=spec.gru_layers,
+            temporal_ensemble=spec.temporal_ensemble,
+            temporal_ensemble_replan_interval=(
+                spec.temporal_ensemble_replan_interval
+            ),
+            temporal_ensemble_gain=spec.temporal_ensemble_gain,
+            tie_break_delta=spec.tie_break_delta,
+            model=spec.model,
+            jit=jit,
+            platform=platform,
+            seed=int(cfg.seed),
             **common_kwargs,
         )
 

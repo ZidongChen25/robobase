@@ -12,7 +12,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from robobase.method.cqn import return_gated_margin_loss
+from robobase.method.cqn_research import return_gated_margin_loss
 
 
 def _setup(seed=0):

@@ -101,7 +101,7 @@ def main():
     import jax.numpy as jnp
     from omegaconf import OmegaConf
     from robobase.workspace import Workspace
-    from robobase.method.cqn import encode_action, zoom_in
+    from robobase.method.cqn_research import encode_action, zoom_in
 
     cfg = OmegaConf.load(RUNS["armA_seed1"][0] / ".hydra" / "config.yaml")
     OmegaConf.set_struct(cfg, False)

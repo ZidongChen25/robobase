@@ -628,7 +628,7 @@ def _forced_bin_plans(
         return jnp.stack(q_levels), jnp.stack(selected_levels)
 
     def _zoom(low, high, index, target_agent):
-        from robobase.method.cqn import zoom_in
+        from robobase.method.cqn_research import zoom_in
 
         return zoom_in(
             low,
