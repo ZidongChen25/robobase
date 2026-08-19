@@ -56,6 +56,26 @@ def __getattr__(name):
         from robobase.method.q_chunking import QChunking
 
         return QChunking
+    # One-file-per-research-line CQN-AS variants (R2 refactor), each
+    # subclassing the frozen pristine CQNAS.
+    _cqn_as_variants = {
+        "CQNASStructuredExplore": "robobase.method.cqn_as_structured_explore",
+        "CQNASDenseReturn": "robobase.method.cqn_as_dense_return",
+        "CQNASFrozenSupportMask": "robobase.method.cqn_as_fscqn",
+        "CQNASTokenSplit": "robobase.method.cqn_as_token_split",
+        "CQNASMcRct": "robobase.method.cqn_as_mc_rct",
+        "CQNASProgressShaping": "robobase.method.cqn_as_progress_shaping",
+        "CQNASAwr": "robobase.method.cqn_as_awr",
+        "CQNASFlowPolicy": "robobase.method.cqn_as_flow_policy",
+        "CQNASBcPolicy": "robobase.method.cqn_as_bc_policy",
+        "CQNASTwinCritic": "robobase.method.cqn_as_twin_critic",
+        "CQNASTdVariants": "robobase.method.cqn_as_td_variants",
+        "CQNASGuarded": "robobase.method.cqn_as_guards",
+    }
+    if name in _cqn_as_variants:
+        import importlib
+
+        return getattr(importlib.import_module(_cqn_as_variants[name]), name)
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
@@ -65,7 +85,19 @@ __all__ = [
     "BC",
     "CQN",
     "CQNAS",
+    "CQNASAwr",
+    "CQNASBcPolicy",
+    "CQNASDenseReturn",
+    "CQNASFlowPolicy",
+    "CQNASFrozenSupportMask",
+    "CQNASGuarded",
+    "CQNASMcRct",
     "CQNASOfficial",
+    "CQNASProgressShaping",
+    "CQNASStructuredExplore",
+    "CQNASTdVariants",
+    "CQNASTokenSplit",
+    "CQNASTwinCritic",
     "CQNFlowAS",
     "CQNOfficial",
     "Diffusion",

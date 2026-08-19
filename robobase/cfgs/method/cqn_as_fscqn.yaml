@@ -1,0 +1,71 @@
+# @package _global_
+
+# With temporal ensembling CQN-AS replans a K-step chunk every environment step;
+# without it, the agent caches and executes one K-step plan. Rollout control lives
+# inside the agent so noise is applied to the action that is actually executed.
+action_sequence: 4
+execution_length: 1
+temporal_ensemble: false
+
+method:
+  name: cqn_as_fscqn
+  _target_: robobase.method.cqn_as_fscqn.CQNASFrozenSupportMask
+  is_rl: true
+  num_train_steps: ${num_train_frames}
+  num_explore_steps: ${num_explore_steps}
+  critic_lr: 5e-5
+  weight_decay: 0.1
+  critic_target_tau: 0.02
+  critic_grad_clip: null
+  levels: 3
+  bins: 5
+  atoms: 51
+  v_min: -2.0
+  v_max: 2.0
+  critic_lambda: 0.1
+  centralized_critic: false
+  use_dueling: true
+  always_bootstrap: false
+  stddev_schedule: "0.01"
+  bc_lambda: 1.0
+  bc_margin: 0.1
+  use_target_network_for_rollout: true
+  num_update_steps: 1
+
+  # Paper-aligned action-sequence and rollout settings.
+  gru_layers: 1
+  temporal_ensemble: true
+  # 1 matches the paper: infer/register a new chunk every primitive step.
+  temporal_ensemble_replan_interval: 1
+  temporal_ensemble_gain: 0.01
+  tie_break_delta: 1e-4
+
+  # FS-CQN frozen support mask (reports/fscqn_proposal_20260814.md): reuse the
+  # separate-BC bin head as a standalone demo-CE bin-probability model on the
+  # canonical critic path. Per level, decode AND target argmax are restricted
+  # to bins with pi_b >= tau * max pi_b; the head stops training after
+  # freeze_step gradient updates. False preserves the exact legacy graph.
+  use_frozen_support_mask: false
+  # False = target-mask-only (Wave-10 arm A "FS-CQN-TM"): the TD-target argmax
+  # stays masked while rollout decode is unmasked. The 08-15 discriminative
+  # measurement on one collapsed 100k critic scored 5% masked vs 36% unmasked
+  # decode, i.e. a frozen decode mask is active poison on a drifted critic,
+  # while the masked target still protects the value surface.
+  support_mask_decode: true
+  support_mask_tau: 0.3
+  support_mask_freeze_step: 10000
+
+  model:
+    hidden_dims: [512, 512]
+    activation: silu
+
+  encoder_model:
+    type: cqn
+    model: cqn_cnn
+    trainable: true
+    pretrained: false
+    use_plucker: false
+
+  view_fusion_model:
+    type: multicam_feature
+    mode: flatten

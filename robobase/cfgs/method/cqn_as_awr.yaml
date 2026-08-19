@@ -1,0 +1,75 @@
+# @package _global_
+
+# With temporal ensembling CQN-AS replans a K-step chunk every environment step;
+# without it, the agent caches and executes one K-step plan. Rollout control lives
+# inside the agent so noise is applied to the action that is actually executed.
+action_sequence: 4
+execution_length: 1
+temporal_ensemble: false
+
+method:
+  name: cqn_as_awr
+  _target_: robobase.method.cqn_as_awr.CQNASAwr
+  is_rl: true
+  num_train_steps: ${num_train_frames}
+  num_explore_steps: ${num_explore_steps}
+  critic_lr: 5e-5
+  weight_decay: 0.1
+  critic_target_tau: 0.02
+  critic_grad_clip: null
+  levels: 3
+  bins: 5
+  atoms: 51
+  v_min: -2.0
+  v_max: 2.0
+  critic_lambda: 0.1
+  centralized_critic: false
+  use_dueling: true
+  always_bootstrap: false
+  stddev_schedule: "0.01"
+  bc_lambda: 1.0
+  bc_margin: 0.1
+  use_target_network_for_rollout: true
+  num_update_steps: 1
+
+  # Paper-aligned action-sequence and rollout settings.
+  gru_layers: 1
+  temporal_ensemble: true
+  # 1 matches the paper: infer/register a new chunk every primitive step.
+  temporal_ensemble_replan_interval: 1
+  temporal_ensemble_gain: 0.01
+  tie_break_delta: 1e-4
+
+  # Route-(c) support-only improvement (cqn-flow.md 26.2): IQL-style
+  # expectile state value + advantage-weighted BC over demo AND online
+  # transitions. Null disables both (legacy graph and params unchanged).
+  # No counterfactual action is ever queried.
+  #
+  # On the pristine critic the advantage weights replace the demonstration
+  # mask in the critic's own BC terms (FOSD + margin), so awr_beta requires
+  # bc_lambda > 0. In the research monolith the same weights reweight the
+  # separate BC policy head's cross-entropy and awr_beta requires
+  # separate_bc_policy=true instead -- see robobase/method/cqn_as_awr.py.
+  #
+  # The expectile target is the replay element ``mc_return``, which
+  # robobase.workspace._mc_return_anchor_enabled only stores for the mc-rct
+  # line's flags; without it the head regresses towards zeros. The Stage-145
+  # gate works around this by also setting mc_return_weight: 0.1.
+  awr_beta: null
+  awr_weight_max: 10.0
+  awr_expectile_tau: 0.7
+
+  model:
+    hidden_dims: [512, 512]
+    activation: silu
+
+  encoder_model:
+    type: cqn
+    model: cqn_cnn
+    trainable: true
+    pretrained: false
+    use_plucker: false
+
+  view_fusion_model:
+    type: multicam_feature
+    mode: flatten

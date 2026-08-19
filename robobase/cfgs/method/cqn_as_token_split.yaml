@@ -1,0 +1,64 @@
+# @package _global_
+
+# With temporal ensembling CQN-AS replans a K-step chunk every environment step;
+# without it, the agent caches and executes one K-step plan. Rollout control lives
+# inside the agent so noise is applied to the action that is actually executed.
+action_sequence: 4
+execution_length: 1
+temporal_ensemble: false
+
+method:
+  name: cqn_as_token_split
+  _target_: robobase.method.cqn_as_token_split.CQNASTokenSplit
+  is_rl: true
+  num_train_steps: ${num_train_frames}
+  num_explore_steps: ${num_explore_steps}
+  critic_lr: 5e-5
+  weight_decay: 0.1
+  critic_target_tau: 0.02
+  critic_grad_clip: null
+  levels: 3
+  bins: 5
+  atoms: 51
+  v_min: -2.0
+  v_max: 2.0
+  critic_lambda: 0.1
+  centralized_critic: false
+  use_dueling: true
+  always_bootstrap: false
+  stddev_schedule: "0.01"
+  bc_lambda: 1.0
+  bc_margin: 0.1
+  use_target_network_for_rollout: true
+  num_update_steps: 1
+
+  # Paper-aligned action-sequence and rollout settings.
+  gru_layers: 1
+  temporal_ensemble: true
+  # 1 matches the paper: infer/register a new chunk every primitive step.
+  temporal_ensemble_replan_interval: 1
+  temporal_ensemble_gain: 0.01
+  tie_break_delta: 1e-4
+
+  # Per-token horizon split (SEAR-inspired, cqn-rline.md): tokens whose
+  # 1-based chunk index exceeds token_split_boundary regress to the
+  # auxiliary_nstep-horizon backup from the same start state; the rest keep
+  # the 1-step backup. False/null is the exact legacy single-horizon target.
+  # Requires replay.auxiliary_nstep > 1 and the canonical critic-source path.
+  token_split_horizon_targets: false
+  token_split_boundary: null
+
+  model:
+    hidden_dims: [512, 512]
+    activation: silu
+
+  encoder_model:
+    type: cqn
+    model: cqn_cnn
+    trainable: true
+    pretrained: false
+    use_plucker: false
+
+  view_fusion_model:
+    type: multicam_feature
+    mode: flatten

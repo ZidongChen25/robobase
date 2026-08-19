@@ -54,6 +54,21 @@ def cached_feature_observation_key(method_name: str, backend_name: str = "jax") 
         # variants' feature adapter, so they reuse the same cache keys.
         "cqn_official": JAX_CQN_FEATURE_KEY,
         "cqn_as_official": JAX_CQN_AS_FEATURE_KEY,
+        # One-file-per-research-line CQN-AS variants (R2 refactor): all
+        # subclass the pristine CQNAS with an unchanged encoder, so they
+        # share the CQN-AS frozen-feature cache.
+        "cqn_as_structured_explore": JAX_CQN_AS_FEATURE_KEY,
+        "cqn_as_dense_return": JAX_CQN_AS_FEATURE_KEY,
+        "cqn_as_fscqn": JAX_CQN_AS_FEATURE_KEY,
+        "cqn_as_token_split": JAX_CQN_AS_FEATURE_KEY,
+        "cqn_as_mc_rct": JAX_CQN_AS_FEATURE_KEY,
+        "cqn_as_progress_shaping": JAX_CQN_AS_FEATURE_KEY,
+        "cqn_as_awr": JAX_CQN_AS_FEATURE_KEY,
+        "cqn_as_flow_policy": JAX_CQN_AS_FEATURE_KEY,
+        "cqn_as_bc_policy": JAX_CQN_AS_FEATURE_KEY,
+        "cqn_as_twin_critic": JAX_CQN_AS_FEATURE_KEY,
+        "cqn_as_td_variants": JAX_CQN_AS_FEATURE_KEY,
+        "cqn_as_guards": JAX_CQN_AS_FEATURE_KEY,
     }
     try:
         return mapping[method_name]
@@ -191,6 +206,18 @@ def build_vision_feature_cache_plan(
         "q_chunking",
         "djcqn",
         "sac",
+        "cqn_as_structured_explore",
+        "cqn_as_dense_return",
+        "cqn_as_fscqn",
+        "cqn_as_token_split",
+        "cqn_as_mc_rct",
+        "cqn_as_progress_shaping",
+        "cqn_as_awr",
+        "cqn_as_flow_policy",
+        "cqn_as_bc_policy",
+        "cqn_as_twin_critic",
+        "cqn_as_td_variants",
+        "cqn_as_guards",
     }
     if method_name not in supported_methods:
         if cache_setting != "auto":
@@ -317,7 +344,22 @@ def build_vision_feature_cache_plan(
     encoder_seed = int(cfg.get("seed", 0))
 
     cache_method_name = method_name
-    if method_name in {"cqn_flow", "cqn_as_official"}:
+    if method_name in {
+        "cqn_flow",
+        "cqn_as_official",
+        "cqn_as_structured_explore",
+        "cqn_as_dense_return",
+        "cqn_as_fscqn",
+        "cqn_as_token_split",
+        "cqn_as_mc_rct",
+        "cqn_as_progress_shaping",
+        "cqn_as_awr",
+        "cqn_as_flow_policy",
+        "cqn_as_bc_policy",
+        "cqn_as_twin_critic",
+        "cqn_as_td_variants",
+        "cqn_as_guards",
+    }:
         cache_method_name = "cqn_as"
     elif method_name == "cqn_official":
         cache_method_name = "cqn"

@@ -1,0 +1,80 @@
+# @package _global_
+
+# With temporal ensembling CQN-AS replans a K-step chunk every environment step;
+# without it, the agent caches and executes one K-step plan. Rollout control lives
+# inside the agent so noise is applied to the action that is actually executed.
+action_sequence: 4
+execution_length: 1
+temporal_ensemble: false
+
+method:
+  name: cqn_as_guards
+  _target_: robobase.method.cqn_as_guards.CQNASGuarded
+  is_rl: true
+  num_train_steps: ${num_train_frames}
+  num_explore_steps: ${num_explore_steps}
+  critic_lr: 5e-5
+  weight_decay: 0.1
+  critic_target_tau: 0.02
+  critic_grad_clip: null
+  levels: 3
+  bins: 5
+  atoms: 51
+  v_min: -2.0
+  v_max: 2.0
+  critic_lambda: 0.1
+  centralized_critic: false
+  use_dueling: true
+  always_bootstrap: false
+  stddev_schedule: "0.01"
+  bc_lambda: 1.0
+  bc_margin: 0.1
+  use_target_network_for_rollout: true
+  num_update_steps: 1
+
+  # Paper-aligned action-sequence and rollout settings.
+  gru_layers: 1
+  temporal_ensemble: true
+  # 1 matches the paper: infer/register a new chunk every primitive step.
+  temporal_ensemble_replan_interval: 1
+  temporal_ensemble_gain: 0.01
+  tie_break_delta: 1e-4
+
+  # --- guards-schedules line ---------------------------------------------
+  # Non-finite update guard. The update tail computes finiteness flags over
+  # features/logits/targets/grads/updates/params/opt_state and commits the
+  # candidate state through jnp.where, so a bad update is skipped and the
+  # last known-good state survives. It also emits nan_diag/* metrics
+  # including nan_diag/update_committed, which workspace._guard_non_finite_
+  # update reads to abort training and dump forensics instead of training on
+  # poisoned parameters. In the research monolith this is always on; here it
+  # is a flag so that false is bit-exactly the pristine official update.
+  nonfinite_guard: true
+  # BC-anchor diagnostics (cqn-flow.md sec 64): bc_weight, bc_agreement,
+  # bc_binding_rate, bc_margin_gap, bc_sibling_q_span, bc_online_agreement.
+  # Observational only -- they never enter the loss. Unconditional in the
+  # research monolith (deliberately: gating them on bc_lambda>0 made
+  # lambda=0 arms instrument-blind), so keep them on for this line.
+  bc_diagnostics: true
+  # Optional schedule string (e.g. "linear(1.0,0.2,10000)") replacing the
+  # constant bc_lambda for the canonical demo FOSD/margin terms (arm-B
+  # assumption-retirement, cqn-flow.md 32.2). Null keeps legacy constant.
+  bc_lambda_schedule: null
+  # Canonical CQN-AS uses both FOSD and expected-Q large-margin imitation.
+  # Disable only for a margin-matched comparison against scalar flow critics.
+  demo_fosd: true
+
+  model:
+    hidden_dims: [512, 512]
+    activation: silu
+
+  encoder_model:
+    type: cqn
+    model: cqn_cnn
+    trainable: true
+    pretrained: false
+    use_plucker: false
+
+  view_fusion_model:
+    type: multicam_feature
+    mode: flatten

@@ -55,6 +55,34 @@ def method_name_from_cfg(cfg: DictConfig) -> str:
         # ``robobase/method/cqn.py`` / ``cqn_as.py``.
         "robobase.method.cqn.CQN": "cqn_official",
         "robobase.method.cqn_as.CQNAS": "cqn_as_official",
+        # One-file-per-research-line CQN-AS variants (R2 refactor), each
+        # subclassing the frozen pristine CQNAS. See CQN_REFACTOR_PLAN.md.
+        "robobase.method.cqn_as_structured_explore.CQNASStructuredExplore": (
+            "cqn_as_structured_explore"
+        ),
+        "robobase.method.cqn_as_dense_return.CQNASDenseReturn": (
+            "cqn_as_dense_return"
+        ),
+        "robobase.method.cqn_as_fscqn.CQNASFrozenSupportMask": "cqn_as_fscqn",
+        "robobase.method.cqn_as_token_split.CQNASTokenSplit": (
+            "cqn_as_token_split"
+        ),
+        "robobase.method.cqn_as_mc_rct.CQNASMcRct": "cqn_as_mc_rct",
+        "robobase.method.cqn_as_progress_shaping.CQNASProgressShaping": (
+            "cqn_as_progress_shaping"
+        ),
+        "robobase.method.cqn_as_awr.CQNASAwr": "cqn_as_awr",
+        "robobase.method.cqn_as_flow_policy.CQNASFlowPolicy": (
+            "cqn_as_flow_policy"
+        ),
+        "robobase.method.cqn_as_bc_policy.CQNASBcPolicy": "cqn_as_bc_policy",
+        "robobase.method.cqn_as_twin_critic.CQNASTwinCritic": (
+            "cqn_as_twin_critic"
+        ),
+        "robobase.method.cqn_as_td_variants.CQNASTdVariants": (
+            "cqn_as_td_variants"
+        ),
+        "robobase.method.cqn_as_guards.CQNASGuarded": "cqn_as_guards",
         "robobase.method.cqn_flow.CQNFlowAS": "cqn_flow",
         "robobase.method.dreamerv3.DreamerV3": "dreamerv3",
         "robobase.method.drm.DrM": "drm",
@@ -605,6 +633,116 @@ def create_agent(
             temporal_ensemble_gain=spec.temporal_ensemble_gain,
             tie_break_delta=spec.tie_break_delta,
             model=spec.model,
+            jit=jit,
+            platform=platform,
+            seed=int(cfg.seed),
+            **common_kwargs,
+        )
+
+    # One-file-per-research-line CQN-AS variants (R2 refactor). Every variant
+    # subclasses the frozen pristine CQNAS and its spec subclasses CQNASpec,
+    # so the pristine kwargs are derived generically from the CQNASpec fields
+    # and each line's extras are exactly its spec fields beyond CQNASpec,
+    # filtered by the class __init__ signature (composition-only spec fields
+    # such as strict_allow_reward_only_success_replay stay factory-side).
+    cqn_as_variant_registry = {
+        "cqn_as_structured_explore": (
+            "robobase.method.cqn_as_structured_explore",
+            "CQNASStructuredExplore",
+            "cqn_as_structured_explore_spec_from_cfg",
+        ),
+        "cqn_as_dense_return": (
+            "robobase.method.cqn_as_dense_return",
+            "CQNASDenseReturn",
+            "cqn_as_dense_return_spec_from_cfg",
+        ),
+        "cqn_as_fscqn": (
+            "robobase.method.cqn_as_fscqn",
+            "CQNASFrozenSupportMask",
+            "cqn_as_fscqn_spec_from_cfg",
+        ),
+        "cqn_as_token_split": (
+            "robobase.method.cqn_as_token_split",
+            "CQNASTokenSplit",
+            "cqn_as_token_split_spec_from_cfg",
+        ),
+        "cqn_as_mc_rct": (
+            "robobase.method.cqn_as_mc_rct",
+            "CQNASMcRct",
+            "cqn_as_mc_rct_spec_from_cfg",
+        ),
+        "cqn_as_progress_shaping": (
+            "robobase.method.cqn_as_progress_shaping",
+            "CQNASProgressShaping",
+            "cqn_as_progress_shaping_spec_from_cfg",
+        ),
+        "cqn_as_awr": (
+            "robobase.method.cqn_as_awr",
+            "CQNASAwr",
+            "cqn_as_awr_spec_from_cfg",
+        ),
+        "cqn_as_flow_policy": (
+            "robobase.method.cqn_as_flow_policy",
+            "CQNASFlowPolicy",
+            "cqn_as_flow_policy_spec_from_cfg",
+        ),
+        "cqn_as_bc_policy": (
+            "robobase.method.cqn_as_bc_policy",
+            "CQNASBcPolicy",
+            "cqn_as_bc_policy_spec_from_cfg",
+        ),
+        "cqn_as_twin_critic": (
+            "robobase.method.cqn_as_twin_critic",
+            "CQNASTwinCritic",
+            "cqn_as_twin_critic_spec_from_cfg",
+        ),
+        "cqn_as_td_variants": (
+            "robobase.method.cqn_as_td_variants",
+            "CQNASTdVariants",
+            "cqn_as_td_variants_spec_from_cfg",
+        ),
+        "cqn_as_guards": (
+            "robobase.method.cqn_as_guards",
+            "CQNASGuarded",
+            "cqn_as_guards_spec_from_cfg",
+        ),
+    }
+    if method_name in cqn_as_variant_registry:
+        import importlib
+        import inspect
+        from dataclasses import fields as dataclass_fields
+
+        from robobase.method.cqn_as import CQNASpec as PristineCQNASpec
+
+        module_path, class_name, spec_builder_name = cqn_as_variant_registry[
+            method_name
+        ]
+        variant_module = importlib.import_module(module_path)
+        variant_cls = getattr(variant_module, class_name)
+        spec = getattr(variant_module, spec_builder_name)(cfg)
+        if int(cfg.execution_length) != 1:
+            raise ValueError("CQN-AS requires execution_length=1.")
+        if int(cfg.get("action_execution_start", 0)) != 0:
+            raise ValueError("CQN-AS requires action_execution_start=0.")
+        if bool(cfg.get("temporal_ensemble", False)):
+            raise ValueError(
+                "CQN-AS rollout control is implemented inside the agent so "
+                "exploration noise is applied after action selection; set the "
+                "root temporal_ensemble=false."
+            )
+        base_field_names = {
+            field.name for field in dataclass_fields(PristineCQNASpec)
+        }
+        base_kwargs = {name: getattr(spec, name) for name in base_field_names}
+        init_params = inspect.signature(variant_cls.__init__).parameters
+        extra_kwargs = {
+            field.name: getattr(spec, field.name)
+            for field in dataclass_fields(type(spec))
+            if field.name not in base_field_names and field.name in init_params
+        }
+        return variant_cls(
+            **base_kwargs,
+            **extra_kwargs,
             jit=jit,
             platform=platform,
             seed=int(cfg.seed),

@@ -274,6 +274,20 @@ def _validate_rl_action_sequence(cfg: DictConfig) -> None:
         "cqn_flow",
         "q_chunking",
         "djcqn",
+        # One-file-per-research-line CQN-AS variants (R2 refactor); all
+        # subclass the pristine CQNAS and inherit its chunk rollout.
+        "cqn_as_structured_explore",
+        "cqn_as_dense_return",
+        "cqn_as_fscqn",
+        "cqn_as_token_split",
+        "cqn_as_mc_rct",
+        "cqn_as_progress_shaping",
+        "cqn_as_awr",
+        "cqn_as_flow_policy",
+        "cqn_as_bc_policy",
+        "cqn_as_twin_critic",
+        "cqn_as_td_variants",
+        "cqn_as_guards",
     }
     if (
         cfg.method.is_rl
@@ -302,9 +316,8 @@ def _online_updates_ready(
 
 def _mc_return_anchor_enabled(cfg: DictConfig) -> bool:
     method_name = method_name_from_cfg(cfg)
-    return bool(
-        method_name in {"cqn_as", "cqn_flow"}
-        and (
+    if method_name in {"cqn_as", "cqn_flow"}:
+        return bool(
             float(cfg.method.get("mc_return_weight", 0.0)) > 0.0
             or bool(cfg.method.get("mc_lower_bound_target", False))
             or bool(cfg.method.get("episodic_success_q_target", False))
@@ -313,7 +326,34 @@ def _mc_return_anchor_enabled(cfg: DictConfig) -> bool:
                 and float(cfg.method.get("evor_td_lambda", 0.0)) > 0.0
             )
         )
-    )
+    # Per-line variant classes (R2 refactor): each declares its own
+    # mc_return consumers. Kept as separate branches so the research-monolith
+    # gate above stays byte-for-byte unchanged.
+    if method_name == "cqn_as_mc_rct":
+        return bool(
+            float(cfg.method.get("mc_return_weight", 0.0)) > 0.0
+            or bool(cfg.method.get("mc_lower_bound_target", False))
+        )
+    if method_name == "cqn_as_dense_return":
+        return bool(
+            bool(cfg.method.get("episodic_success_q_target", False))
+            or bool(cfg.method.get("dense_return_positive_only", False))
+            or cfg.method.get("return_gated_margin", None) is not None
+        )
+    if method_name == "cqn_as_awr":
+        # The research monolith never stored mc_return for AWR-only configs
+        # (documented trap: the expectile head regressed toward zeros). The
+        # standalone AWR line fixes that for its own method name only.
+        return cfg.method.get("awr_beta", None) is not None
+    if method_name == "cqn_as_twin_critic":
+        # The twin update graph hard-wires the MC lower bound.
+        return bool(cfg.method.get("pessimistic_twin_critic", False))
+    if method_name == "cqn_as_flow_policy":
+        selfdistill = cfg.method.get("coarse_flow_selfdistill_weight", None)
+        return bool(cfg.method.get("coarse_flow", False)) and (
+            selfdistill is not None and float(selfdistill) > 0.0
+        )
+    return False
 
 
 def _progress_label_enabled(cfg: DictConfig) -> bool:
@@ -326,7 +366,7 @@ def _progress_label_enabled(cfg: DictConfig) -> bool:
 
     method_name = method_name_from_cfg(cfg)
     return bool(
-        method_name in {"cqn_as", "cqn_flow"}
+        method_name in {"cqn_as", "cqn_flow", "cqn_as_progress_shaping"}
         and (
             float(cfg.method.get("progress_head_weight", 0.0)) > 0.0
             or float(cfg.method.get("progress_potential_weight", 0.0)) > 0.0
@@ -336,7 +376,8 @@ def _progress_label_enabled(cfg: DictConfig) -> bool:
 
 def _structured_exploration_enabled(cfg: DictConfig) -> bool:
     return (
-        method_name_from_cfg(cfg) in {"cqn_as", "cqn_flow"}
+        method_name_from_cfg(cfg)
+        in {"cqn_as", "cqn_flow", "cqn_as_structured_explore"}
         and float(cfg.method.get("structured_exploration_prob", 0.0)) > 0.0
     )
 

@@ -1,0 +1,117 @@
+# @package _global_
+
+# With temporal ensembling CQN-AS replans a K-step chunk every environment step;
+# without it, the agent caches and executes one K-step plan. Rollout control lives
+# inside the agent so noise is applied to the action that is actually executed.
+action_sequence: 4
+execution_length: 1
+temporal_ensemble: false
+
+method:
+  name: cqn_as_structured_explore
+  _target_: robobase.method.cqn_as_structured_explore.CQNASStructuredExplore
+  is_rl: true
+  num_train_steps: ${num_train_frames}
+  num_explore_steps: ${num_explore_steps}
+  critic_lr: 5e-5
+  weight_decay: 0.1
+  critic_target_tau: 0.02
+  critic_grad_clip: null
+  levels: 3
+  bins: 5
+  atoms: 51
+  v_min: -2.0
+  v_max: 2.0
+  critic_lambda: 0.1
+  centralized_critic: false
+  use_dueling: true
+  always_bootstrap: false
+  stddev_schedule: "0.01"
+  bc_lambda: 1.0
+  bc_margin: 0.1
+  use_target_network_for_rollout: true
+  num_update_steps: 1
+
+  # Paper-aligned action-sequence and rollout settings.
+  gru_layers: 1
+  temporal_ensemble: true
+  # 1 matches the paper: infer/register a new chunk every primitive step.
+  temporal_ensemble_replan_interval: 1
+  temporal_ensemble_gain: 0.01
+  tie_break_delta: 1e-4
+
+  # ---- structured-exploration research line (all defaults = OFF) ----------
+  # After temporal ensembling, optionally perturb one actually executed action
+  # coordinate by one C2F cell width. This creates local online action support
+  # without replacing the full BC plan. Zero preserves legacy rollout RNG.
+  structured_exploration_prob: 0.0
+  structured_exploration_level: 1
+  # Number of consecutive environment decisions that share one sampled
+  # coordinate/direction. Probability is the start probability while inactive.
+  structured_exploration_horizon: 1
+  # Arm-B open-loop bin-space exploration (cqn-flow.md 32.2): per plan
+  # refresh, with this probability move one dimension's level-l bin to a
+  # random sibling cell for the whole chunk (inherit-refine, alias-free).
+  # Requires method.temporal_ensemble=false. Level null = random per flip.
+  bin_flip_prob: 0.0
+  bin_flip_level: null
+  # Stage-153 hierarchical epsilon-bin exploration (cqn-flow.md 35): one
+  # probability per level (coarsest first, intended increasing with depth);
+  # a fired flip persists across the next K fresh plans so the temporal
+  # ensemble actually reaches the sibling cell. Works WITH the closed-loop
+  # ensemble (unlike bin_flip_prob). null = legacy.
+  bin_explore_probs: null
+  # Stage-162: optional multiplier schedule on every level's activation
+  # probability, e.g. linear(1.0,0.0,100000) anneals exploration to zero.
+  bin_explore_schedule: null
+  # Plans a fired flip persists across (null = action_sequence; with a
+  # sparser replan interval j, set to window_steps / j).
+  bin_explore_persist_plans: null
+  # Stage-160 random low-dim observation mask: during updates (never at
+  # act()), zero each low-dim frame except its last keep_last dims with
+  # this per-sample probability, forcing visual reliance. Pair with
+  # env.append_floating_base_to_low_dim=true so the kept tail is the
+  # floating-base state. 0.0 = legacy.
+  low_dim_mask_prob: 0.0
+  low_dim_mask_keep_last: 0
+  # Diagnostic, eval only. Replace the critic bin choice with a uniform
+  # draw at this C2F level and every level below it. null = off.
+  # Measures what the critic's per-level ordering is worth on task
+  # success: the powered sibling probe (08-04) found sign accuracy
+  # 0.571 / 0.521 / 0.491 at levels 0/1/2 (0.50 = chance) while
+  # realized regret stayed 0.125 / 0.086 / 0.052, i.e. the fine
+  # levels carry return the critic does not rank.
+  random_levels_from: null
+  # random = uniform draw at/below random_levels_from; middle = the parent
+  # cell's centre bin, i.e. what deleting those levels would emit.
+  level_override_mode: random
+  # Eval-only post-ensemble resolution probe: keep the executed action's
+  # true C2F prefix of this many levels and randomize the rest. null = off.
+  post_ensemble_random_keep_levels: null
+  # Constant (rather than iid) leaf inside the kept parent cell. null =
+  # iid random leaf.
+  post_ensemble_fixed_leaf: null
+  # Train-time exploration applied AFTER temporal ensembling: with prob p per
+  # step (per env), pick ONE action dimension, force ONE alternative L1 bin
+  # inside the current L0 cell (L2 center) and hold it for `horizon` steps.
+  # Post-ensemble placement bypasses the ~15x plan-averaging attenuation;
+  # single-dimension flips keep the return contrast attributable; the flipped
+  # action is executed AND stored, so TD grounds the flipped bin. 0 = off.
+  post_ensemble_l1_flip_prob: 0.0
+  post_ensemble_l2_flip_prob: 0.0
+  post_ensemble_l1_flip_horizon: 4
+
+  model:
+    hidden_dims: [512, 512]
+    activation: silu
+
+  encoder_model:
+    type: cqn
+    model: cqn_cnn
+    trainable: true
+    pretrained: false
+    use_plucker: false
+
+  view_fusion_model:
+    type: multicam_feature
+    mode: flatten

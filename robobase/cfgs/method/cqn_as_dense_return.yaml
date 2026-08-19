@@ -1,0 +1,127 @@
+# @package _global_
+
+# With temporal ensembling CQN-AS replans a K-step chunk every environment step;
+# without it, the agent caches and executes one K-step plan. Rollout control lives
+# inside the agent so noise is applied to the action that is actually executed.
+action_sequence: 4
+execution_length: 1
+temporal_ensemble: false
+
+method:
+  name: cqn_as_dense_return
+  _target_: robobase.method.cqn_as_dense_return.CQNASDenseReturn
+  is_rl: true
+  num_train_steps: ${num_train_frames}
+  num_explore_steps: ${num_explore_steps}
+  critic_lr: 5e-5
+  weight_decay: 0.1
+  critic_target_tau: 0.02
+  critic_grad_clip: null
+  levels: 3
+  bins: 5
+  atoms: 51
+  v_min: -2.0
+  v_max: 2.0
+  critic_lambda: 0.1
+  centralized_critic: false
+  use_dueling: true
+  always_bootstrap: false
+  stddev_schedule: "0.01"
+  bc_lambda: 1.0
+  bc_margin: 0.1
+  use_target_network_for_rollout: true
+  num_update_steps: 1
+
+  # Paper-aligned action-sequence and rollout settings.
+  gru_layers: 1
+  temporal_ensemble: true
+  # 1 matches the paper: infer/register a new chunk every primitive step.
+  temporal_ensemble_replan_interval: 1
+  temporal_ensemble_gain: 0.01
+  tie_break_delta: 1e-4
+
+  # ---- dense-return line (the no-BC research line's return machinery) ----
+  # Audit guard for demo-driven RL experiments with no imitation path. When
+  # true, config composition rejects BC/FOSD/margin, policy/flow heads,
+  # self-imitation, and behavior-policy TD targets. Reward-only offline
+  # critic updates through num_pretrain_steps are allowed: they are offline
+  # RL, not actor or behavior-cloning pretraining.
+  strict_demo_rl_only: false
+  # The official CQN-AS launch copies successful online trajectories into the
+  # protected replay.  This switch lets a strict no-imitation configuration
+  # preserve that replay-only behavior.  It never enables an action-label
+  # objective; the strict guard still requires every BC/policy loss to be off.
+  strict_allow_reward_only_success_replay: false
+  # Single dense distributional-Q objective: the replayed bin gets its
+  # reward/Bellman target and all unseen bins get the task-minimum return.
+  dense_return_q_target: false
+  # Apply the all-bin dense target only to transitions from completed
+  # positive-return trajectories. Zero-return transitions use canonical
+  # chosen-action C51 TD, avoiding unsupported negative counterfactuals.
+  # The gate reads reward-to-go only and never demo identity.
+  dense_return_positive_only: false
+  # Regress only the expected return of that same dense target instead of its
+  # full C51 shape. This remains one Q loss; false preserves categorical C51.
+  dense_return_expected_q_loss: false
+  # Baird advantage-learning coefficient inside that same categorical Q
+  # target. Zero is exact legacy C51; [0, 1) devalues each bin by its
+  # stop-gradient disadvantage without adding an auxiliary or imitation loss.
+  dense_return_advantage_alpha: 0.0
+  # Optional clipped-AL ratio: only near-greedy bins above this
+  # support-relative value ratio receive the advantage shift. Null is the
+  # constant advantage-learning operator.
+  dense_return_advantage_clip_ratio: null
+  # Positive affine reward/Q scale inside the Bellman and MC targets. One is
+  # the exact legacy objective; scaling must fit the configured C51 support.
+  q_reward_scale: 1.0
+  dense_return_label_smoothing: 0.0
+  dense_return_floor_satisfaction_margin: null
+  dense_return_relative_floor_margin: null
+  return_gated_margin: null
+  return_gated_margin_weight: 0.0
+  # Optional local-Q kernel inside that same dense target. Immediate neighbor
+  # bins at only the finest C2F level receive this convex weight of the
+  # replayed return distribution; zero preserves the exact dense target.
+  dense_return_finest_neighbor_weight: 0.0
+  # Binary episodic Monte-Carlo control for sparse success tasks. The replayed
+  # bin gets 1 iff its completed trajectory succeeds and 0 otherwise; dense
+  # unseen bins remain 0. This replaces, rather than augments, Bellman/MC
+  # lower-bound targets and never reads demo identity.
+  episodic_success_q_target: false
+  # Convexly lift a positive discounted return toward the completed success
+  # bit before using it as the MC lower-bound target. Zero is canonical; a
+  # positive value is one single ordered reward target, not an auxiliary loss.
+  # COUPLING: its only consumer is mc_lower_bound_target (mc-rct line), which
+  # this variant does not implement, so a positive value is rejected here.
+  ordered_success_return_mix: 0.0
+  # Optional exact future-token return alignment for a sparse terminal reward:
+  # token k receives min(G_t / discount^k, 1) inside the same MC/Bellman
+  # categorical target. Null preserves scalar G_t broadcasting.
+  # COUPLING: same mc_lower_bound_target dependency as above; non-null is
+  # rejected by this variant.
+  sequence_aligned_mc_discount: null
+  # Q-Transformer-style conservative RL term. The replayed action bin is
+  # excluded and remains Bellman/return-only; every other bin is regressed to
+  # the task's valid minimum return. Zero weight preserves canonical CQN-AS.
+  unseen_return_floor_weight: 0.0
+  unseen_return_floor_value: 0.0
+  # mean reproduces the Stage-1 average conservative penalty. max trains the
+  # single largest unseen competitor per head to the same reward floor.
+  unseen_return_floor_reduction: mean
+  # Used only by topk reduction; must be smaller than method.bins.
+  unseen_return_floor_topk: 1
+
+  model:
+    hidden_dims: [512, 512]
+    activation: silu
+
+  encoder_model:
+    type: cqn
+    model: cqn_cnn
+    trainable: true
+    pretrained: false
+    use_plucker: false
+
+  view_fusion_model:
+    type: multicam_feature
+    mode: flatten

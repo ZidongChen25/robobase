@@ -1,0 +1,92 @@
+# @package _global_
+
+# With temporal ensembling CQN-AS replans a K-step chunk every environment step;
+# without it, the agent caches and executes one K-step plan. Rollout control lives
+# inside the agent so noise is applied to the action that is actually executed.
+action_sequence: 4
+execution_length: 1
+temporal_ensemble: false
+
+method:
+  name: cqn_as_mc_rct
+  _target_: robobase.method.cqn_as_mc_rct.CQNASMcRct
+  is_rl: true
+  num_train_steps: ${num_train_frames}
+  num_explore_steps: ${num_explore_steps}
+  critic_lr: 5e-5
+  weight_decay: 0.1
+  critic_target_tau: 0.02
+  critic_grad_clip: null
+  levels: 3
+  bins: 5
+  atoms: 51
+  v_min: -2.0
+  v_max: 2.0
+  critic_lambda: 0.1
+  centralized_critic: false
+  use_dueling: true
+  always_bootstrap: false
+  stddev_schedule: "0.01"
+  bc_lambda: 1.0
+  bc_margin: 0.1
+  use_target_network_for_rollout: true
+  num_update_steps: 1
+
+  # Paper-aligned action-sequence and rollout settings.
+  gru_layers: 1
+  temporal_ensemble: true
+  # 1 matches the paper: infer/register a new chunk every primitive step.
+  temporal_ensemble_replan_interval: 1
+  temporal_ensemble_gain: 0.01
+  tie_break_delta: 1e-4
+
+  model:
+    hidden_dims: [512, 512]
+    activation: silu
+
+  encoder_model:
+    type: cqn
+    model: cqn_cnn
+    trainable: true
+    pretrained: false
+    use_plucker: false
+
+  view_fusion_model:
+    type: multicam_feature
+    mode: flatten
+
+  # --- mc-rct research line ------------------------------------------------
+  # Auxiliary C51 cross-entropy to the completed-episode discounted return of
+  # the executed action. Zero preserves the legacy replay/update contract.
+  mc_return_weight: 0.0
+  # Replace a lower Bellman target with the completed-episode Monte-Carlo
+  # return for the same executed action. This is one Q-learning target (the
+  # Q-Transformer lower bound), not an auxiliary imitation or policy loss.
+  mc_lower_bound_target: false
+  # Let the MC loss train the critic head while protecting the policy-trained
+  # visual representation. TD and BC retain their existing encoder gradients.
+  mc_return_stop_gradient_encoder: false
+  # Calibrate Q through the dueling value stream while stop-gradient preserving
+  # the current action's advantage logits. This removes the direct MC gradient
+  # to advantage parameters; atom-softmax and encoder coupling can still change
+  # expected-Q ranking and must be measured by the causal probe.
+  mc_return_value_only: false
+  # Optional replay-only action-centered causal advantage moment. It uses the
+  # known propensity of one-step structured interventions and completed return
+  # to orthogonalize state-only outcome difficulty. Direct scalar-Q only.
+  # NOT IMPLEMENTED on this class: the only implementation lives in
+  # robobase/method/cqn_direct_q.py (direct-scalar-Q line) and additionally
+  # needs structured_exploration_prob. A non-zero value raises at construction.
+  causal_rct_weight: 0.0
+  causal_rct_level: null
+  # Stage-141 control-variate-adjusted causal RCT for the decoupled C51 path.
+  # Null disables the block entirely (legacy graph). 0.0 runs the identical
+  # graph with a zero-weighted loss, giving an exactly matched control arm.
+  # The outcome is adjusted by the target-critic Q of the pre-treatment
+  # action, which cuts outcome variance 10-15x (cqn-flow.md section 22).
+  # NOT IMPLEMENTED on this class: it requires separate_bc_policy (bc-policy
+  # line) plus a randomized structured exploration policy (structured-
+  # exploration line). Any non-null value raises at construction.
+  cv_rct_weight: null
+  cv_rct_level: null
+  cv_rct_baseline: target_q

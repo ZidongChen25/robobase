@@ -1,0 +1,93 @@
+# @package _global_
+
+# With temporal ensembling CQN-AS replans a K-step chunk every environment step;
+# without it, the agent caches and executes one K-step plan. Rollout control lives
+# inside the agent so noise is applied to the action that is actually executed.
+action_sequence: 4
+execution_length: 1
+temporal_ensemble: false
+
+method:
+  name: cqn_as_flow_policy
+  _target_: robobase.method.cqn_as_flow_policy.CQNASFlowPolicy
+  is_rl: true
+  num_train_steps: ${num_train_frames}
+  num_explore_steps: ${num_explore_steps}
+  critic_lr: 5e-5
+  weight_decay: 0.1
+  critic_target_tau: 0.02
+  critic_grad_clip: null
+  levels: 3
+  bins: 5
+  atoms: 51
+  v_min: -2.0
+  v_max: 2.0
+  critic_lambda: 0.1
+  centralized_critic: false
+  use_dueling: true
+  always_bootstrap: false
+  stddev_schedule: "0.01"
+  bc_lambda: 1.0
+  bc_margin: 0.1
+  use_target_network_for_rollout: true
+  num_update_steps: 1
+
+  # Paper-aligned action-sequence and rollout settings.
+  gru_layers: 1
+  temporal_ensemble: true
+  # 1 matches the paper: infer/register a new chunk every primitive step.
+  temporal_ensemble_replan_interval: 1
+  temporal_ensemble_gain: 0.01
+  tie_break_delta: 1e-4
+
+  # ---- flow-policy line (R2) ------------------------------------------
+  # flow+CQN line (cqn-flow.md 29): behavior-side conditional flow proposes
+  # demonstration-style chunks; the calibrated critic reranks M candidates
+  # at rollout. False keeps legacy params/graph untouched.
+  # NOTE: the research implementation requires separate_bc_policy=true, which
+  # lives in the bc-policy variant; this class raises if it is switched on.
+  flow_policy: false
+  flow_policy_candidates: 8
+  flow_policy_steps: 8
+  flow_policy_lambda: 1.0
+  # EMA weights for rollout sampling (null = use online weights).
+  flow_policy_ema: null
+  # Capacity overrides for the flow head only (null = inherit model/gru).
+  flow_policy_hidden_dims: null
+  flow_policy_gru_layers: null
+  # Stage-152 coarse-flow (cqn-flow.md 34): canonical critic keeps the bin
+  # decision at the coarse resolution where sibling bins have data support
+  # (TD counterfactuals identifiable); a bin-conditioned flow head models
+  # the continuous within-cell residual. Intended with levels: 1. Reuses
+  # flow_policy_steps/lambda/ema/hidden_dims/gru_layers. False = legacy.
+  coarse_flow: false
+  # Stage-155 no-selection control: flow models the full action chunk with
+  # no bin conditioning and the critic never touches rollout actions.
+  # (CCFF - pure) isolates the coarse selection mechanism.
+  coarse_flow_pure: false
+  # Optional weighted self-distillation of high-return online chunks into
+  # the flow (requires mc_return_weight > 0 so mc_returns are real; inert
+  # otherwise because mc_returns default to zeros < threshold).
+  coarse_flow_selfdistill_weight: null
+  coarse_flow_selfdistill_threshold: 0.5
+  # Null keeps the independent BC policy as rollout behavior. A finite beta
+  # evaluates normalized direct-C51 Q + beta * BC log-probability on the same
+  # checkpoint, enabling a paired action-facing control for CQN-Flow.
+  # NOTE: requires separate_bc_policy=true (bc-policy variant); this class
+  # raises if it is switched on.
+  policy_value_beta: null
+
+  model:
+    hidden_dims: [512, 512]
+    activation: silu
+
+  encoder_model:
+    type: cqn
+    model: cqn_cnn
+    trainable: true
+    pretrained: false
+    use_plucker: false
+
+  view_fusion_model:
+    type: multicam_feature
+    mode: flatten

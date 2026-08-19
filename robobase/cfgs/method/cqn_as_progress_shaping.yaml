@@ -1,0 +1,78 @@
+# @package _global_
+
+# With temporal ensembling CQN-AS replans a K-step chunk every environment step;
+# without it, the agent caches and executes one K-step plan. Rollout control lives
+# inside the agent so noise is applied to the action that is actually executed.
+action_sequence: 4
+execution_length: 1
+temporal_ensemble: false
+
+method:
+  name: cqn_as_progress_shaping
+  _target_: robobase.method.cqn_as_progress_shaping.CQNASProgressShaping
+  is_rl: true
+  num_train_steps: ${num_train_frames}
+  num_explore_steps: ${num_explore_steps}
+  critic_lr: 5e-5
+  weight_decay: 0.1
+  critic_target_tau: 0.02
+  critic_grad_clip: null
+  levels: 3
+  bins: 5
+  atoms: 51
+  v_min: -2.0
+  v_max: 2.0
+  critic_lambda: 0.1
+  centralized_critic: false
+  use_dueling: true
+  always_bootstrap: false
+  stddev_schedule: "0.01"
+  bc_lambda: 1.0
+  bc_margin: 0.1
+  use_target_network_for_rollout: true
+  num_update_steps: 1
+
+  # Paper-aligned action-sequence and rollout settings.
+  gru_layers: 1
+  temporal_ensemble: true
+  # 1 matches the paper: infer/register a new chunk every primitive step.
+  temporal_ensemble_replan_interval: 1
+  temporal_ensemble_gain: 0.01
+  tie_break_delta: 1e-4
+
+  # Progress-potential shaping (reports/progress_shaping_impl_20260818.md).
+  # Ng-form potential F = lambda * (gamma * bootstrap * Phi(s') - Phi(s)) added
+  # to the reward scalar inside the C51 target ONLY -- replay rewards and
+  # mc_returns stay raw. Phi is an auxiliary state-only expectile head trained
+  # to regress the raw per-transition progress label (t+1)/T stored in replay.
+  # Zero weight + zero head weight is the exact legacy graph and param tree.
+  progress_potential_weight: 0.0
+  # Optional schedule string ("linear(0.25,0.0,50000)") replacing the constant
+  # lambda. Annealing is the recommended answer to the nonstationary-Phi
+  # invariance break (Devlin-Kudenko 2012 licenses online Phi training).
+  progress_potential_schedule: null
+  # Loss weight on the auxiliary progress head. It reads stop-gradient encoder
+  # features only and never queries an action, so it cannot leak counterfactual
+  # action claims. Zero disables the loss (but the head is still created when
+  # progress_potential_weight > 0).
+  progress_head_weight: 0.0
+  progress_expectile_tau: 0.9
+  # Regress only transitions whose episode actually succeeded (or is a genuine
+  # demo by raw reward sum). Failed-episode time indices are censored, not
+  # taught as progress.
+  progress_success_gated: true
+
+  model:
+    hidden_dims: [512, 512]
+    activation: silu
+
+  encoder_model:
+    type: cqn
+    model: cqn_cnn
+    trainable: true
+    pretrained: false
+    use_plucker: false
+
+  view_fusion_model:
+    type: multicam_feature
+    mode: flatten
