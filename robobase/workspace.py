@@ -288,6 +288,7 @@ def _validate_rl_action_sequence(cfg: DictConfig) -> None:
         "cqn_as_twin_critic",
         "cqn_as_td_variants",
         "cqn_as_guards",
+        "cqn_as_latent_consequence",
     }
     if (
         cfg.method.is_rl
@@ -2037,6 +2038,11 @@ class Workspace:
             backend_observations = {
                 k: np.expand_dims(v, axis=0) for k, v in observations.items()
             }
+        set_rollout_env = getattr(self.agent, "set_rollout_env", None)
+        if callable(set_rollout_env):
+            # Exact-successor diagnostics need simulator state aligned to the
+            # observation passed into act(). Other methods have no hook.
+            set_rollout_env(env)
         action = self.agent.act(
             backend_observations, self.main_loop_iterations, eval_mode=eval_mode
         )

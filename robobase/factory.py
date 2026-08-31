@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+import copy
 from typing import Any
 
-from omegaconf import DictConfig
+from omegaconf import DictConfig, open_dict
 
 from robobase.method.act import act_spec_from_cfg
 from robobase.method.bc import bc_spec_from_cfg
@@ -51,6 +52,9 @@ def method_name_from_cfg(cfg: DictConfig) -> str:
         "robobase.method.alix.ALIX": "alix",
         "robobase.method.cqn_research.CQN": "cqn",
         "robobase.method.cqn_as_research.CQNAS": "cqn_as",
+        "robobase.method.cqn_as_latent_consequence.CQNASLatentConsequence": (
+            "cqn_as_latent_consequence"
+        ),
         # The pristine official-fidelity JAX port kept frozen in
         # ``robobase/method/cqn.py`` / ``cqn_as.py``.
         "robobase.method.cqn.CQN": "cqn_official",
@@ -365,6 +369,96 @@ def create_agent(
             platform=platform,
             seed=int(cfg.seed),
             **common_kwargs,
+        )
+
+    if method_name == "cqn_as_latent_consequence":
+        from robobase.method.cqn_as_latent_consequence import (
+            CQNASLatentConsequence,
+        )
+
+        # Build canonical research CQN-AS first. The auxiliary model owns
+        # disjoint parameters, optimizer state, and RNG.
+        base_cfg = copy.deepcopy(cfg)
+        with open_dict(base_cfg.method):
+            base_cfg.method.name = "cqn_as"
+            base_cfg.method._target_ = "robobase.method.cqn_as_research.CQNAS"
+        base_agent = create_agent(
+            base_cfg,
+            observation_space=observation_space,
+            action_space=action_space,
+            intrinsic_reward_module=intrinsic_reward_module,
+        )
+        return CQNASLatentConsequence(
+            base_agent,
+            seed=int(cfg.seed),
+            discount=float(cfg.get("discount", 0.99)),
+            hidden_dims=tuple(
+                int(value)
+                for value in cfg.method.get(
+                    "latent_consequence_hidden_dims", [512, 512]
+                )
+            ),
+            ensemble_size=int(
+                cfg.method.get("latent_consequence_ensemble_size", 5)
+            ),
+            model_lr=float(
+                cfg.method.get("latent_consequence_model_lr", 3e-4)
+            ),
+            model_weight_decay=float(
+                cfg.method.get("latent_consequence_model_weight_decay", 1e-4)
+            ),
+            bootstrap_probability=float(
+                cfg.method.get(
+                    "latent_consequence_bootstrap_probability", 0.8
+                )
+            ),
+            latent_loss_weight=float(
+                cfg.method.get("latent_consequence_latent_loss_weight", 1.0)
+            ),
+            reward_loss_weight=float(
+                cfg.method.get("latent_consequence_reward_loss_weight", 1.0)
+            ),
+            done_loss_weight=float(
+                cfg.method.get("latent_consequence_done_loss_weight", 0.25)
+            ),
+            positive_weight=float(
+                cfg.method.get("latent_consequence_positive_weight", 256.0)
+            ),
+            huber_delta=float(
+                cfg.method.get("latent_consequence_huber_delta", 1.0)
+            ),
+            minimum_model_updates=int(
+                cfg.method.get("latent_consequence_minimum_model_updates", 500)
+            ),
+            proposal_level=int(
+                cfg.method.get("latent_consequence_proposal_level", 1)
+            ),
+            dimension_selection=str(
+                cfg.method.get("latent_consequence_dimension_selection", "q_span")
+            ),
+            uncertainty_beta=float(
+                cfg.method.get("latent_consequence_uncertainty_beta", 0.0)
+            ),
+            switch_margin=float(
+                cfg.method.get("latent_consequence_switch_margin", 1e-5)
+            ),
+            maximum_score_std=float(
+                cfg.method.get("latent_consequence_maximum_score_std", 1.0)
+            ),
+            maximum_failure_probability=float(
+                cfg.method.get(
+                    "latent_consequence_maximum_failure_probability", 0.5
+                )
+            ),
+            rerank_interval=int(
+                cfg.method.get("latent_consequence_rerank_interval", 16)
+            ),
+            rerank_train=bool(
+                cfg.method.get("latent_consequence_rerank_train", False)
+            ),
+            rerank_eval=bool(
+                cfg.method.get("latent_consequence_rerank_eval", True)
+            ),
         )
 
     if method_name == "cqn_as":

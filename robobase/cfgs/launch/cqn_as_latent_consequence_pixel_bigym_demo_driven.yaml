@@ -1,0 +1,65 @@
+# @package _global_
+
+# Matched RGB BiGym K=16 CQN-AS run with a separately trained one-step latent
+# consequence model.  Collection and CQN TD/BC are unchanged in Stage 7.
+defaults:
+  - ../env: null
+  - ../method: cqn_as_latent_consequence
+  - _self_
+
+seed: 1
+demos: !!float .inf
+num_pretrain_steps: 0
+num_explore_steps: 0
+num_train_frames: 101000
+num_eval_episodes: 25
+eval_every_steps: 2500
+batch_size: 256
+demo_batch_size: 256
+replay_size_before_train: 500
+save_snapshot: true
+artifacts:
+  resume_keep_last: 2
+  save_eval_checkpoints: true
+  # Stage 7 stops first at 25k and may resume to 101k only after its gate.
+  delete_replay_on_train_complete: false
+  delete_resume_on_train_complete: false
+
+pixels: true
+visual_observation_shape: [84, 84]
+frame_stack: 4
+action_repeat: 1
+action_sequence: 16
+execution_length: 1
+temporal_ensemble: false
+
+is_imitation_learning: false
+use_min_max_normalization: true
+use_standardization: false
+min_max_margin: 0.0
+norm_obs: true
+use_self_imitation: true
+update_every_steps: 1
+
+replay:
+  nstep: 1
+  size: 1000000
+  demo_size: 1000000
+  compression: zip
+  demo_cache_dir: ./exp_local/_shared_demo_replay
+  num_workers: 0
+  action_padding: edge
+  action_sequence_start_offset: 0
+  include_tp1: true
+
+lazy_replay:
+  use: false
+
+method:
+  v_min: -2.0
+  v_max: 2.0
+  use_target_network_for_rollout: true
+
+hydra:
+  run:
+    dir: ./exp_local/pixel_cqn_as_latent_consequence/bigym_${env.task_name}_${now:%Y%m%d%H%M%S}

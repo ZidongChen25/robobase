@@ -1,0 +1,36 @@
+# @package _global_
+
+# Canonical CQN-AS plus an independently optimized one-step RGB-latent model.
+# The model never backpropagates into the encoder/critic.  The registered first
+# stage changes evaluation action selection only, every 16 decisions.
+defaults:
+  - cqn_as
+  - _self_
+
+method:
+  name: cqn_as_latent_consequence
+  _target_: robobase.method.cqn_as_latent_consequence.CQNASLatentConsequence
+
+  latent_consequence_hidden_dims: [512, 512]
+  latent_consequence_ensemble_size: 5
+  latent_consequence_model_lr: 3e-4
+  latent_consequence_model_weight_decay: 1e-4
+  latent_consequence_bootstrap_probability: 0.8
+  latent_consequence_latent_loss_weight: 1.0
+  latent_consequence_reward_loss_weight: 1.0
+  latent_consequence_done_loss_weight: 0.25
+  latent_consequence_positive_weight: 256.0
+  latent_consequence_huber_delta: 1.0
+  latent_consequence_minimum_model_updates: 500
+
+  # Matches the exact H=1 oracle gate: five plans (direct plus the other four
+  # bins of one level-1, first-step coordinate) and sparse intervention.
+  latent_consequence_proposal_level: 1
+  latent_consequence_dimension_selection: q_span
+  latent_consequence_uncertainty_beta: 0.0
+  latent_consequence_switch_margin: 1e-5
+  latent_consequence_maximum_score_std: 1.0
+  latent_consequence_maximum_failure_probability: 0.5
+  latent_consequence_rerank_interval: 16
+  latent_consequence_rerank_train: false
+  latent_consequence_rerank_eval: true
