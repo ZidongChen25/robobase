@@ -39,8 +39,8 @@ mapfile -t free_gpu_rows < <(
       if ($3 < 2000 && $4 < 20) print $1 " " $2;
     }'
 )
-if [[ ${#free_gpu_rows[@]} -lt 6 ]]; then
-  echo "need six training-free GPUs; found ${#free_gpu_rows[@]}" >&2
+if [[ ${#free_gpu_rows[@]} -lt 1 ]]; then
+  echo "need at least one training-free GPU; found none" >&2
   nvidia-smi \
     --query-gpu=index,uuid,memory.used,memory.total,utilization.gpu \
     --format=csv,noheader >&2
@@ -59,43 +59,52 @@ snapshots=(
 )
 
 : > "$output_dir/pids.tsv"
-pids=()
-for job_index in "${!selectors[@]}"; do
-  read -r egl_index gpu_uuid <<< "${free_gpu_rows[$job_index]}"
-  selector=${selectors[$job_index]}
-  seed=${seeds[$job_index]}
-  job_name="seed${seed}_${snapshot_step}_${selector}"
-  job_output="$output_dir/${job_name}.json"
-  job_log="$output_dir/${job_name}.log"
-  job_workspace="$output_dir/${job_name}_workspace"
-
-  (
-    cd "$repo_root"
-    exec "$robobase_python" \
-      scripts/eval_cqn_as_latent_consequence_control.py \
-      --run-dir "${run_dirs[$job_index]}" \
-      --snapshot "${snapshots[$job_index]}" \
-      --selector "$selector" \
-      --num-eval-episodes 50 \
-      --eval-seed-start 400 \
-      --gpu-id "$gpu_uuid" \
-      --egl-device-id "$egl_index" \
-      --work-dir "$job_workspace" \
-      --output "$job_output"
-  ) > "$job_log" 2>&1 &
-  pid=$!
-  pids+=("$pid")
-  printf '%s\t%s\t%s\t%s\t%s\n' \
-    "$pid" "$job_name" "$egl_index" "$gpu_uuid" "$job_output" \
-    >> "$output_dir/pids.tsv"
-  sleep 20
-done
-
 failed=0
-for pid in "${pids[@]}"; do
-  if ! wait "$pid"; then
-    failed=1
-  fi
+next_job=0
+while [[ $next_job -lt ${#selectors[@]} ]]; do
+  batch_pids=()
+  for gpu_row in "${free_gpu_rows[@]}"; do
+    if [[ $next_job -ge ${#selectors[@]} ]]; then
+      break
+    fi
+    read -r egl_index gpu_uuid <<< "$gpu_row"
+    selector=${selectors[$next_job]}
+    seed=${seeds[$next_job]}
+    job_name="seed${seed}_${snapshot_step}_${selector}"
+    job_output="$output_dir/${job_name}.json"
+    job_log="$output_dir/${job_name}.log"
+    job_workspace="$output_dir/${job_name}_workspace"
+
+    (
+      cd "$repo_root"
+      exec "$robobase_python" \
+        scripts/eval_cqn_as_latent_consequence_control.py \
+        --run-dir "${run_dirs[$next_job]}" \
+        --snapshot "${snapshots[$next_job]}" \
+        --selector "$selector" \
+        --num-eval-episodes 50 \
+        --eval-seed-start 400 \
+        --gpu-id "$gpu_uuid" \
+        --egl-device-id "$egl_index" \
+        --work-dir "$job_workspace" \
+        --output "$job_output"
+    ) > "$job_log" 2>&1 &
+    pid=$!
+    batch_pids+=("$pid")
+    printf '%s\t%s\t%s\t%s\t%s\n' \
+      "$pid" "$job_name" "$egl_index" "$gpu_uuid" "$job_output" \
+      >> "$output_dir/pids.tsv"
+    next_job=$((next_job + 1))
+    sleep 20
+  done
+
+  # If fewer than six cards were idle at launch, wait for this batch before
+  # reusing only those same verified cards. Never co-locate two evals.
+  for pid in "${batch_pids[@]}"; do
+    if ! wait "$pid"; then
+      failed=1
+    fi
+  done
 done
 
 if [[ $failed -ne 0 ]]; then
