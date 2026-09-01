@@ -127,6 +127,22 @@ def test_factory_registers_rgb_k16_latent_consequence():
     assert agent.rerank_eval is True
 
 
+def test_bigym_launch_freezes_official_observation_contract():
+    """Do not silently compare the floating-base variant to official CQN-AS."""
+    GlobalHydra.instance().clear()
+    with initialize_config_dir(config_dir=CONFIG_DIR, version_base=None):
+        cfg = compose(
+            config_name="robobase_config",
+            overrides=[
+                "launch=cqn_as_latent_consequence_pixel_bigym_demo_driven",
+                "env=bigym/sandwich_remove",
+            ],
+        )
+
+    assert cfg.env.append_floating_base_to_low_dim is False
+    assert cfg.env.obs_std_floor_relative == 0.0
+
+
 def test_model_uses_only_the_executed_first_action_and_keeps_base_update_exact():
     _, wrapped = _agent("cqn_as_latent_consequence")
     _, plain = _agent("cqn_as")

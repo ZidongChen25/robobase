@@ -33,6 +33,14 @@ action_sequence: 16
 execution_length: 1
 temporal_ensemble: false
 
+# Freeze the observation contract to the completed official CQN-AS baseline.
+# The repository-wide BiGym defaults have since moved to the floating-base
+# variant, which is a different observation space and cannot be used for a
+# matched consequence-model comparison.
+env:
+  append_floating_base_to_low_dim: false
+  obs_std_floor_relative: 0.0
+
 is_imitation_learning: false
 use_min_max_normalization: true
 use_standardization: false
