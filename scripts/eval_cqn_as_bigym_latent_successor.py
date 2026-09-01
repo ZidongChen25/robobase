@@ -40,8 +40,16 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--max-branch-steps", type=int, default=600)
     parser.add_argument(
+        "--terminal-first-success",
+        action="store_true",
+        help=(
+            "stop terminal branching once direct or the first sibling has a "
+            "positive realized return; preserves binary-success feasibility"
+        ),
+    )
+    parser.add_argument(
         "--dimension-selection",
-        choices=("q_span", "round_robin"),
+        choices=("q_span", "round_robin", "all"),
         default="q_span",
     )
     return parser.parse_args()
@@ -136,6 +144,7 @@ def run(args: argparse.Namespace) -> dict:
             rerank_interval=int(args.rerank_interval),
             policy_to_terminal=bool(args.policy_to_terminal),
             max_branch_steps=int(args.max_branch_steps),
+            terminal_first_success=bool(args.terminal_first_success),
         )
         workspace.agent = wrapper
         metrics = workspace.eval()
@@ -168,6 +177,7 @@ def run(args: argparse.Namespace) -> dict:
         "horizon": int(args.horizon),
         "policy_to_terminal": bool(args.policy_to_terminal),
         "max_branch_steps": int(args.max_branch_steps),
+        "terminal_first_success": bool(args.terminal_first_success),
         "proposal_level": int(args.proposal_level),
         "dimension_selection": str(args.dimension_selection),
         "switch_margin": float(args.switch_margin),

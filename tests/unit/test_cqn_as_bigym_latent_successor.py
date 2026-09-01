@@ -7,6 +7,7 @@ import robobase.method.cqn_as_bigym_latent_successor as successor_module
 from robobase.method.cqn_as_bigym_latent_successor import (
     CQNASBigymGroundTruthLatentSuccessor,
     _capture_agent_rollout_state,
+    _direct_plus_all_dimension_bins,
     _direct_plus_other_bins,
     _restore_agent_rollout_state,
     _safe_candidate_choice,
@@ -52,6 +53,7 @@ def test_policy_to_terminal_branches_use_frozen_cqn_continuation(monkeypatch):
     wrapper.horizon = 1
     wrapper.policy_to_terminal = True
     wrapper.max_branch_steps = 5
+    wrapper.terminal_first_success = False
     wrapper._branch_steps = 0
 
     monkeypatch.setattr(
@@ -85,6 +87,72 @@ def test_policy_to_terminal_branches_use_frozen_cqn_continuation(monkeypatch):
     np.testing.assert_array_equal(done, [1.0, 1.0])
     assert agent.calls == 4
     assert wrapper._branch_steps == 6
+
+
+def test_policy_to_terminal_can_stop_at_first_realized_success(monkeypatch):
+    class FakeEnv:
+        def __init__(self):
+            self.action = 0.0
+
+        def step(self, action):
+            self.action = float(np.asarray(action)[0, 0])
+            return (
+                {"state": np.asarray([self.action], dtype=np.float32)},
+                float(self.action > 0.5),
+                True,
+                False,
+                {},
+            )
+
+    wrapper = object.__new__(CQNASBigymGroundTruthLatentSuccessor)
+    wrapper.base = SimpleNamespace()
+    wrapper._rollout_env = FakeEnv()
+    wrapper.discount = 0.9
+    wrapper.horizon = 1
+    wrapper.policy_to_terminal = True
+    wrapper.max_branch_steps = 5
+    wrapper.terminal_first_success = True
+    wrapper._branch_steps = 0
+    monkeypatch.setattr(successor_module, "restore_bigym_branch_state", lambda *_: None)
+    monkeypatch.setattr(successor_module, "_restore_agent_rollout_state", lambda *_: None)
+    monkeypatch.setattr(
+        successor_module,
+        "_register_candidate",
+        lambda _agent, candidate: np.asarray(candidate, dtype=np.float32),
+    )
+    candidates = np.asarray([[[0.0]], [[1.0]], [[-1.0]]], dtype=np.float32)
+
+    observations, returns, _, done = wrapper._branch_candidates(
+        candidates,
+        env_state=None,
+        agent_state={},
+    )
+
+    assert len(observations) == 2
+    np.testing.assert_allclose(returns, [0.0, 1.0])
+    np.testing.assert_array_equal(done, [1.0, 1.0])
+    assert wrapper._branch_steps == 2
+
+
+def test_direct_plus_all_dimension_bins_drops_one_nearest_plan_per_dimension():
+    direct = np.zeros((2, 2), dtype=np.float32)
+    direct[0] = [0.1, -0.1]
+    siblings = np.zeros((6, 2, 2), dtype=np.float32)
+    dimensions = np.repeat(np.arange(2), 3)
+    siblings[:3, 0, 0] = [-0.8, 0.0, 0.8]
+    siblings[3:, 0, 1] = [-0.8, 0.0, 0.8]
+
+    candidates, dropped = _direct_plus_all_dimension_bins(
+        direct,
+        siblings,
+        dimensions,
+    )
+
+    assert candidates.shape == (5, 2, 2)
+    np.testing.assert_array_equal(candidates[0], direct)
+    np.testing.assert_array_equal(dropped, [1, 4])
+    np.testing.assert_allclose(candidates[1:3, 0, 0], [-0.8, 0.8])
+    np.testing.assert_allclose(candidates[3:, 0, 1], [-0.8, 0.8])
 
 
 def test_policy_to_terminal_scores_realized_return_without_calling_critic():

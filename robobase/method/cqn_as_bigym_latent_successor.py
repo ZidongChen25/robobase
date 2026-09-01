@@ -111,6 +111,50 @@ def _direct_plus_other_bins(
     return candidates.astype(np.float32, copy=False), nearest
 
 
+def _direct_plus_all_dimension_bins(
+    direct_plan: np.ndarray,
+    forced_bin_plans: np.ndarray,
+    action_dimensions: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Retain every non-direct forced bin for every first-action dimension."""
+
+    direct = np.asarray(direct_plan, dtype=np.float32)
+    siblings = np.asarray(forced_bin_plans, dtype=np.float32)
+    dimensions = np.asarray(action_dimensions, dtype=np.int32).reshape(-1)
+    if siblings.ndim != 3 or direct.shape != siblings.shape[1:]:
+        raise ValueError("direct and forced-bin plans have incompatible shapes.")
+    if len(dimensions) != len(siblings):
+        raise ValueError("each forced-bin plan requires one action dimension.")
+
+    retained: list[np.ndarray] = []
+    dropped: list[int] = []
+    counts = []
+    for coordinate in range(direct.shape[-1]):
+        rows = np.flatnonzero(dimensions == coordinate)
+        if not rows.size:
+            raise ValueError("all action dimensions must have forced-bin plans.")
+        counts.append(len(rows))
+        nearest_local = int(
+            np.argmin(
+                np.abs(
+                    siblings[rows, 0, coordinate] - direct[0, coordinate]
+                )
+            )
+        )
+        dropped.append(int(rows[nearest_local]))
+        retained.extend(siblings[row] for row in np.delete(rows, nearest_local))
+    if len(set(counts)) != 1:
+        raise ValueError("every action dimension must use the same bin count.")
+    candidates = np.concatenate(
+        [direct[None], np.stack(retained, axis=0)],
+        axis=0,
+    )
+    return (
+        candidates.astype(np.float32, copy=False),
+        np.asarray(dropped, dtype=np.int32),
+    )
+
+
 def _safe_candidate_choice(
     scores: np.ndarray,
     returns: np.ndarray,
@@ -199,6 +243,7 @@ class CQNASBigymGroundTruthLatentSuccessor:
         rerank_interval: int = 16,
         policy_to_terminal: bool = False,
         max_branch_steps: int = 600,
+        terminal_first_success: bool = False,
     ):
         if not base_agent.use_pixels:
             raise ValueError("Ground-truth latent successor requires an RGB agent.")
@@ -212,7 +257,7 @@ class CQNASBigymGroundTruthLatentSuccessor:
             raise ValueError("horizon must lie in [1, action_sequence].")
         if not 0 <= int(proposal_level) < int(base_agent.levels):
             raise ValueError("proposal_level must lie in [0, levels).")
-        if dimension_selection not in {"q_span", "round_robin"}:
+        if dimension_selection not in {"q_span", "round_robin", "all"}:
             raise ValueError("unknown dimension-selection mode.")
         if int(rerank_interval) < 1:
             raise ValueError("rerank_interval must be positive.")
@@ -228,6 +273,11 @@ class CQNASBigymGroundTruthLatentSuccessor:
         self.rerank_interval = int(rerank_interval)
         self.policy_to_terminal = bool(policy_to_terminal)
         self.max_branch_steps = int(max_branch_steps)
+        self.terminal_first_success = bool(terminal_first_success)
+        if self.terminal_first_success and not self.policy_to_terminal:
+            raise ValueError(
+                "terminal_first_success requires policy_to_terminal."
+            )
         self._rollout_env = None
         self._episode_decisions = 0
         self._policy_calls = 0
@@ -346,12 +396,30 @@ class CQNASBigymGroundTruthLatentSuccessor:
                 critic_params, features, low, high, proposal_level
             )
             current_q = proposal_q[0, 0]
-            if dimension_selection == "q_span":
+            if dimension_selection == "all":
+                action_dimension = jnp.repeat(
+                    jnp.arange(base.action_dim, dtype=jnp.int32),
+                    base.bins,
+                )
+                forced_bin = jnp.tile(
+                    jnp.arange(base.bins, dtype=jnp.int32),
+                    base.action_dim,
+                )
+                predicted_q = current_q
+            elif dimension_selection == "q_span":
                 action_dimension = jnp.argmax(jnp.ptp(current_q, axis=-1))
+                forced_bin = jnp.arange(base.bins, dtype=jnp.int32)
+                predicted_q = current_q[action_dimension]
             else:
                 action_dimension = jnp.mod(call_index, base.action_dim)
+                forced_bin = jnp.arange(base.bins, dtype=jnp.int32)
+                predicted_q = current_q[action_dimension]
 
-            count = base.bins
+            count = (
+                base.bins * base.action_dim
+                if dimension_selection == "all"
+                else base.bins
+            )
             repeated_features = jnp.repeat(features, count, axis=0)
             candidate_low = jnp.repeat(low, count, axis=0)
             candidate_high = jnp.repeat(high, count, axis=0)
@@ -365,9 +433,12 @@ class CQNASBigymGroundTruthLatentSuccessor:
                 )
                 index = jnp.argmax(q_values, axis=-1)
                 if level == proposal_level:
-                    index = index.at[:, 0, action_dimension].set(
-                        jnp.arange(count, dtype=index.dtype)
-                    )
+                    if dimension_selection == "all":
+                        index = index.at[
+                            jnp.arange(count), 0, action_dimension
+                        ].set(forced_bin)
+                    else:
+                        index = index.at[:, 0, action_dimension].set(forced_bin)
                 candidate_low, candidate_high = zoom_in(
                     candidate_low,
                     candidate_high,
@@ -379,7 +450,7 @@ class CQNASBigymGroundTruthLatentSuccessor:
             plans = (0.5 * (candidate_low + candidate_high)).reshape(
                 (count, base.action_sequence, base.action_dim)
             )
-            return plans, action_dimension, current_q[action_dimension]
+            return plans, action_dimension, predicted_q
 
         return candidate_fn
 
@@ -422,7 +493,12 @@ class CQNASBigymGroundTruthLatentSuccessor:
         self,
         observation: dict[str, np.ndarray],
         direct_plan: np.ndarray,
-    ) -> tuple[np.ndarray, int, int, np.ndarray]:
+    ) -> tuple[
+        np.ndarray,
+        int | np.ndarray,
+        int | np.ndarray,
+        np.ndarray,
+    ]:
         obs_inputs = self.base._prepare_rl_obs_inputs(
             {name: value[None] for name, value in observation.items()}
         )
@@ -434,12 +510,20 @@ class CQNASBigymGroundTruthLatentSuccessor:
         )
         self.base._block(siblings, action_dimension, predicted_q)
         siblings = np.asarray(jax.device_get(siblings), dtype=np.float32)
-        action_dimension = int(np.asarray(jax.device_get(action_dimension)))
-        candidates, dropped_bin = _direct_plus_other_bins(
-            direct_plan,
-            siblings,
-            action_dimension=action_dimension,
-        )
+        action_dimension = np.asarray(jax.device_get(action_dimension))
+        if action_dimension.ndim == 0:
+            action_dimension = int(action_dimension)
+            candidates, dropped_bin = _direct_plus_other_bins(
+                direct_plan,
+                siblings,
+                action_dimension=action_dimension,
+            )
+        else:
+            candidates, dropped_bin = _direct_plus_all_dimension_bins(
+                direct_plan,
+                siblings,
+                action_dimension,
+            )
         return (
             candidates,
             action_dimension,
@@ -515,6 +599,12 @@ class CQNASBigymGroundTruthLatentSuccessor:
             bootstrap_discounts.append(discount)
             done_values.append(float(done))
             self._branch_steps += steps
+            if (
+                self.policy_to_terminal
+                and self.terminal_first_success
+                and total_return > 0.0
+            ):
+                break
         return (
             final_observations,
             np.asarray(returns, dtype=np.float32),
@@ -667,7 +757,7 @@ class CQNASBigymGroundTruthLatentSuccessor:
         self._latent_span_max = max(self._latent_span_max, latent_span)
         self._margin_sum += max(margin, 0.0)
         self._margin_max = max(self._margin_max, max(margin, 0.0))
-        self._candidate_count += len(candidates)
+        self._candidate_count += len(returns)
         self._rewarding_candidates += int(np.sum(returns > 0.0))
         self._terminal_candidates += int(np.sum(done > 0.5))
         self._invalid_candidates += int(np.sum(invalid))
@@ -724,6 +814,9 @@ class CQNASBigymGroundTruthLatentSuccessor:
                     self._selected_invalid_siblings / calls
                 ),
                 "gt_latent_policy_to_terminal": float(self.policy_to_terminal),
+                "gt_latent_terminal_first_success": float(
+                    self.terminal_first_success
+                ),
                 "gt_latent_direct_success_call_rate": (
                     self._direct_success_calls / calls
                 ),
@@ -744,6 +837,7 @@ class CQNASBigymGroundTruthLatentSuccessor:
 __all__ = [
     "CQNASBigymGroundTruthLatentSuccessor",
     "_capture_agent_rollout_state",
+    "_direct_plus_all_dimension_bins",
     "_direct_plus_other_bins",
     "_restore_agent_rollout_state",
     "_safe_candidate_choice",
