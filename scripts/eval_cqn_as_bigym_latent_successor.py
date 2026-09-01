@@ -48,6 +48,11 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--verify-selected-branch",
+        action="store_true",
+        help="replay each selected terminal branch and fail on outcome drift",
+    )
+    parser.add_argument(
         "--dimension-selection",
         choices=("q_span", "round_robin", "all"),
         default="q_span",
@@ -145,6 +150,7 @@ def run(args: argparse.Namespace) -> dict:
             policy_to_terminal=bool(args.policy_to_terminal),
             max_branch_steps=int(args.max_branch_steps),
             terminal_first_success=bool(args.terminal_first_success),
+            verify_selected_branch=bool(args.verify_selected_branch),
         )
         workspace.agent = wrapper
         metrics = workspace.eval()
@@ -178,6 +184,7 @@ def run(args: argparse.Namespace) -> dict:
         "policy_to_terminal": bool(args.policy_to_terminal),
         "max_branch_steps": int(args.max_branch_steps),
         "terminal_first_success": bool(args.terminal_first_success),
+        "verify_selected_branch": bool(args.verify_selected_branch),
         "proposal_level": int(args.proposal_level),
         "dimension_selection": str(args.dimension_selection),
         "switch_margin": float(args.switch_margin),

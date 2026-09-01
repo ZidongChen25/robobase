@@ -244,6 +244,7 @@ class CQNASBigymGroundTruthLatentSuccessor:
         policy_to_terminal: bool = False,
         max_branch_steps: int = 600,
         terminal_first_success: bool = False,
+        verify_selected_branch: bool = False,
     ):
         if not base_agent.use_pixels:
             raise ValueError("Ground-truth latent successor requires an RGB agent.")
@@ -274,9 +275,14 @@ class CQNASBigymGroundTruthLatentSuccessor:
         self.policy_to_terminal = bool(policy_to_terminal)
         self.max_branch_steps = int(max_branch_steps)
         self.terminal_first_success = bool(terminal_first_success)
+        self.verify_selected_branch = bool(verify_selected_branch)
         if self.terminal_first_success and not self.policy_to_terminal:
             raise ValueError(
                 "terminal_first_success requires policy_to_terminal."
+            )
+        if self.verify_selected_branch and not self.policy_to_terminal:
+            raise ValueError(
+                "verify_selected_branch requires policy_to_terminal."
             )
         self._rollout_env = None
         self._episode_decisions = 0
@@ -305,6 +311,8 @@ class CQNASBigymGroundTruthLatentSuccessor:
         self._sibling_success_calls = 0
         self._rescue_available_calls = 0
         self._all_candidate_failure_calls = 0
+        self._selected_success_calls = 0
+        self._verified_selected_branches = 0
 
         # These functions run at every control step.  Build/JIT them once here;
         # the sparse-anchor counterfactual script intentionally constructs its
@@ -770,6 +778,39 @@ class CQNASBigymGroundTruthLatentSuccessor:
         self._sibling_success_calls += int(sibling_success)
         self._rescue_available_calls += int((not direct_success) and sibling_success)
         self._all_candidate_failure_calls += int(not np.any(returns > 0.0))
+        self._selected_success_calls += int(returns[choice] > 0.0)
+
+        if self.verify_selected_branch:
+            try:
+                _, replay_returns, _, replay_done = self._branch_candidates(
+                    candidates[choice : choice + 1],
+                    env_state,
+                    agent_state,
+                    policy_step=int(step),
+                )
+            finally:
+                restore_bigym_branch_state(self._rollout_env, env_state)
+                _restore_agent_rollout_state(self.base, agent_state)
+            expected_return = float(returns[choice])
+            replay_return = float(replay_returns[0])
+            expected_done = bool(done[choice] > 0.5)
+            replay_is_done = bool(replay_done[0] > 0.5)
+            self._verified_selected_branches += 1
+            if (
+                not np.isclose(
+                    expected_return,
+                    replay_return,
+                    rtol=0.0,
+                    atol=1e-7,
+                )
+                or expected_done != replay_is_done
+            ):
+                raise RuntimeError(
+                    "Selected ground-truth branch was not reproducible from "
+                    "the same snapshot: "
+                    f"return {expected_return} -> {replay_return}, "
+                    f"done {expected_done} -> {replay_is_done}."
+                )
 
         selected = _register_candidate(self.base, candidates[choice])
         return selected[None]
@@ -828,6 +869,12 @@ class CQNASBigymGroundTruthLatentSuccessor:
                 ),
                 "gt_latent_all_candidate_failure_call_rate": (
                     self._all_candidate_failure_calls / calls
+                ),
+                "gt_latent_selected_success_call_rate": (
+                    self._selected_success_calls / calls
+                ),
+                "gt_latent_verified_selected_branches": float(
+                    self._verified_selected_branches
                 ),
             }
         )
