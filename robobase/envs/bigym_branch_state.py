@@ -11,8 +11,8 @@ import copy
 from dataclasses import dataclass
 from typing import Any
 
+import mujoco
 import numpy as np
-
 
 _PHYSICS_ARRAYS = (
     "ctrl",
@@ -54,6 +54,7 @@ class BiGymBranchState:
     """State needed to restart deterministic rollouts in the same env."""
 
     physics_state: np.ndarray
+    integration_state: np.ndarray | None
     physics_time: float
     physics_arrays: dict[str, np.ndarray]
     model_arrays: dict[str, np.ndarray]
@@ -62,6 +63,7 @@ class BiGymBranchState:
     floating_base_last_action: np.ndarray
     wrapper_types: tuple[str, ...]
     wrapper_values: tuple[dict[str, Any], ...]
+    env_health_values: dict[str, Any]
     numpy_random_state: tuple[Any, ...]
 
 
@@ -98,6 +100,22 @@ def capture_bigym_branch_state(env) -> BiGymBranchState:
         raise TypeError("capture_bigym_branch_state requires a BiGym environment")
 
     data = raw_env.mojo.data
+    integration_state = None
+    try:
+        state_spec = mujoco.mjtState.mjSTATE_INTEGRATION
+        integration_state = np.empty(
+            mujoco.mj_stateSize(raw_env.mojo.model, state_spec),
+            dtype=np.float64,
+        )
+        mujoco.mj_getState(
+            raw_env.mojo.model,
+            data,
+            integration_state,
+            state_spec,
+        )
+    except TypeError:
+        # Lightweight unit-test fakes are not native MjModel/MjData objects.
+        integration_state = None
     # get_state() is intentionally compact and excludes controls, applied
     # forces, mocap/equality inputs, and the solver warm start.
     physics_arrays = {
@@ -120,8 +138,10 @@ def capture_bigym_branch_state(env) -> BiGymBranchState:
         for wrapper in wrappers
     )
     floating_base = raw_env.robot.floating_base
+    env_health = getattr(raw_env, "_env_health", None)
     return BiGymBranchState(
         physics_state=raw_env.mojo.physics.get_state().copy(),
+        integration_state=integration_state,
         physics_time=float(data.time),
         physics_arrays=physics_arrays,
         model_arrays=model_arrays,
@@ -132,6 +152,16 @@ def capture_bigym_branch_state(env) -> BiGymBranchState:
         floating_base_last_action=np.asarray(floating_base._last_action).copy(),
         wrapper_types=tuple(type(wrapper).__qualname__ for wrapper in wrappers),
         wrapper_values=wrapper_values,
+        env_health_values=(
+            {
+                "_current_error": getattr(env_health, "_current_error", None),
+                "_consecutive_errors": list(
+                    getattr(env_health, "_consecutive_errors", [])
+                ),
+            }
+            if env_health is not None
+            else {}
+        ),
         numpy_random_state=copy.deepcopy(np.random.get_state()),
     )
 
@@ -148,16 +178,34 @@ def restore_bigym_branch_state(env, state: BiGymBranchState) -> None:
         )
 
     raw_env = env.unwrapped
-    raw_env.mojo.physics.set_state(state.physics_state)
-    raw_env.mojo.data.time = state.physics_time
     for name, value in state.model_arrays.items():
         getattr(raw_env.mojo.model, name)[...] = value
+    if state.integration_state is None:
+        raw_env.mojo.physics.set_state(state.physics_state)
+        raw_env.mojo.data.time = state.physics_time
+    else:
+        mujoco.mj_setState(
+            raw_env.mojo.model,
+            raw_env.mojo.data,
+            state.integration_state,
+            mujoco.mjtState.mjSTATE_INTEGRATION,
+        )
     # Restore mocap/equality inputs before forward so derived kinematics match
     # the branch point. dm_control's forward callbacks can rewrite actuator
     # controls, so reapply every external integration input afterwards too.
     for name, value in state.physics_arrays.items():
         getattr(raw_env.mojo.data, name)[...] = value
     raw_env.mojo.physics.forward()
+    if state.integration_state is not None:
+        # ``forward`` recomputes derived quantities but may rewrite warm-start
+        # and control inputs.  Restore the complete integration vector again;
+        # qpos/qvel are unchanged, so the derived geometry remains valid.
+        mujoco.mj_setState(
+            raw_env.mojo.model,
+            raw_env.mojo.data,
+            state.integration_state,
+            mujoco.mjtState.mjSTATE_INTEGRATION,
+        )
     for name, value in state.physics_arrays.items():
         getattr(raw_env.mojo.data, name)[...] = value
     # BiGym assigns ``self._action = action`` and can therefore alias the
@@ -177,4 +225,8 @@ def restore_bigym_branch_state(env, state: BiGymBranchState) -> None:
 
     # Cached reward/success predicates refer to the abandoned branch.
     raw_env._step_cache.clean()
+    env_health = getattr(raw_env, "_env_health", None)
+    if env_health is not None:
+        for name, value in state.env_health_values.items():
+            setattr(env_health, name, list(value) if isinstance(value, list) else value)
     np.random.set_state(copy.deepcopy(state.numpy_random_state))

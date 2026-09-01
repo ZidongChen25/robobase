@@ -57,6 +57,10 @@ class _RawEnv:
         self.robot = SimpleNamespace(floating_base=floating_base)
         self._action = np.array([7.0])
         self._step_cache = _StepCache()
+        self._env_health = SimpleNamespace(
+            _current_error=None,
+            _consecutive_errors=[],
+        )
 
     @property
     def unwrapped(self):
@@ -84,6 +88,8 @@ def test_restore_does_not_mutate_abandoned_candidate_alias():
     raw.mojo.data.qpos[...] = -1
     raw.mojo.data.ctrl[...] = -2
     raw.robot.floating_base._last_action[...] = -3
+    raw._env_health._current_error = RuntimeError("branch error")
+    raw._env_health._consecutive_errors.append(RuntimeError("branch error"))
     env._elapsed_steps = 100
     env.frames["state"][...] = -4
 
@@ -95,6 +101,8 @@ def test_restore_does_not_mutate_abandoned_candidate_alias():
     np.testing.assert_array_equal(raw.mojo.data.qpos, [1.0, 2.0])
     np.testing.assert_array_equal(raw.mojo.data.ctrl, [3.0])
     np.testing.assert_array_equal(raw.robot.floating_base._last_action, [6.0])
+    assert raw._env_health._current_error is None
+    assert raw._env_health._consecutive_errors == []
     assert env._elapsed_steps == 8
     np.testing.assert_array_equal(env.frames["state"], [[9.0]])
     assert raw._step_cache.cleaned
