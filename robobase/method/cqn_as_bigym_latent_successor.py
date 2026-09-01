@@ -12,6 +12,12 @@ No MuJoCo state is passed to the critic.  The simulator is used only to replace
 the learned map ``(z_t, a_t:t+h) -> z_t+h`` with a ground-truth latent target.
 It is therefore a causal headroom test for a later deployable latent predictor,
 not a method that can run on a real robot.
+
+An optional, strictly diagnostic ``policy_to_terminal`` mode replaces the
+target-critic continuation value by the exact discounted outcome obtained
+after the candidate's first action and a frozen base-CQN continuation.  This is
+an upper bound for learning an intervention-return critic; it is not used by
+the deployable Stage-7 predictor.
 """
 
 from __future__ import annotations
@@ -28,7 +34,6 @@ from robobase.envs.bigym_branch_state import (
     capture_bigym_branch_state,
     restore_bigym_branch_state,
 )
-
 
 _ROLLOUT_STATE_ATTRIBUTES = (
     "rng_key",
@@ -51,7 +56,7 @@ def _capture_agent_rollout_state(agent) -> dict[str, Any]:
         else:
             try:
                 state[name] = np.asarray(value).copy()
-            except Exception:
+            except Exception:  # noqa: BLE001 - rollout state may be opaque
                 state[name] = copy.deepcopy(value)
     return state
 
@@ -192,6 +197,8 @@ class CQNASBigymGroundTruthLatentSuccessor:
         switch_margin: float = 1e-5,
         dimension_selection: str = "q_span",
         rerank_interval: int = 16,
+        policy_to_terminal: bool = False,
+        max_branch_steps: int = 600,
     ):
         if not base_agent.use_pixels:
             raise ValueError("Ground-truth latent successor requires an RGB agent.")
@@ -209,6 +216,8 @@ class CQNASBigymGroundTruthLatentSuccessor:
             raise ValueError("unknown dimension-selection mode.")
         if int(rerank_interval) < 1:
             raise ValueError("rerank_interval must be positive.")
+        if int(max_branch_steps) < 1:
+            raise ValueError("max_branch_steps must be positive.")
 
         self.base = base_agent
         self.discount = float(discount)
@@ -217,6 +226,8 @@ class CQNASBigymGroundTruthLatentSuccessor:
         self.switch_margin = float(switch_margin)
         self.dimension_selection = str(dimension_selection)
         self.rerank_interval = int(rerank_interval)
+        self.policy_to_terminal = bool(policy_to_terminal)
+        self.max_branch_steps = int(max_branch_steps)
         self._rollout_env = None
         self._episode_decisions = 0
         self._policy_calls = 0
@@ -240,6 +251,10 @@ class CQNASBigymGroundTruthLatentSuccessor:
         self._unmasked_invalid_wins = 0
         self._all_invalid_calls = 0
         self._selected_invalid_siblings = 0
+        self._direct_success_calls = 0
+        self._sibling_success_calls = 0
+        self._rescue_available_calls = 0
+        self._all_candidate_failure_calls = 0
 
         # These functions run at every control step.  Build/JIT them once here;
         # the sparse-anchor counterfactual script intentionally constructs its
@@ -437,6 +452,7 @@ class CQNASBigymGroundTruthLatentSuccessor:
         candidates: np.ndarray,
         env_state,
         agent_state: dict[str, Any],
+        policy_step: int = 0,
     ) -> tuple[list[dict[str, np.ndarray]], np.ndarray, np.ndarray, np.ndarray]:
         if self._rollout_env is None:
             raise RuntimeError("Ground-truth latent successor has no rollout env.")
@@ -453,8 +469,29 @@ class CQNASBigymGroundTruthLatentSuccessor:
             done = False
             observation = None
             steps = 0
-            for horizon_index in range(self.horizon):
-                if horizon_index > 0:
+            branch_horizon = (
+                self.max_branch_steps if self.policy_to_terminal else self.horizon
+            )
+            for horizon_index in range(branch_horizon):
+                if horizon_index > 0 and self.policy_to_terminal:
+                    batched_observation = {
+                        name: np.asarray(value)[None]
+                        for name, value in observation.items()
+                    }
+                    continuation = np.asarray(
+                        self.base.act(
+                            batched_observation,
+                            int(policy_step) + horizon_index,
+                            eval_mode=True,
+                        ),
+                        dtype=np.float32,
+                    )
+                    if continuation.shape[0] != 1:
+                        raise ValueError(
+                            "Ground-truth continuation requires eval batch size 1."
+                        )
+                    action_chunk = continuation[0]
+                elif horizon_index > 0:
                     action_chunk = _advance_committed_plan(self.base)
                 observation, reward, terminated, truncated, _ = self._rollout_env.step(
                     action_chunk
@@ -465,6 +502,10 @@ class CQNASBigymGroundTruthLatentSuccessor:
                 done = bool(terminated or truncated)
                 if done:
                     break
+            if self.policy_to_terminal and not done:
+                # A branch that did not terminate inside the conservative cap
+                # is not a known success and must never beat the direct action.
+                done = True
             if observation is None:
                 raise RuntimeError("Ground-truth branch executed zero steps.")
             final_observations.append(
@@ -519,6 +560,32 @@ class CQNASBigymGroundTruthLatentSuccessor:
             np.asarray(jax.device_get(features), dtype=np.float32),
         )
 
+    def _score_candidates(
+        self,
+        final_observations: list[dict[str, np.ndarray]],
+        returns: np.ndarray,
+        bootstrap_discounts: np.ndarray,
+        done: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        if self.policy_to_terminal:
+            if not np.all(np.asarray(done) > 0.5):
+                raise RuntimeError(
+                    "Terminal-return oracle left a branch unterminated."
+                )
+            # This diagnostic is deliberately independent of Q/V.  Calling the
+            # critic and multiplying its output by zero would be mathematically
+            # equivalent for finite values, but would no longer be a clean test
+            # of whether the continuation-value estimate is the bottleneck.
+            return np.asarray(returns, dtype=np.float32).copy(), np.zeros(
+                (len(final_observations), 1), dtype=np.float32
+            )
+        return self._score_ground_truth_latents(
+            final_observations,
+            returns,
+            bootstrap_discounts,
+            done,
+        )
+
     def act(self, observations: dict, step: int, eval_mode: bool):
         if not eval_mode:
             raise ValueError("Ground-truth latent successor is evaluation-only.")
@@ -543,9 +610,14 @@ class CQNASBigymGroundTruthLatentSuccessor:
         started = time.perf_counter()
         try:
             final_observations, returns, bootstrap_discounts, done = (
-                self._branch_candidates(candidates, env_state, agent_state)
+                self._branch_candidates(
+                    candidates,
+                    env_state,
+                    agent_state,
+                    policy_step=int(step),
+                )
             )
-            scores, features = self._score_ground_truth_latents(
+            scores, features = self._score_candidates(
                 final_observations,
                 returns,
                 bootstrap_discounts,
@@ -602,6 +674,12 @@ class CQNASBigymGroundTruthLatentSuccessor:
         self._unmasked_invalid_wins += int(selection["unmasked_invalid_win"])
         self._all_invalid_calls += int(selection["all_invalid"])
         self._selected_invalid_siblings += int(choice != 0 and invalid[choice])
+        direct_success = bool(returns[0] > 0.0)
+        sibling_success = bool(np.any(returns[1:] > 0.0))
+        self._direct_success_calls += int(direct_success)
+        self._sibling_success_calls += int(sibling_success)
+        self._rescue_available_calls += int((not direct_success) and sibling_success)
+        self._all_candidate_failure_calls += int(not np.any(returns > 0.0))
 
         selected = _register_candidate(self.base, candidates[choice])
         return selected[None]
@@ -644,6 +722,19 @@ class CQNASBigymGroundTruthLatentSuccessor:
                 "gt_latent_all_invalid_call_rate": self._all_invalid_calls / calls,
                 "gt_latent_selected_invalid_sibling_rate": (
                     self._selected_invalid_siblings / calls
+                ),
+                "gt_latent_policy_to_terminal": float(self.policy_to_terminal),
+                "gt_latent_direct_success_call_rate": (
+                    self._direct_success_calls / calls
+                ),
+                "gt_latent_sibling_success_call_rate": (
+                    self._sibling_success_calls / calls
+                ),
+                "gt_latent_rescue_available_call_rate": (
+                    self._rescue_available_calls / calls
+                ),
+                "gt_latent_all_candidate_failure_call_rate": (
+                    self._all_candidate_failure_calls / calls
                 ),
             }
         )

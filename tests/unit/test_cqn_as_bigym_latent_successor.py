@@ -3,12 +3,110 @@ from types import SimpleNamespace
 import jax.numpy as jnp
 import numpy as np
 
+import robobase.method.cqn_as_bigym_latent_successor as successor_module
 from robobase.method.cqn_as_bigym_latent_successor import (
+    CQNASBigymGroundTruthLatentSuccessor,
     _capture_agent_rollout_state,
     _direct_plus_other_bins,
     _restore_agent_rollout_state,
     _safe_candidate_choice,
 )
+
+
+def test_policy_to_terminal_branches_use_frozen_cqn_continuation(monkeypatch):
+    class FakeEnv:
+        def __init__(self):
+            self.steps = 0
+            self.first_action = 0.0
+
+        def step(self, action):
+            self.steps += 1
+            if self.steps == 1:
+                self.first_action = float(np.asarray(action)[0, 0])
+            terminal = self.steps == 3
+            reward = float(terminal and self.first_action > 0.5)
+            return (
+                {"state": np.asarray([self.steps], dtype=np.float32)},
+                reward,
+                terminal,
+                False,
+                {},
+            )
+
+    class FakeAgent:
+        def __init__(self):
+            self.calls = 0
+
+        def act(self, observations, step, eval_mode):
+            assert eval_mode
+            assert observations["state"].shape[0] == 1
+            self.calls += 1
+            return np.zeros((1, 2, 1), dtype=np.float32)
+
+    env = FakeEnv()
+    agent = FakeAgent()
+    wrapper = object.__new__(CQNASBigymGroundTruthLatentSuccessor)
+    wrapper.base = agent
+    wrapper._rollout_env = env
+    wrapper.discount = 0.9
+    wrapper.horizon = 1
+    wrapper.policy_to_terminal = True
+    wrapper.max_branch_steps = 5
+    wrapper._branch_steps = 0
+
+    monkeypatch.setattr(
+        successor_module,
+        "restore_bigym_branch_state",
+        lambda rollout_env, _state: setattr(rollout_env, "steps", 0),
+    )
+    monkeypatch.setattr(
+        successor_module,
+        "_restore_agent_rollout_state",
+        lambda _agent, _state: None,
+    )
+    monkeypatch.setattr(
+        successor_module,
+        "_register_candidate",
+        lambda _agent, candidate: np.asarray(candidate, dtype=np.float32),
+    )
+
+    candidates = np.zeros((2, 2, 1), dtype=np.float32)
+    candidates[1, 0, 0] = 1.0
+    observations, returns, discounts, done = wrapper._branch_candidates(
+        candidates,
+        env_state=None,
+        agent_state={},
+        policy_step=17,
+    )
+
+    assert len(observations) == 2
+    np.testing.assert_allclose(returns, [0.0, 0.9**2])
+    np.testing.assert_allclose(discounts, [0.9**3, 0.9**3])
+    np.testing.assert_array_equal(done, [1.0, 1.0])
+    assert agent.calls == 4
+    assert wrapper._branch_steps == 6
+
+
+def test_policy_to_terminal_scores_realized_return_without_calling_critic():
+    wrapper = object.__new__(CQNASBigymGroundTruthLatentSuccessor)
+    wrapper.policy_to_terminal = True
+    wrapper._score_ground_truth_latents = lambda *_args: (_ for _ in ()).throw(
+        AssertionError("terminal-return oracle must not query Q/V")
+    )
+    observations = [
+        {"state": np.asarray([0.0], dtype=np.float32)},
+        {"state": np.asarray([1.0], dtype=np.float32)},
+    ]
+
+    scores, features = wrapper._score_candidates(
+        observations,
+        np.asarray([0.0, 0.81], dtype=np.float32),
+        np.asarray([0.7, 0.7], dtype=np.float32),
+        np.asarray([1.0, 1.0], dtype=np.float32),
+    )
+
+    np.testing.assert_allclose(scores, [0.0, 0.81])
+    np.testing.assert_array_equal(features, np.zeros((2, 1), dtype=np.float32))
 
 
 def test_direct_plus_other_bins_keeps_true_direct_and_drops_nearest_bin():
