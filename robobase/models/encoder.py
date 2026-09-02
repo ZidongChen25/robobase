@@ -17,6 +17,7 @@ from flax.traverse_util import unflatten_dict
 import flax.linen as nn
 
 from robobase.models.resnet import resnet_feature_model
+from robobase.models.pooling import max_pool_3x3_stride2_pad1
 
 
 _IMAGENET_MEAN = np.asarray([0.485, 0.456, 0.406], dtype=np.float32)
@@ -541,13 +542,50 @@ def _init_resnet18_film_variables(
     return freeze({"params": params})
 
 
+_COMPUTE_DTYPES = {
+    "float32": jnp.float32,
+    "bfloat16": jnp.bfloat16,
+}
+
+
+def resolve_compute_dtype(compute_dtype) -> jnp.dtype | None:
+    """Map an ``encoder_model.compute_dtype`` string to a JAX dtype.
+
+    ``None``/``"float32"`` keep the historical float32 path bit-identical.
+    ``"bfloat16"`` runs the ResNet convolutions and stores their activations
+    in bfloat16 (parameters, batch statistics, the normalisation arithmetic
+    and every consumer stay float32), which halves the trunk's activation
+    memory and uses the tensor-core bf16 path instead of TF32.
+    """
+
+    if compute_dtype is None:
+        return None
+    if isinstance(compute_dtype, str):
+        key = compute_dtype.strip().lower()
+        if key not in _COMPUTE_DTYPES:
+            raise ValueError(
+                "encoder_model.compute_dtype must be one of "
+                f"{sorted(_COMPUTE_DTYPES)}, got {compute_dtype!r}."
+            )
+        resolved = _COMPUTE_DTYPES[key]
+    else:
+        resolved = jnp.dtype(compute_dtype)
+    if resolved == jnp.float32:
+        return None
+    return resolved
+
+
 def _conv2d(
     x: jnp.ndarray,
     kernel: jnp.ndarray,
     *,
     strides: tuple[int, int],
     padding,
+    compute_dtype=None,
 ) -> jnp.ndarray:
+    if compute_dtype is not None:
+        x = x.astype(compute_dtype)
+        kernel = kernel.astype(compute_dtype)
     return jax.lax.conv_general_dilated(
         x,
         kernel,
@@ -566,8 +604,11 @@ def _batch_norm(
 ) -> jnp.ndarray:
     mean = stats["mean"].reshape((1, 1, 1, -1))
     var = stats["var"].reshape((1, 1, 1, -1))
-    scale = params["scale"].reshape((1, 1, 1, -1))
-    bias = params["bias"].reshape((1, 1, 1, -1))
+    # Match Torch FrozenBatchNorm2d: the affine values participate in the
+    # forward pass but are buffers, not differentiable parameters.  They stay
+    # in the JAX checkpoint tree for backward compatibility.
+    scale = jax.lax.stop_gradient(params["scale"]).reshape((1, 1, 1, -1))
+    bias = jax.lax.stop_gradient(params["bias"]).reshape((1, 1, 1, -1))
     return (x - mean) * jax.lax.rsqrt(
         var + jnp.asarray(eps, dtype=x.dtype)
     ) * scale + bias
@@ -582,6 +623,7 @@ def _resnet_conv_block(
     strides: tuple[int, int] = (1, 1),
     padding=((0, 0), (0, 0)),
     activate: bool = True,
+    compute_dtype=None,
 ) -> jnp.ndarray:
     block_params = params[name]
     block_stats = stats[name]
@@ -590,13 +632,17 @@ def _resnet_conv_block(
         block_params["Conv_0"]["kernel"],
         strides=strides,
         padding=padding,
+        compute_dtype=compute_dtype,
     )
+    # Frozen-statistics normalisation promotes to float32 (the parameters and
+    # statistics are float32); the stored activation is cast back afterwards.
     x = _batch_norm(
         x,
         block_params["BatchNorm_0"],
         block_stats["BatchNorm_0"],
     )
-    return jax.nn.relu(x) if activate else x
+    x = jax.nn.relu(x) if activate else x
+    return x if compute_dtype is None else x.astype(compute_dtype)
 
 
 def _apply_resnet18_block(
@@ -606,6 +652,7 @@ def _apply_resnet18_block(
     *,
     strides: tuple[int, int],
     film: jnp.ndarray | None = None,
+    compute_dtype=None,
 ) -> jnp.ndarray:
     residual = x
     y = _resnet_conv_block(
@@ -616,6 +663,7 @@ def _apply_resnet18_block(
         strides=strides,
         padding=((1, 1), (1, 1)),
         activate=True,
+        compute_dtype=compute_dtype,
     )
     y = _resnet_conv_block(
         y,
@@ -625,11 +673,14 @@ def _apply_resnet18_block(
         strides=(1, 1),
         padding=((1, 1), (1, 1)),
         activate=False,
+        compute_dtype=compute_dtype,
     )
     if film is not None:
         gamma = film[:, 0].reshape((film.shape[0], 1, 1, -1))
         beta = film[:, 1].reshape((film.shape[0], 1, 1, -1))
         y = (1.0 + gamma) * y + beta
+        if compute_dtype is not None:
+            y = y.astype(compute_dtype)
     if "ResNetSkipConnection_0" in params:
         residual = _resnet_conv_block(
             residual,
@@ -639,6 +690,7 @@ def _apply_resnet18_block(
             strides=strides,
             padding=((0, 0), (0, 0)),
             activate=False,
+            compute_dtype=compute_dtype,
         )
     return jax.nn.relu(y + residual)
 
@@ -648,6 +700,8 @@ def _apply_resnet18_film(
     resnet_variables,
     film_params,
     task_emb: jnp.ndarray,
+    compute_dtype=None,
+    use_remat: bool = True,
 ) -> jnp.ndarray:
     params = resnet_variables["params"]
     stats = resnet_variables["batch_stats"]
@@ -659,13 +713,9 @@ def _apply_resnet18_film(
         strides=(2, 2),
         padding=((3, 3), (3, 3)),
         activate=True,
+        compute_dtype=compute_dtype,
     )
-    x = nn.max_pool(
-        x,
-        window_shape=(3, 3),
-        strides=(2, 2),
-        padding=((1, 1), (1, 1)),
-    )
+    x = max_pool_3x3_stride2_pad1(x)
 
     block_specs = (
         ("layers_2", (1, 1), None, None, None),
@@ -700,15 +750,17 @@ def _apply_resnet18_film(
                 block_stats,
                 strides=block_strides,
                 film=film_values,
+                compute_dtype=compute_dtype,
             )
 
-        x = jax.checkpoint(apply_block)(
+        block_fn = jax.checkpoint(apply_block) if use_remat else apply_block
+        x = block_fn(
             x,
             params[layer_name],
             stats[layer_name],
             block_film,
         )
-    return x
+    return x if compute_dtype is None else x.astype(jnp.float32)
 
 
 class JaxPluckerEncoder(nn.Module):
@@ -979,12 +1031,7 @@ class JaxDPEarlyConcatResNet18(nn.Module):
         )(x)
         x = nn.GroupNorm(num_groups=4, epsilon=1e-5, name="norm1")(x)
         x = nn.relu(x)
-        x = nn.max_pool(
-            x,
-            window_shape=(3, 3),
-            strides=(2, 2),
-            padding=((1, 1), (1, 1)),
-        )
+        x = max_pool_3x3_stride2_pad1(x)
 
         for stage, features in enumerate((64, 128, 256, 512)):
             for block in range(2):
@@ -1247,6 +1294,8 @@ class JaxResNetEncoder:
         film_task_hidden_dim: int = 256,
         seed: int = 0,
         pretrained_weights_path: str | os.PathLike[str] | None = None,
+        compute_dtype=None,
+        use_remat: bool = True,
     ):
         if input_shape[1] % 3 != 0:
             raise ValueError(
@@ -1255,6 +1304,8 @@ class JaxResNetEncoder:
             )
 
         seed = int(seed)
+        self._compute_dtype = resolve_compute_dtype(compute_dtype)
+        self._use_remat = bool(use_remat)
 
         def init_key(legacy_index: int):
             if seed == 0:
@@ -1284,6 +1335,11 @@ class JaxResNetEncoder:
                 model,
                 bool(pretrained),
                 seed=seed,
+            )
+        if self._compute_dtype is not None:
+            # Same variable tree; only the convolution/activation dtype differs.
+            feature_model = resnet_feature_model(
+                _SUPPORTED_RESNETS[model], dtype=self._compute_dtype
             )
         self._feature_model = feature_model
         self._feature_variables = jax.tree.map(
@@ -1667,12 +1723,16 @@ class JaxResNetEncoder:
                 self._resnet_variables(variables),
                 film_params,
                 expanded_task,
+                compute_dtype=self._compute_dtype,
+                use_remat=self._use_remat,
             )
         else:
             x = self._feature_model.apply(
                 self._resnet_variables(variables),
                 x,
             )
+            if self._compute_dtype is not None:
+                x = x.astype(jnp.float32)
 
         def finish(features):
             if stop_gradient:

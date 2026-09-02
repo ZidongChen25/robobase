@@ -274,6 +274,7 @@ def flow_matching_model_spec_from_cfg(cfg: DictConfig) -> FlowMatchingModelSpec:
                 encoder_model_cfg.get("plucker_identity_init", False)
             ),
             plucker_fusion_mode=encoder_model_cfg.get("plucker_fusion_mode", None),
+            compute_dtype=str(encoder_model_cfg.get("compute_dtype", "float32")),
         )
 
     view_fusion_model_cfg = method_cfg.get("view_fusion_model", None)
@@ -574,6 +575,7 @@ def _build_encoder_and_fusion(
                     model_spec.encoder_model.plucker_hidden_channels
                 ),
                 plucker_identity_init=(model_spec.encoder_model.plucker_identity_init),
+                compute_dtype=model_spec.encoder_model.compute_dtype,
             )
         encoder_model = encoder_cls(**encoder_kwargs)
         if obs_layout.use_multicam_fusion:
@@ -680,6 +682,10 @@ def _build_model(
 
 class FlowMatching(JaxMethodBase):
     """Rectified Flow method using JAX/Flax backbones."""
+
+    # Every RGB consumer (CamPose crop, the ResNet preprocess) casts inside
+    # its own jit, so uint8 stays on device until the update program runs.
+    _defer_rgb_float_cast = True
 
     def __init__(
         self,
@@ -1590,7 +1596,14 @@ class FlowMatching(JaxMethodBase):
             action_pad_mask,
             ema_params,
             ema_optimization_step,
+            augmentation_key=None,
         ):
+            if augmentation_key is not None:
+                # Augment inside the update program so the augmented float32
+                # image only exists in the executable's temporaries.
+                obs_inputs = self._augment_trainable_obs_inputs(
+                    obs_inputs, augmentation_key
+                )
             source_key, time_key, dropout_key, next_key = jax.random.split(rng_key, 4)
             actor_dropout_key = jax.random.fold_in(dropout_key, 1)
             x1 = jax.random.normal(source_key, shape=actions.shape)
@@ -2161,6 +2174,7 @@ class FlowMatching(JaxMethodBase):
             action_pad_mask,
             ema_params,
             ema_optimization_step,
+            augmentation_keys=None,
         ):
             def body_fn(carry, xs):
                 (
@@ -2170,16 +2184,15 @@ class FlowMatching(JaxMethodBase):
                     current_ema,
                     current_ema_step,
                 ) = carry
-                if action_pad_mask is None:
-                    step_obs_inputs, step_actions, step_loss_coeff = xs
-                    step_action_pad_mask = None
-                else:
-                    (
-                        step_obs_inputs,
-                        step_actions,
-                        step_loss_coeff,
-                        step_action_pad_mask,
-                    ) = xs
+                # ``None`` leaves carry no data through scan, so a missing
+                # augmentation key or pad mask arrives here as ``None``.
+                (
+                    step_obs_inputs,
+                    step_actions,
+                    step_loss_coeff,
+                    step_action_pad_mask,
+                    step_augmentation_key,
+                ) = xs
                 (
                     next_params,
                     next_opt_state,
@@ -2198,6 +2211,7 @@ class FlowMatching(JaxMethodBase):
                     step_action_pad_mask,
                     current_ema,
                     current_ema_step,
+                    step_augmentation_key,
                 )
                 next_carry = (
                     next_params,
@@ -2208,9 +2222,7 @@ class FlowMatching(JaxMethodBase):
                 )
                 return next_carry, (loss, priority)
 
-            xs = (obs_inputs, actions, loss_coeff)
-            if action_pad_mask is not None:
-                xs = (*xs, action_pad_mask)
+            xs = (obs_inputs, actions, loss_coeff, action_pad_mask, augmentation_keys)
             (
                 (
                     new_params,
@@ -3077,11 +3089,17 @@ class FlowMatching(JaxMethodBase):
         actions = self._as_jax_array(batch["action"], self.jnp.float32)
         action_pad_mask = self._extract_action_pad_mask(batch)
         loss_coeff = self._loss_weights(batch)
+        aug_key = None
         if self._trainable_encoder:
             obs_inputs = self._prepare_trainable_obs_inputs(batch)
             if self.image_augmentation_type != "none":
                 self.rng_key, aug_key = jax.random.split(self.rng_key)
-                obs_inputs = self._augment_trainable_obs_inputs(obs_inputs, aug_key)
+                if self._flow_source_type != "gaussian":
+                    # A2A / Legato programs take pre-augmented observations.
+                    obs_inputs = self._augment_trainable_obs_inputs(
+                        obs_inputs, aug_key
+                    )
+                    aug_key = None
             metrics = {}
         else:
             obs_inputs, metrics = self._prepare_obs_features(batch)
@@ -3152,6 +3170,7 @@ class FlowMatching(JaxMethodBase):
                 action_pad_mask,
                 self.ema_params,
                 self._ema_optimization_step,
+                aug_key,
             )
         uses_priorities = self._uses_replay_priorities(replay_buffer)
         if self._should_block_update(uses_priorities):
@@ -3214,7 +3233,13 @@ class FlowMatching(JaxMethodBase):
                 action_history_pad_masks.append(history_pad_mask)
             if self._trainable_encoder:
                 obs = self._prepare_trainable_obs_inputs(batch)
-                if augmentation_keys is not None:
+                if (
+                    augmentation_keys is not None
+                    and self._flow_source_type != "gaussian"
+                ):
+                    # A2A / Legato programs take pre-augmented observations;
+                    # the Gaussian program crops per step inside the scan on
+                    # the raw (uint8) stack instead.
                     obs = self._augment_trainable_obs_inputs(
                         obs,
                         augmentation_keys[update_idx],
@@ -3237,6 +3262,7 @@ class FlowMatching(JaxMethodBase):
             lambda *values: self.jnp.stack(values, axis=0),
             *obs_inputs_list,
         )
+        del obs_inputs_list
         actions = self.jnp.stack(actions, axis=0)
         loss_coeffs = self.jnp.stack(loss_coeffs, axis=0)
         action_pad_mask = (
@@ -3261,6 +3287,19 @@ class FlowMatching(JaxMethodBase):
                 action_pad_mask,
                 self.ema_params,
                 self._ema_optimization_step,
+            )
+        elif self._flow_source_type == "gaussian":
+            result = self._update_many_impl(
+                self.params,
+                self.opt_state,
+                self.rng_key,
+                obs_inputs,
+                actions,
+                loss_coeffs,
+                action_pad_mask,
+                self.ema_params,
+                self._ema_optimization_step,
+                augmentation_keys,
             )
         else:
             result = self._update_many_impl(

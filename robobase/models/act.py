@@ -70,6 +70,85 @@ def _build_2d_sincos_pos_embed(hidden_dim: int, height: int, width: int) -> jnp.
     return jnp.concatenate([pos_y, pos_x], axis=-1).astype(jnp.float32)
 
 
+_ATTENTION_IMPLS = ("flax", "xla", "cudnn")
+_ATTENTION_DTYPES = {"float32": jnp.float32, "bfloat16": jnp.bfloat16}
+
+
+def _fused_attention_fn(implementation: str, attention_dtype: str):
+    """Build a Flax ``attention_fn`` backed by ``jax.nn.dot_product_attention``.
+
+    ``flax`` (the default) keeps Flax's reference attention, which materialises
+    the (batch, heads, queries, keys) probability tensor and supports attention
+    dropout. ``xla`` and ``cudnn`` hand q/k/v to ``jax.nn.dot_product_attention``;
+    ``cudnn`` is the fused flash-attention kernel (no probability tensor in
+    memory), which only exists for bfloat16/float16 inputs and even sequence
+    lengths, so inputs are cast to ``attention_dtype`` (forced to bfloat16 for
+    ``cudnn``) and odd sequences are padded by one masked position. Neither
+    fused path applies attention-probability dropout; residual and MLP dropout
+    are unaffected. Parameter names and shapes are identical to the Flax path.
+    """
+
+    if implementation not in _ATTENTION_IMPLS:
+        raise ValueError(
+            f"attention_impl must be one of {_ATTENTION_IMPLS}, got {implementation!r}."
+        )
+    if attention_dtype not in _ATTENTION_DTYPES:
+        raise ValueError(
+            f"attention_dtype must be one of {sorted(_ATTENTION_DTYPES)}, "
+            f"got {attention_dtype!r}."
+        )
+    if implementation == "flax":
+        return None
+    compute_dtype = _ATTENTION_DTYPES[attention_dtype]
+    if implementation == "cudnn" and compute_dtype == jnp.float32:
+        compute_dtype = jnp.bfloat16
+
+    def attention_fn(
+        query,
+        key,
+        value,
+        bias=None,
+        mask=None,
+        broadcast_dropout=True,
+        dropout_rng=None,
+        dropout_rate=0.0,
+        deterministic=False,
+        dtype=None,
+        precision=None,
+        module=None,
+        **unused,
+    ):
+        del bias, broadcast_dropout, dropout_rng, dropout_rate, deterministic
+        del dtype, precision, module, unused
+        out_dtype = query.dtype
+        batch, q_len = query.shape[0], query.shape[1]
+        kv_len = key.shape[1]
+        q, k, v = (x.astype(compute_dtype) for x in (query, key, value))
+        if mask is not None:
+            mask = jnp.broadcast_to(mask, (batch, mask.shape[1], q_len, kv_len))
+        q_pad = q_len % 2 if implementation == "cudnn" else 0
+        kv_pad = kv_len % 2 if implementation == "cudnn" else 0
+        if q_pad or kv_pad:
+            if mask is None:
+                mask = jnp.ones((batch, 1, q_len, kv_len), dtype=bool)
+            q = jnp.pad(q, ((0, 0), (0, q_pad), (0, 0), (0, 0)))
+            k = jnp.pad(k, ((0, 0), (0, kv_pad), (0, 0), (0, 0)))
+            v = jnp.pad(v, ((0, 0), (0, kv_pad), (0, 0), (0, 0)))
+            mask = jnp.pad(
+                mask, ((0, 0), (0, 0), (0, q_pad), (0, kv_pad)), constant_values=False
+            )
+            if q_pad:
+                # A padded query row must attend to something to stay finite;
+                # its output is sliced away below.
+                mask = mask.at[:, :, q_len:, 0].set(True)
+        out = jax.nn.dot_product_attention(
+            q, k, v, mask=mask, implementation=implementation
+        )
+        return out[:, :q_len].astype(out_dtype)
+
+    return attention_fn
+
+
 def _key_padding_mask(mask: jnp.ndarray | None, query_len: int):
     if mask is None:
         return None
@@ -213,6 +292,8 @@ class ACTTransformerEncoderLayer(nn.Module):
     pre_norm: bool
     mlp_kernel_init: object = _DETR_KERNEL_INIT
     attention_out_kernel_init: object = _DETR_KERNEL_INIT
+    attention_impl: str = "flax"
+    attention_dtype: str = "float32"
 
     @nn.compact
     def __call__(
@@ -228,6 +309,10 @@ class ACTTransformerEncoderLayer(nn.Module):
             normed = nn.LayerNorm(name="norm1")(x)
             normed_pos = normed if pos is None else normed + pos
             attn = nn.MultiHeadDotProductAttention(
+                attention_fn=_fused_attention_fn(
+                    self.attention_impl, self.attention_dtype
+                )
+                or nn.dot_product_attention,
                 num_heads=self.nheads,
                 dropout_rate=self.dropout,
                 kernel_init=_PYTORCH_MHA_QKV_KERNEL_INIT,
@@ -247,6 +332,8 @@ class ACTTransformerEncoderLayer(nn.Module):
             return x + ff
 
         attn = nn.MultiHeadDotProductAttention(
+            attention_fn=_fused_attention_fn(self.attention_impl, self.attention_dtype)
+            or nn.dot_product_attention,
             num_heads=self.nheads,
             dropout_rate=self.dropout,
             kernel_init=_PYTORCH_MHA_QKV_KERNEL_INIT,
@@ -274,6 +361,8 @@ class ACTTransformerDecoderLayer(nn.Module):
     dim_feedforward: int
     dropout: float
     pre_norm: bool
+    attention_impl: str = "flax"
+    attention_dtype: str = "float32"
 
     @nn.compact
     def __call__(
@@ -296,6 +385,10 @@ class ACTTransformerDecoderLayer(nn.Module):
         if self.pre_norm:
             normed = nn.LayerNorm(name="norm1")(queries)
             self_attn = nn.MultiHeadDotProductAttention(
+                attention_fn=_fused_attention_fn(
+                    self.attention_impl, self.attention_dtype
+                )
+                or nn.dot_product_attention,
                 num_heads=self.nheads,
                 dropout_rate=self.dropout,
                 kernel_init=_PYTORCH_MHA_QKV_KERNEL_INIT,
@@ -316,6 +409,10 @@ class ACTTransformerDecoderLayer(nn.Module):
 
             normed = nn.LayerNorm(name="norm2")(queries)
             cross_attn = nn.MultiHeadDotProductAttention(
+                attention_fn=_fused_attention_fn(
+                    self.attention_impl, self.attention_dtype
+                )
+                or nn.dot_product_attention,
                 num_heads=self.nheads,
                 dropout_rate=self.dropout,
                 kernel_init=_PYTORCH_MHA_QKV_KERNEL_INIT,
@@ -344,6 +441,8 @@ class ACTTransformerDecoderLayer(nn.Module):
             return queries + ff
 
         self_attn = nn.MultiHeadDotProductAttention(
+            attention_fn=_fused_attention_fn(self.attention_impl, self.attention_dtype)
+            or nn.dot_product_attention,
             num_heads=self.nheads,
             dropout_rate=self.dropout,
             kernel_init=_PYTORCH_MHA_QKV_KERNEL_INIT,
@@ -362,6 +461,8 @@ class ACTTransformerDecoderLayer(nn.Module):
             + nn.Dropout(rate=self.dropout)(self_attn, deterministic=deterministic)
         )
         cross_attn = nn.MultiHeadDotProductAttention(
+            attention_fn=_fused_attention_fn(self.attention_impl, self.attention_dtype)
+            or nn.dot_product_attention,
             num_heads=self.nheads,
             dropout_rate=self.dropout,
             kernel_init=_PYTORCH_MHA_QKV_KERNEL_INIT,
@@ -399,6 +500,9 @@ class ACTDetrTransformer(nn.Module):
     dropout: float
     pre_norm: bool
     decoder_output_layer: str = "final"
+    use_remat: bool = True
+    attention_impl: str = "flax"
+    attention_dtype: str = "float32"
 
     @nn.compact
     def __call__(
@@ -445,11 +549,13 @@ class ACTDetrTransformer(nn.Module):
         else:
             raise ValueError(f"Unexpected transformer source shape {src.shape}.")
 
-        encoder_layer = nn.remat(
-            ACTTransformerEncoderLayer,
-            prevent_cse=False,
-            static_argnums=(4,),
-        )
+        encoder_layer = ACTTransformerEncoderLayer
+        if self.use_remat:
+            encoder_layer = nn.remat(
+                encoder_layer,
+                prevent_cse=False,
+                static_argnums=(4,),
+            )
         for layer in range(self.enc_layers):
             memory = encoder_layer(
                 self.hidden_dim,
@@ -457,6 +563,8 @@ class ACTDetrTransformer(nn.Module):
                 self.dim_feedforward,
                 self.dropout,
                 self.pre_norm,
+                attention_impl=self.attention_impl,
+                attention_dtype=self.attention_dtype,
                 name=f"encoder_{layer}",
             )(memory, None, pos, deterministic)
         if self.pre_norm:
@@ -466,11 +574,13 @@ class ACTDetrTransformer(nn.Module):
             query_embed[None], (batch_size, *query_embed.shape)
         )
         queries = jnp.zeros_like(query_pos)
-        decoder_layer = nn.remat(
-            ACTTransformerDecoderLayer,
-            prevent_cse=False,
-            static_argnums=(6,),
-        )
+        decoder_layer = ACTTransformerDecoderLayer
+        if self.use_remat:
+            decoder_layer = nn.remat(
+                decoder_layer,
+                prevent_cse=False,
+                static_argnums=(6,),
+            )
         first_queries = None
         for layer in range(self.dec_layers):
             queries = decoder_layer(
@@ -479,6 +589,8 @@ class ACTDetrTransformer(nn.Module):
                 self.dim_feedforward,
                 self.dropout,
                 self.pre_norm,
+                attention_impl=self.attention_impl,
+                attention_dtype=self.attention_dtype,
                 name=f"decoder_{layer}",
             )(queries, memory, None, pos, query_pos, deterministic)
             if layer == 0:
@@ -510,6 +622,9 @@ class JaxACTPolicy(nn.Module):
     proprio_projection_type: str = "legacy_mlp"
     style_cls_type: str = "learned"
     decoder_output_layer: str = "final"
+    use_remat: bool = True
+    attention_impl: str = "flax"
+    attention_dtype: str = "float32"
 
     @nn.compact
     def __call__(
@@ -629,11 +744,13 @@ class JaxACTPolicy(nn.Module):
                 pos_table[None, : style_tokens.shape[1]],
                 style_tokens.shape,
             )
-            style_encoder_layer = nn.remat(
-                ACTTransformerEncoderLayer,
-                prevent_cse=False,
-                static_argnums=(4,),
-            )
+            style_encoder_layer = ACTTransformerEncoderLayer
+            if self.use_remat:
+                style_encoder_layer = nn.remat(
+                    style_encoder_layer,
+                    prevent_cse=False,
+                    static_argnums=(4,),
+                )
             for layer in range(self.enc_layers):
                 style_tokens = style_encoder_layer(
                     self.hidden_dim,
@@ -643,6 +760,8 @@ class JaxACTPolicy(nn.Module):
                     self.pre_norm,
                     mlp_kernel_init=_PYTORCH_DEFAULT_KERNEL_INIT,
                     attention_out_kernel_init=_PYTORCH_DEFAULT_KERNEL_INIT,
+                    attention_impl=self.attention_impl,
+                    attention_dtype=self.attention_dtype,
                     name=f"style_encoder_{layer}",
                 )(style_tokens, style_is_pad, style_pos, deterministic)
             if self.pre_norm:
@@ -755,6 +874,9 @@ class JaxACTPolicy(nn.Module):
                 dropout=self.dropout,
                 pre_norm=self.pre_norm,
                 decoder_output_layer=decoder_output_layer,
+                use_remat=self.use_remat,
+                attention_impl=self.attention_impl,
+                attention_dtype=self.attention_dtype,
                 name="transformer",
             )(
                 memory,
@@ -780,6 +902,9 @@ class JaxACTPolicy(nn.Module):
                 dropout=self.dropout,
                 pre_norm=self.pre_norm,
                 decoder_output_layer=decoder_output_layer,
+                use_remat=self.use_remat,
+                attention_impl=self.attention_impl,
+                attention_dtype=self.attention_dtype,
                 name="transformer",
             )(
                 memory,
@@ -797,6 +922,9 @@ class JaxACTPolicy(nn.Module):
                 dropout=self.dropout,
                 pre_norm=self.pre_norm,
                 decoder_output_layer=decoder_output_layer,
+                use_remat=self.use_remat,
+                attention_impl=self.attention_impl,
+                attention_dtype=self.attention_dtype,
                 name="transformer",
             )(
                 image_features,

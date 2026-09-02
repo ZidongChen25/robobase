@@ -55,6 +55,9 @@ method:
     plucker_fusion_mode: null
     plucker_hidden_channels: 64
     plucker_identity_init: false
+    # float32 (default) or bfloat16 for the ResNet trunk (half activation
+    # memory, bf16 tensor cores); heads and parameters stay float32.
+    compute_dtype: float32
 
   view_fusion_model:
     type: multicam_feature

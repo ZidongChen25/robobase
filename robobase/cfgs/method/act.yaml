@@ -40,9 +40,25 @@ method:
     num_camera_extrinsics: 2
     image_position_max_tokens: null
     proprio_dropout_prob: 0.0
+    # legacy_mlp = the two-layer projection every existing ACT checkpoint was
+    # trained with (changing it changes the parameter tree). The benchmark
+    # parity profile overrides this to campose_single, which is what the
+    # reference PyTorch ACT uses; do not flip the production default.
     proprio_projection_type: legacy_mlp
     style_cls_type: learned
     decoder_output_layer: final
+    # Rematerialise ResNet blocks and transformer layers in the backward pass.
+    # true (production) keeps the batch-128 BiGym update at ~11.4 GiB live so
+    # two runs fit one card (xla_mem_fraction=0.45); false is ~26% faster
+    # per update but needs ~15.3 GiB live (measured 2026-09-02, swirl03 GPU5).
+    # The benchmark parity profile sets it to false to match PyTorch's graph.
+    use_remat: true
+    # Attention kernel for the DETR/style transformers: flax (reference,
+    # materialises the attention matrix, supports attention dropout), xla, or
+    # cudnn (fused flash attention in bfloat16; even-length padding is handled;
+    # attention-probability dropout is not applied on the fused paths).
+    attention_impl: flax
+    attention_dtype: float32
     use_lang_cond: ${method.use_lang_cond}
     lang_feature_dim: 512
     image_position_embedding_type: sincos_legacy
@@ -56,6 +72,9 @@ method:
     plucker_fusion_mode: null
     plucker_hidden_channels: 64
     plucker_identity_init: false
+    # float32 (default) or bfloat16 for the ResNet trunk (half activation
+    # memory, bf16 tensor cores); heads and parameters stay float32.
+    compute_dtype: float32
 
   view_fusion_model:
     type: multicam_feature

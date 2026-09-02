@@ -55,6 +55,10 @@ class BCEncoderModelSpec:
     plucker_hidden_channels: int = 64
     plucker_identity_init: bool = False
     plucker_fusion_mode: str | None = None
+    # ResNet convolution/activation dtype: "float32" (default, bit-identical
+    # to earlier runs) or "bfloat16" (half the trunk activation memory, bf16
+    # tensor cores). Parameters, statistics and downstream heads stay float32.
+    compute_dtype: str = "float32"
     num_downsample_convs: int = 1
     num_post_downsample_convs: int = 3
     channels: int = 32
@@ -206,6 +210,7 @@ def bc_model_spec_from_cfg(cfg: DictConfig) -> BCModelSpec:
                 encoder_model_cfg.get("plucker_identity_init", False)
             ),
             plucker_fusion_mode=encoder_model_cfg.get("plucker_fusion_mode", None),
+            compute_dtype=str(encoder_model_cfg.get("compute_dtype", "float32")),
             num_downsample_convs=int(
                 encoder_model_cfg.get("num_downsample_convs", 1)
             ),
@@ -419,6 +424,7 @@ def _build_model(
                     model_spec.encoder_model.plucker_hidden_channels
                 ),
                 plucker_identity_init=(model_spec.encoder_model.plucker_identity_init),
+                compute_dtype=model_spec.encoder_model.compute_dtype,
             )
         encoder_model = encoder_cls(**encoder_kwargs)
         if obs_layout.use_multicam_fusion:

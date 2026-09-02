@@ -168,6 +168,15 @@ class JaxMethodBase(Method):
         low_dim_obs = flatten_time_into_channel(low_dim_obs)
         return low_dim_obs.reshape((low_dim_obs.shape[0], -1))
 
+    # Methods whose every RGB consumer is a jitted function that casts the
+    # image itself (``JaxResNetEncoder._preprocess``, the ACT / CamPose
+    # augmentations) opt in to keeping uint8 on device: the cast then fuses
+    # into the first device kernel and no standalone float32 image buffer
+    # exists outside the update program. With fused updates this also makes
+    # the stacked multi-batch input 4x smaller. RL methods keep the eager
+    # float32 cast because their augmentation helpers assume float inputs.
+    _defer_rgb_float_cast = False
+
     def _to_device_then_f32(self, value):
         """Transfer in the source dtype, cast to float32 on device.
 
@@ -176,8 +185,13 @@ class JaxMethodBase(Method):
         large single-threaded numpy conversion (measured 58 ms vs 2 ms per
         128-sample camera batch on a 5090) and starves the GPU whenever the
         CPU is busy. Value-identical: uint8 -> float32 is exact either way.
+
+        When ``_defer_rgb_float_cast`` is set the array is returned in its
+        source dtype and the (exact) cast happens inside the consuming jit.
         """
         arr = self.jnp.asarray(value)
+        if self._defer_rgb_float_cast:
+            return arr
         if arr.dtype != self.jnp.float32:
             arr = arr.astype(self.jnp.float32)
         return arr

@@ -197,6 +197,7 @@ def test_act_config_uses_jax_transformer_spec():
     assert spec.model.actor_model.proprio_projection_type == "legacy_mlp"
     assert spec.model.actor_model.style_cls_type == "learned"
     assert spec.model.actor_model.decoder_output_layer == "final"
+    assert spec.model.actor_model.use_remat is True
     assert spec.model.encoder_model.plucker_fusion_mode is None
     assert spec.weight_decay == pytest.approx(1e-4)
     assert spec.horizon_dropout_lengths == (1, 2, 4)
@@ -232,6 +233,67 @@ def test_act_model_config_parses_campose_conditioning_fields():
     assert spec.proprio_projection_type == "campose_single"
     assert spec.style_cls_type == "zero"
     assert spec.decoder_output_layer == "first"
+    # A frozen legacy config has no new key and retains its old memory policy.
+    assert spec.use_remat is True
+
+
+def test_act_remat_toggle_preserves_parameters_outputs_and_gradients():
+    kwargs = dict(
+        hidden_dim=8,
+        nheads=2,
+        enc_layers=1,
+        dec_layers=1,
+        dim_feedforward=16,
+        dropout=0.0,
+        pre_norm=False,
+    )
+    remat = ACTDetrTransformer(**kwargs, use_remat=True)
+    direct = ACTDetrTransformer(**kwargs, use_remat=False)
+    src = jax.numpy.arange(24, dtype=jax.numpy.float32).reshape((1, 3, 8))
+    query_embed = jax.numpy.arange(16, dtype=jax.numpy.float32).reshape((2, 8))
+    pos_embed = jax.numpy.zeros_like(src)
+    variables = remat.init(
+        jax.random.PRNGKey(31),
+        src,
+        query_embed,
+        pos_embed,
+        deterministic=True,
+    )
+
+    def loss(module, params):
+        output = module.apply(
+            {"params": params},
+            src,
+            query_embed,
+            pos_embed,
+            deterministic=True,
+        )
+        return jax.numpy.sum(output**2)
+
+    remat_output = remat.apply(
+        variables, src, query_embed, pos_embed, deterministic=True
+    )
+    direct_output = direct.apply(
+        variables, src, query_embed, pos_embed, deterministic=True
+    )
+    np.testing.assert_array_equal(remat_output, direct_output)
+    remat_variables = remat.init(
+        jax.random.PRNGKey(31), src, query_embed, pos_embed, deterministic=True
+    )
+    direct_variables = direct.init(
+        jax.random.PRNGKey(31), src, query_embed, pos_embed, deterministic=True
+    )
+    assert jax.tree.structure(remat_variables) == jax.tree.structure(
+        direct_variables
+    )
+    remat_grads = jax.grad(lambda p: loss(remat, p))(variables["params"])
+    direct_grads = jax.grad(lambda p: loss(direct, p))(variables["params"])
+    for remat_leaf, direct_leaf in zip(
+        jax.tree.leaves(remat_grads),
+        jax.tree.leaves(direct_grads),
+        strict=True,
+    ):
+        np.testing.assert_allclose(remat_leaf, direct_leaf, rtol=1e-6, atol=1e-6)
 
 
 def test_campose_act_profile_composes_official_conditioning_path():

@@ -8,7 +8,6 @@ from typing import Iterator, Optional
 
 import jax
 import jax.numpy as jnp
-import jax.scipy.ndimage as jndi
 import numpy as np
 from gymnasium import spaces
 from omegaconf import DictConfig
@@ -54,6 +53,15 @@ class ACTActorModelSpec:
     proprio_projection_type: str = "legacy_mlp"
     style_cls_type: str = "learned"
     decoder_output_layer: str = "final"
+    # Rematerialisation changes the backward workload. New composed configs
+    # disable it for parity with PyTorch, while old frozen configs that lack
+    # the field retain their historical behaviour.
+    use_remat: bool = True
+    # Attention kernel: "flax" (reference, materialised probabilities, attention
+    # dropout), "xla" or "cudnn" (jax.nn.dot_product_attention; cudnn = fused
+    # flash attention, bfloat16 inputs, no attention-probability dropout).
+    attention_impl: str = "flax"
+    attention_dtype: str = "float32"
 
 
 @dataclass(frozen=True)
@@ -160,6 +168,9 @@ def act_model_spec_from_cfg(cfg: DictConfig) -> ACTModelSpec:
         decoder_output_layer=str(
             actor_model_cfg.get("decoder_output_layer", "final")
         ).lower(),
+        use_remat=bool(actor_model_cfg.get("use_remat", True)),
+        attention_impl=str(actor_model_cfg.get("attention_impl", "flax")).lower(),
+        attention_dtype=str(actor_model_cfg.get("attention_dtype", "float32")).lower(),
     )
 
     encoder_model_cfg = method_cfg.get("encoder_model", None)
@@ -196,6 +207,7 @@ def act_model_spec_from_cfg(cfg: DictConfig) -> ACTModelSpec:
                 encoder_model_cfg.get("plucker_identity_init", False)
             ),
             plucker_fusion_mode=encoder_model_cfg.get("plucker_fusion_mode", None),
+            compute_dtype=str(encoder_model_cfg.get("compute_dtype", "float32")),
         )
 
     view_fusion_model_cfg = method_cfg.get("view_fusion_model", None)
@@ -321,6 +333,8 @@ def _build_model(
             film_task_input_dim=actor_spec.lang_feature_dim,
             film_task_hidden_dim=actor_spec.hidden_dim,
             seed=encoder_seed,
+            compute_dtype=model_spec.encoder_model.compute_dtype,
+            use_remat=actor_spec.use_remat,
         )
         image_projection_model = ACTImageProjection(
             hidden_dim=actor_spec.hidden_dim,
@@ -355,6 +369,9 @@ def _build_model(
             proprio_projection_type=actor_spec.proprio_projection_type,
             style_cls_type=actor_spec.style_cls_type,
             decoder_output_layer=actor_spec.decoder_output_layer,
+            use_remat=actor_spec.use_remat,
+            attention_impl=actor_spec.attention_impl,
+            attention_dtype=actor_spec.attention_dtype,
         ),
         encoder_model=encoder_model,
         image_projection_model=image_projection_model,
@@ -461,11 +478,38 @@ def _depthwise_blur_2d(field: jnp.ndarray, kernel: jnp.ndarray) -> jnp.ndarray:
     )
 
 
-def _elastic_transform_chw(
-    image: jnp.ndarray,
+def _linear_indices_and_weights(coordinate: jnp.ndarray, size: int):
+    """Mirror ``jax.scipy.ndimage.map_coordinates(order=1, mode="nearest")``."""
+
+    lower = jnp.floor(coordinate)
+    upper_weight = coordinate - lower
+    lower_weight = 1.0 - upper_weight
+    index = lower.astype(jnp.int32)
+    return (
+        (jnp.clip(index, 0, size - 1), lower_weight),
+        (jnp.clip(index + 1, 0, size - 1), upper_weight),
+    )
+
+
+def _elastic_warp_batch(
+    flat: jnp.ndarray,
     displacement: jnp.ndarray,
 ) -> jnp.ndarray:
-    channels, height, width = image.shape
+    """Bilinearly resample every (C, H, W) image with one shared displacement.
+
+    Equivalent to ``vmap(map_coordinates(order=1, mode="nearest"))`` over the
+    batch with integer channel coordinates, but the four corner gathers use
+    one (H*W,) index vector shared by every image and channel instead of a
+    per-image 3-D coordinate volume. ``map_coordinates`` with a 3-D coordinate
+    builds eight corner terms (two per axis) from full-size index and weight
+    volumes: on a 128-sample, three-camera 256x256 batch that is ~1.8 GiB of
+    temporaries for a 302 MiB result. The channel axis has integer coordinates,
+    so its upper-corner weight is exactly 0 and its terms add exact zeros; the
+    remaining four terms are evaluated here with the same weight products and
+    the same left-to-right summation order, so the output is bit-identical.
+    """
+
+    batch, channels, height, width = flat.shape
     y, x = jnp.meshgrid(
         jnp.arange(height, dtype=jnp.float32),
         jnp.arange(width, dtype=jnp.float32),
@@ -473,20 +517,18 @@ def _elastic_transform_chw(
     )
     y = jnp.clip(y + displacement[..., 0], 0.0, float(height - 1))
     x = jnp.clip(x + displacement[..., 1], 0.0, float(width - 1))
-    c = jnp.broadcast_to(
-        jnp.arange(channels, dtype=jnp.float32)[:, None, None],
-        image.shape,
-    )
-    return jndi.map_coordinates(
-        image,
-        (
-            c,
-            jnp.broadcast_to(y[None], image.shape),
-            jnp.broadcast_to(x[None], image.shape),
-        ),
-        order=1,
-        mode="nearest",
-    )
+    y_terms = _linear_indices_and_weights(y, height)
+    x_terms = _linear_indices_and_weights(x, width)
+    flat_hw = flat.reshape((batch, channels, height * width))
+
+    result = None
+    for y_index, y_weight in y_terms:
+        for x_index, x_weight in x_terms:
+            gather_index = (y_index * width + x_index).reshape((-1,))
+            corner = jnp.take(flat_hw, gather_index, axis=2).reshape(flat.shape)
+            term = (y_weight * x_weight)[None, None] * corner
+            result = term if result is None else result + term
+    return result
 
 
 def _apply_elastic_transform(
@@ -510,8 +552,14 @@ def _apply_elastic_transform(
         _gaussian_kernel1d(sigma=sigma, radius=int(round(3.0 * sigma))),
     )[0]
     displacement = displacement * float(alpha)
-    warped = jax.vmap(_elastic_transform_chw, in_axes=(0, None))(flat, displacement)
-    return jnp.where(apply_mask, warped, flat)
+    # Half of the batches keep the original pixels; ``lax.cond`` skips the
+    # warp entirely for those instead of computing it and discarding it.
+    return jax.lax.cond(
+        apply_mask,
+        lambda images: _elastic_warp_batch(images, displacement),
+        lambda images: images,
+        flat,
+    )
 
 
 def _rgb_to_hsv(rgb: jnp.ndarray) -> jnp.ndarray:
@@ -569,6 +617,10 @@ def _adjust_hue_chw(flat: jnp.ndarray, hue_delta: jnp.ndarray) -> jnp.ndarray:
 
 class ACT(JaxMethodBase):
     """Chunked-action ACT method implemented entirely with JAX/Flax."""
+
+    # Every RGB consumer (augmentations, the ResNet preprocess) casts inside
+    # its own jit, so uint8 stays on device until the update program runs.
+    _defer_rgb_float_cast = True
 
     def __init__(
         self,
@@ -1169,7 +1221,14 @@ class ACT(JaxMethodBase):
             dropout_key,
             latent_key,
             horizon_key,
+            augmentation_key,
         ):
+            # Augment inside the update program: the augmented float32 image
+            # then lives only in the executable's temporaries instead of as a
+            # standalone device buffer between two dispatches.
+            obs_inputs = self._augment_observation_images(
+                obs_inputs, augmentation_key
+            )
             effective_action_pad_mask = action_pad_mask
             if horizon_dropout_lengths is not None:
                 length_indices = jax.random.choice(
@@ -1286,6 +1345,7 @@ class ACT(JaxMethodBase):
             dropout_keys,
             latent_keys,
             horizon_keys,
+            augmentation_keys,
         ):
             def body_fn(carry, xs):
                 current_params, current_opt_state = carry
@@ -1297,6 +1357,7 @@ class ACT(JaxMethodBase):
                         step_dropout_key,
                         step_latent_key,
                         step_horizon_key,
+                        step_augmentation_key,
                     ) = xs
                     step_action_pad_mask = None
                 else:
@@ -1308,6 +1369,7 @@ class ACT(JaxMethodBase):
                         step_dropout_key,
                         step_latent_key,
                         step_horizon_key,
+                        step_augmentation_key,
                     ) = xs
                 (
                     next_params,
@@ -1327,6 +1389,7 @@ class ACT(JaxMethodBase):
                     step_dropout_key,
                     step_latent_key,
                     step_horizon_key,
+                    step_augmentation_key,
                 )
                 return (next_params, next_opt_state), (
                     loss,
@@ -1343,6 +1406,7 @@ class ACT(JaxMethodBase):
                 dropout_keys,
                 latent_keys,
                 horizon_keys,
+                augmentation_keys,
             )
             if action_pad_mask is not None:
                 xs = (
@@ -1353,6 +1417,7 @@ class ACT(JaxMethodBase):
                     dropout_keys,
                     latent_keys,
                     horizon_keys,
+                    augmentation_keys,
                 )
             (
                 (
@@ -1408,7 +1473,6 @@ class ACT(JaxMethodBase):
             self.rng_key,
             5,
         )
-        obs_inputs = self._augment_observation_images(obs_inputs, aug_key)
         start_time = time.perf_counter()
         (
             self.params,
@@ -1428,6 +1492,7 @@ class ACT(JaxMethodBase):
             dropout_key,
             latent_key,
             horizon_key,
+            aug_key,
         )
         uses_priorities = self._uses_replay_priorities(replay_buffer)
         if self._should_block_update(uses_priorities):
@@ -1491,9 +1556,10 @@ class ACT(JaxMethodBase):
             batch = next(replay_iter)
             actions.append(self._as_jax_array(batch["action"], self.jnp.float32))
             loss_coeffs.append(self._loss_weights(batch))
-            obs = self._prepare_trainable_obs_inputs(batch)
-            obs = self._augment_observation_images(obs, aug_keys[update_idx])
-            obs_inputs_list.append(obs)
+            # Raw (uint8) observations are stacked; augmentation and the
+            # float cast run per step inside the fused program, so the
+            # stacked input is 4x smaller than a float32 pre-augmented stack.
+            obs_inputs_list.append(self._prepare_trainable_obs_inputs(batch))
             action_pad_mask = self._extract_action_pad_mask(batch)
             current_has_mask = action_pad_mask is not None
             if has_action_pad_mask is None:
@@ -1509,6 +1575,7 @@ class ACT(JaxMethodBase):
             lambda *values: self.jnp.stack(values, axis=0),
             *obs_inputs_list,
         )
+        del obs_inputs_list
         actions = self.jnp.stack(actions, axis=0)
         loss_coeffs = self.jnp.stack(loss_coeffs, axis=0)
         action_pad_mask = (
@@ -1534,6 +1601,7 @@ class ACT(JaxMethodBase):
             dropout_keys,
             latent_keys,
             horizon_keys,
+            aug_keys,
         )
         if (
             self.logging
