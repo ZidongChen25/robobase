@@ -13,26 +13,7 @@ Commit source code, configs, launch scripts, tests, and documentation:
 - `BiGym/*.sh`
 - `RoboMimic/*.py` and `RoboMimic/*.sh`
 - `pyproject.toml`, `uv.lock`, `setup.py`
-- project docs such as `README.md`, `backend.md`, and reports you want preserved
-
-For the current working tree, the untracked files that look commit-worthy are:
-
-- `BiGym/run_bigym_dp_transformer_tasks_gpu2_gpu5.sh`
-- `BiGym/run_move_plate_diffusion_transformer_gpu2.sh`
-- `robobase/cfgs/env/pusht.yaml`
-- `robobase/cfgs/launch/act_pixel_bigym_lazy.yaml`
-- `robobase/cfgs/launch/dp_pixel_bigym_move_plate_transformer.yaml`
-- `robobase/cfgs/launch/dp_pixel_bigym_transformer_ddpm.yaml`
-- `robobase/cfgs/launch/dp_pixel_pusht.yaml`
-- `robobase/cfgs/launch/fm_pixel_bigym_transformer.yaml`
-- `robobase/envs/pusht.py`
-- `robobase/replay_buffer/bigym_lazy_replay.py`
-- `scripts/cache_bigym_pixel_demos.py`
-- `scripts/eval_flow_step_checkpoint.py`
-- `scripts/run_flow_step_sweep.py`
-- `tests/unit/envs/test_bigym.py`
-- `tests/unit/envs/test_pusht.py`
-- `tests/unit/replay_buffer/test_bigym_lazy_replay.py`
+- stable user-facing project documentation such as `README.md` and setup guides
 
 ## What To Ignore
 
