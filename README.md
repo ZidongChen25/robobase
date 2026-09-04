@@ -116,9 +116,7 @@ The three-camera BiGym adapter is launched with:
 python3 train.py launch=q_chunking_pixel_bigym env=bigym/move_plate
 ```
 
-Q-Chunking's upstream mapping, replay contract, measured smoke artifacts, and
-matched evaluation protocol are recorded in
-[Q_CHUNKING_JAX.md](Q_CHUNKING_JAX.md). Snapshot sweeps use:
+Q-Chunking snapshot sweeps use:
 
 ```commandline
 python3 scripts/eval_q_chunking_snapshot_sweep.py --run-dir <run_dir> \
@@ -142,9 +140,6 @@ python3 train.py launch=cqn_as_pixel_bigym_demo_driven env=bigym/move_plate
 python3 train.py launch=cqn_as_pixel_rlbench_demo_driven
 ```
 
-CQN-AS value Flow Matching 的实现定义、分阶段研究方案和实验门槛见
-[cqn-flow.md](cqn-flow.md)。
-
 ### JAX Imitation Learning
 
 | Method                                        | Paper                                                                                                   | 1-line Summary                              | Differences to paper?             | Stable    |
@@ -152,7 +147,7 @@ CQN-AS value Flow Matching 的实现定义、分阶段研究方案和实验门�
 | [bc](robobase/cfgs/method/bc.yaml)               | Behavior cloning                                                                                        | Direct action regression.                   | JAX implementation.               | :white_check_mark: |
 | [diffusion](robobase/cfgs/method/diffusion.yaml) | [Diffusion Policy: Visuomotor Policy Learning via Action Diffusion](https://arxiv.org/abs/2303.04137)   | Brings diffusion to robotics.               | None.                             | :warning: |
 | [flow_matching](robobase/cfgs/method/flow_matching.yaml) | Rectified Flow                                                                                   | Learns an action-space velocity field.      | JAX implementation.               | :warning: |
-| [a2a](robobase/cfgs/method/a2a.yaml) | [Action-to-Action Flow Matching](https://arxiv.org/abs/2602.07322) | Transports encoded prior-action history to a future chunk. | Pure JAX; BiGym currently feeds commanded actions, see [flow extension notes](FLOW_POLICY_EXTENSIONS.md). | :warning: |
+| [a2a](robobase/cfgs/method/a2a.yaml) | [Action-to-Action Flow Matching](https://arxiv.org/abs/2602.07322) | Transports encoded prior-action history to a future chunk. | Pure JAX; BiGym currently feeds commanded actions. | :warning: |
 | [legato](robobase/cfgs/method/legato.yaml) | [Learning Native Continuation for Action Chunking Flow Policies](https://arxiv.org/abs/2602.12978) | Learns delay-aware continuation throughout flow integration. | Pure JAX; paper/public-code target modes are explicit. | :warning: |
 | [act](robobase/cfgs/method/act.yaml)             | [Learning Fine-Grained Bimanual Manipulation with Low-Cost Hardware](https://arxiv.org/abs/2304.13705)  | Transformer and action-sequence prediction. | None.                             | :white_check_mark: |
 
