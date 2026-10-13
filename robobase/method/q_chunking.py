@@ -18,6 +18,7 @@ from robobase.method.rl_common import (
     JaxRLMethodBase,
     RLModelSpec,
     activation,
+    random_shift_rgb,
     rl_model_spec_from_cfg,
     scale_unit_action,
     unscale_action,
@@ -46,6 +47,14 @@ class QChunkingSpec:
     critic_grad_clip: float | None
     weight_decay: float
     model: RLModelSpec
+    feature_projection: bool = False
+    feature_dim: int = 64
+    rgb_encoder_layers: int = 2
+    rgb_shift_pad: int = 0
+    bc_demo_only: bool = False
+    actor_use_low_dim: bool = True
+    low_dim_mask_prob: float = 0.0
+    low_dim_mask_keep_last: int = 0
 
 
 def q_chunking_spec_from_cfg(cfg: DictConfig) -> QChunkingSpec:
@@ -74,6 +83,14 @@ def q_chunking_spec_from_cfg(cfg: DictConfig) -> QChunkingSpec:
         ),
         weight_decay=float(method.get("weight_decay", 0.0)),
         model=rl_model_spec_from_cfg(cfg),
+        feature_projection=bool(method.get("feature_projection", False)),
+        feature_dim=int(method.get("feature_dim", 64)),
+        rgb_encoder_layers=int(method.get("rgb_encoder_layers", 2)),
+        rgb_shift_pad=int(method.get("rgb_shift_pad", 0)),
+        bc_demo_only=bool(method.get("bc_demo_only", False)),
+        actor_use_low_dim=bool(method.get("actor_use_low_dim", True)),
+        low_dim_mask_prob=float(method.get("low_dim_mask_prob", 0.0)),
+        low_dim_mask_keep_last=int(method.get("low_dim_mask_keep_last", 0)),
     )
 
 
@@ -191,6 +208,68 @@ class QChunkCritic(nn.Module):
         return jnp.stack(values, axis=-1)
 
 
+class QChunkFeatureTrunk(nn.Module):
+    """Per-modality projection matching the CQN-AS pixel trunk.
+
+    Raw flattened CNN features (~19k dims, |x|~1e-2) and standardized low-dim
+    state (~240 dims, |x|~1, outliers >40) are projected separately to
+    ``feature_dim`` with LayerNorm+tanh, so neither modality dominates the MLP.
+    Input layout follows ``JaxRLMethodBase._rl_features``: [low_dim, rgb, time].
+    """
+
+    low_dim_size: int
+    rgb_size: int
+    time_size: int
+    hidden_dim: int
+    feature_dim: int = 64
+    rgb_encoder_layers: int = 2
+    activation_name: str = "gelu"
+
+    @property
+    def output_dim(self) -> int:
+        return (
+            (self.feature_dim if self.low_dim_size else 0)
+            + (self.feature_dim if self.rgb_size else 0)
+            + self.time_size
+        )
+
+    @nn.compact
+    def __call__(self, features: jax.Array) -> jax.Array:
+        features = features.astype(jnp.float32)
+        low_dim = features[:, : self.low_dim_size]
+        rgb = features[:, self.low_dim_size : self.low_dim_size + self.rgb_size]
+        time = features[:, self.low_dim_size + self.rgb_size :]
+        parts = []
+        if self.rgb_size:
+            for index in range(self.rgb_encoder_layers):
+                rgb = nn.Dense(
+                    self.hidden_dim,
+                    use_bias=False,
+                    kernel_init=nn.initializers.orthogonal(),
+                    name=f"rgb_dense_{index}",
+                )(rgb)
+                rgb = nn.LayerNorm(name=f"rgb_norm_{index}")(rgb)
+                rgb = activation(rgb, self.activation_name)
+            rgb = nn.Dense(
+                self.feature_dim,
+                use_bias=False,
+                kernel_init=nn.initializers.orthogonal(),
+                name="rgb_projection",
+            )(rgb)
+            parts.append(jnp.tanh(nn.LayerNorm(name="rgb_projection_norm")(rgb)))
+        if self.low_dim_size:
+            low_dim = nn.Dense(
+                self.feature_dim,
+                use_bias=False,
+                kernel_init=nn.initializers.orthogonal(),
+                name="low_dim_projection",
+            )(low_dim)
+            parts.append(jnp.tanh(nn.LayerNorm(name="low_dim_norm")(low_dim)))
+        if self.time_size:
+            parts.append(time)
+        return jnp.concatenate(parts, axis=-1)
+
+
 class QChunking(JaxRLMethodBase, OffPolicyMethod):
     """Official-style Best-of-N Q-chunking adapted to RoboBase replay."""
 
@@ -224,6 +303,14 @@ class QChunking(JaxRLMethodBase, OffPolicyMethod):
         platform: str | None = None,
         seed: int = 0,
         update_block_every_steps: int = 1,
+        feature_projection: bool = False,
+        feature_dim: int = 64,
+        rgb_encoder_layers: int = 2,
+        rgb_shift_pad: int = 0,
+        bc_demo_only: bool = False,
+        actor_use_low_dim: bool = True,
+        low_dim_mask_prob: float = 0.0,
+        low_dim_mask_keep_last: int = 0,
     ):
         super().__init__(
             lr=actor_lr,
@@ -263,6 +350,48 @@ class QChunking(JaxRLMethodBase, OffPolicyMethod):
         self.critic_grad_clip = critic_grad_clip
         input_dim = self._setup_rl_features(model, seed=seed)
         self.action_low, self.action_high = self._action_bounds()
+        if rgb_shift_pad < 0:
+            raise ValueError("rgb_shift_pad must be non-negative.")
+        self.feature_projection = bool(feature_projection)
+        self.rgb_shift_pad = int(rgb_shift_pad)
+        self.bc_demo_only = bool(bc_demo_only)
+        self.actor_use_low_dim = bool(actor_use_low_dim)
+        if not 0.0 <= low_dim_mask_prob <= 1.0:
+            raise ValueError("low_dim_mask_prob must be in [0, 1].")
+        self.low_dim_mask_prob = float(low_dim_mask_prob)
+        self.low_dim_mask_keep_last = int(low_dim_mask_keep_last)
+        if self.low_dim_mask_prob > 0.0:
+            if not self.low_dim_size or "low_dim_state" not in self.observation_space.spaces:
+                raise ValueError("low_dim_mask_prob requires a low_dim_state observation.")
+            self._low_dim_frame_dim = int(self.observation_space.spaces["low_dim_state"].shape[-1])
+            if not 0 <= self.low_dim_mask_keep_last < self._low_dim_frame_dim:
+                raise ValueError("low_dim_mask_keep_last must be in [0, low-dim frame width).")
+        raw_input_dim = int(input_dim)
+        self.trunk_model = None
+        if self.feature_projection:
+            if self.use_pixels and not self._trainable_encoder:
+                raise ValueError(
+                    "Q-chunking feature_projection needs the trainable-encoder "
+                    "feature layout [low_dim, rgb, time]."
+                )
+            # Flattened (frame-stacked) low-dim width, as produced by _extract_low_dim_batch.
+            low_width = int(self.low_dim_size)
+            rgb_width = raw_input_dim - low_width - self._time_feature_dim
+            if rgb_width < 0 or (not self.use_pixels and rgb_width != 0):
+                raise ValueError(
+                    f"Unexpected RL feature layout: total={raw_input_dim}, "
+                    f"low_dim={low_width}, time={self._time_feature_dim}."
+                )
+            self.trunk_model = QChunkFeatureTrunk(
+                low_dim_size=low_width,
+                rgb_size=rgb_width,
+                time_size=self._time_feature_dim,
+                hidden_dim=int(model.hidden_dims[0]),
+                feature_dim=int(feature_dim),
+                rgb_encoder_layers=int(rgb_encoder_layers),
+                activation_name=model.activation,
+            )
+            input_dim = self.trunk_model.output_dim
         flat_action_dim = self.action_sequence * self.action_dim
 
         self.actor_model = QChunkFlowActor(
@@ -296,6 +425,15 @@ class QChunking(JaxRLMethodBase, OffPolicyMethod):
             "actor": actor_params,
             "critic": critic_params,
         }
+        if self.feature_projection:
+            self.rng_key, actor_trunk_key, critic_trunk_key = jax.random.split(
+                self.rng_key, 3
+            )
+            dummy_raw = jnp.zeros((1, raw_input_dim), dtype=jnp.float32)
+            self.params["actor_trunk"] = self.trunk_model.init(actor_trunk_key, dummy_raw)
+            self.params["critic_trunk"] = self.trunk_model.init(
+                critic_trunk_key, dummy_raw
+            )
         if self._trainable_encoder:
             initial_encoder = jax.tree.map(jnp.array, self._encoder_params)
             self.params["actor_encoder"] = initial_encoder
@@ -353,27 +491,58 @@ class QChunking(JaxRLMethodBase, OffPolicyMethod):
         bundle = {"actor": params["actor"]}
         if self._trainable_encoder:
             bundle["actor_encoder"] = params["actor_encoder"]
+        if self.feature_projection:
+            bundle["actor_trunk"] = params["actor_trunk"]
         return bundle
 
     def _critic_bundle(self, params):
         bundle = {"critic": params["critic"]}
         if self._trainable_encoder:
             bundle["critic_encoder"] = params["critic_encoder"]
+        if self.feature_projection:
+            bundle["critic_trunk"] = params["critic_trunk"]
         return bundle
 
+    def _mask_low_dim(self, low_dim, key):
+        """Per-sample update-time low-dim dropout (same semantics as CQN-AS Stage-160)."""
+        batch = low_dim.shape[0]
+        frame = self._low_dim_frame_dim
+        frames = low_dim.reshape((batch, -1, frame))
+        keep = self.low_dim_mask_keep_last
+        keep_mask = jnp.concatenate(
+            [jnp.zeros((frame - keep,), frames.dtype), jnp.ones((keep,), frames.dtype)]
+        )
+        drop = jax.random.bernoulli(key, self.low_dim_mask_prob, (batch, 1, 1))
+        return jnp.where(drop, frames * keep_mask, frames).reshape(low_dim.shape)
+
+    def _project(self, trunk_params, features, stop_gradient):
+        if not self.feature_projection:
+            return features
+        features = self.trunk_model.apply(trunk_params, features)
+        return jax.lax.stop_gradient(features) if stop_gradient else features
+
     def _actor_features(self, bundle, obs_inputs, *, stop_gradient=False):
-        return self._rl_features(
+        if not self.actor_use_low_dim:
+            if not isinstance(obs_inputs, dict):
+                raise ValueError("actor_use_low_dim=False needs the trainable-encoder input dict.")
+            if "low_dim" in obs_inputs:
+                # Same zeros at train and inference: the actor cannot shortcut on proprio.
+                obs_inputs = dict(obs_inputs)
+                obs_inputs["low_dim"] = jnp.zeros_like(obs_inputs["low_dim"])
+        features = self._rl_features(
             bundle.get("actor_encoder", None),
             obs_inputs,
             stop_gradient=stop_gradient,
         )
+        return self._project(bundle.get("actor_trunk"), features, stop_gradient)
 
     def _critic_features(self, bundle, obs_inputs, *, stop_gradient=False):
-        return self._rl_features(
+        features = self._rl_features(
             bundle.get("critic_encoder", None),
             obs_inputs,
             stop_gradient=stop_gradient,
         )
+        return self._project(bundle.get("critic_trunk"), features, stop_gradient)
 
     def _aggregate_q(self, q_values):
         if self.q_aggregate == "min":
@@ -490,8 +659,35 @@ class QChunking(JaxRLMethodBase, OffPolicyMethod):
             bootstrap,
             action_valid,
             loss_weights,
+            bc_weights,
             key,
         ):
+            if (
+                self.rgb_shift_pad > 0
+                and isinstance(obs_inputs, dict)
+                and "rgb" in obs_inputs
+            ):
+                key, obs_shift_key, next_shift_key = jax.random.split(key, 3)
+                obs_inputs = dict(obs_inputs)
+                next_obs_inputs = dict(next_obs_inputs)
+                obs_inputs["rgb"] = random_shift_rgb(
+                    obs_inputs["rgb"], obs_shift_key, self.rgb_shift_pad
+                )
+                next_obs_inputs["rgb"] = random_shift_rgb(
+                    next_obs_inputs["rgb"], next_shift_key, self.rgb_shift_pad
+                )
+            if (
+                self.low_dim_mask_prob > 0.0
+                and isinstance(obs_inputs, dict)
+                and "low_dim" in obs_inputs
+            ):
+                key, mask_key, next_mask_key = jax.random.split(key, 3)
+                obs_inputs = dict(obs_inputs)
+                next_obs_inputs = dict(next_obs_inputs)
+                obs_inputs["low_dim"] = self._mask_low_dim(obs_inputs["low_dim"], mask_key)
+                next_obs_inputs["low_dim"] = self._mask_low_dim(
+                    next_obs_inputs["low_dim"], next_mask_key
+                )
             key, next_action_key, source_key, time_key = jax.random.split(key, 4)
             full_chunk_valid = jnp.all(action_valid, axis=1).astype(jnp.float32)
             critic_weights = loss_weights * full_chunk_valid
@@ -597,8 +793,8 @@ class QChunking(JaxRLMethodBase, OffPolicyMethod):
                     jnp.sum(valid, axis=1),
                     1.0,
                 )
-                actor_denominator = jnp.maximum(jnp.sum(loss_weights), 1.0)
-                loss = jnp.sum(per_sample_actor * loss_weights) / actor_denominator
+                actor_denominator = jnp.maximum(jnp.sum(bc_weights), 1.0)
+                loss = jnp.sum(per_sample_actor * bc_weights) / actor_denominator
                 return loss, per_sample_actor
 
             current_actor_bundle = self._actor_bundle(params)
@@ -635,6 +831,7 @@ class QChunking(JaxRLMethodBase, OffPolicyMethod):
                 "chunk_valid_fraction": jnp.mean(full_chunk_valid),
                 "action_valid_fraction": jnp.mean(action_valid),
                 "actor_per_sample_loss": jnp.mean(per_sample_actor),
+                "bc_weight_fraction": jnp.mean((bc_weights > 0).astype(jnp.float32)),
             }
             return (
                 params,
@@ -769,6 +966,14 @@ class QChunking(JaxRLMethodBase, OffPolicyMethod):
         else:
             action_valid = jnp.logical_not(pad_mask)
         loss_weights = self._loss_weights(batch)
+        bc_weights = loss_weights
+        if self.bc_demo_only:
+            if "demo" not in batch:
+                raise ValueError("bc_demo_only requires a 'demo' flag in replay batches.")
+            demo = self._as_jax_array(batch["demo"], self.jnp.float32).reshape(
+                (actions.shape[0], -1)
+            )[:, 0]
+            bc_weights = loss_weights * (demo > 0).astype(self.jnp.float32)
 
         start_time = time.perf_counter()
         (
@@ -790,6 +995,7 @@ class QChunking(JaxRLMethodBase, OffPolicyMethod):
             bootstrap,
             action_valid,
             loss_weights,
+            bc_weights,
             self.rng_key,
         )
         uses_priorities = self._uses_replay_priorities(replay_buffer)

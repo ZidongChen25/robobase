@@ -47,6 +47,7 @@ def method_name_from_cfg(cfg: DictConfig) -> str:
         "robobase.method.legato.Legato": "legato",
         "robobase.method.ppo.PPO": "ppo",
         "robobase.method.q_chunking.QChunking": "q_chunking",
+        "robobase.method.q_chunking_c2f.QChunkingC2F": "q_chunking_c2f",
         "robobase.method.sac.SAC": "sac",
         "robobase.method.alix.ALIX": "alix",
         "robobase.method.cqn_research.CQN": "cqn",
@@ -234,8 +235,24 @@ def create_agent(
             **common_kwargs,
         )
 
-    if method_name == "q_chunking":
+    if method_name in ("q_chunking", "q_chunking_c2f"):
         from robobase.method.q_chunking import QChunking
+
+        qc_cls, qc_extra = QChunking, {}
+        if method_name == "q_chunking_c2f":
+            from robobase.method.q_chunking_c2f import QChunkingC2F
+
+            m = cfg.method
+            qc_cls = QChunkingC2F
+            qc_extra = dict(
+                c2f_levels=int(m.get("c2f_levels", 3)),
+                c2f_bins=int(m.get("c2f_bins", 5)),
+                c2f_heads=int(m.get("c2f_heads", 5)),
+                c2f_cql_weight=float(m.get("c2f_cql_weight", 0.0)),
+                c2f_lcb_kappa=float(m.get("c2f_lcb_kappa", 1.0)),
+                c2f_train_act_mode=str(m.get("c2f_train_act_mode", "bon")),
+                c2f_eval_act_mode=str(m.get("c2f_eval_act_mode", "bon")),
+            )
 
         validate_q_chunking_config(
             action_sequence=int(cfg.action_sequence),
@@ -245,7 +262,7 @@ def create_agent(
             action_execution_start=int(cfg.get("action_execution_start", 0)),
         )
         spec = q_chunking_spec_from_cfg(cfg)
-        return QChunking(
+        return qc_cls(
             actor_lr=spec.actor_lr,
             critic_lr=spec.critic_lr,
             num_train_steps=spec.num_train_steps,
@@ -261,6 +278,15 @@ def create_agent(
             jit=jit,
             platform=platform,
             seed=int(cfg.seed),
+            feature_projection=spec.feature_projection,
+            feature_dim=spec.feature_dim,
+            rgb_encoder_layers=spec.rgb_encoder_layers,
+            rgb_shift_pad=spec.rgb_shift_pad,
+            bc_demo_only=spec.bc_demo_only,
+            actor_use_low_dim=spec.actor_use_low_dim,
+            low_dim_mask_prob=spec.low_dim_mask_prob,
+            low_dim_mask_keep_last=spec.low_dim_mask_keep_last,
+            **qc_extra,
             **common_kwargs,
         )
 

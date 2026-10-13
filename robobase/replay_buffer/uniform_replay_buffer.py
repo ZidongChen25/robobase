@@ -164,6 +164,7 @@ class UniformReplayBuffer(ReplayBuffer):
         nstep_explore_truncate: bool = False,
         multiprocessing_context: str = "fork",
         transition_uniform_sampling: bool = False,
+        chunk_tail_starts: bool = False,
     ):
         """Initializes OutOfGraphReplayBuffer.
 
@@ -314,6 +315,8 @@ class UniformReplayBuffer(ReplayBuffer):
             None if auxiliary_nstep is None else int(auxiliary_nstep)
         )
         self._nstep_explore_truncate = bool(nstep_explore_truncate)
+        # Allow starts in the last nstep-1 transitions; the n-step window is cut at the episode end.
+        self._chunk_tail_starts = bool(chunk_tail_starts)
         if self._auxiliary_nstep is not None and self._auxiliary_nstep < 1:
             raise ValueError("auxiliary_nstep must be >= 1 or null.")
         if sequential and self._auxiliary_nstep is not None:
@@ -937,12 +940,18 @@ class UniformReplayBuffer(ReplayBuffer):
         eps_fn, _, global_index = records[np.random.randint(0, len(records))]
         return self._get_episode_for_sampling(eps_fn), global_index
 
+    def _max_start(self, ep_len) -> int:
+        """Exclusive upper bound of sampled transition indices for an episode."""
+        if self._chunk_tail_starts:
+            return max(int(ep_len), 1)
+        return max(int(ep_len) - self._nstep + 1, 1)
+
     def _episode_start_weights(self) -> np.ndarray:
         """Cumulative counts of valid n-step start indices per episode file."""
         if self._episode_weights_version != self._episode_files_version:
             weights = np.asarray(
                 [
-                    max(_parse_episode_file_metadata(eps_fn)[1] - self._nstep + 1, 1)
+                    self._max_start(_parse_episode_file_metadata(eps_fn)[1])
                     for eps_fn in self._episode_files
                 ],
                 dtype=np.int64,
@@ -1172,6 +1181,8 @@ class UniformReplayBuffer(ReplayBuffer):
             ep_len = episode_len(episode)
 
             next_idxs = idxs + self._nstep
+            if self._chunk_tail_starts:
+                next_idxs = np.minimum(next_idxs, ep_len)
             aux_next_idxs = (
                 np.minimum(idxs + self._auxiliary_nstep, ep_len)
                 if self._auxiliary_nstep is not None
@@ -1405,7 +1416,7 @@ class UniformReplayBuffer(ReplayBuffer):
                 episode, global_index = self._sample_episode_transition_uniform()
             else:
                 episode, global_index = self._sample_episode()
-            min_idx, max_idx = 0, np.maximum(episode_len(episode) - self._nstep + 1, 1)
+            min_idx, max_idx = 0, self._max_start(episode_len(episode))
             idx = np.random.randint(min_idx, max_idx)
 
             # global index of the transition = index of episode_start + transition_idx
@@ -1419,6 +1430,8 @@ class UniformReplayBuffer(ReplayBuffer):
         # Construct replay sample from sampled transition index
         ep_len = episode_len(episode)
         next_idx = idx + self._nstep
+        if self._chunk_tail_starts:
+            next_idx = min(next_idx, ep_len)
         if (
             self._nstep_explore_truncate
             and self._nstep > 1
@@ -1808,6 +1821,12 @@ class UniformReplayBuffer(ReplayBuffer):
                         n_eff_by_row[row] = j
                         break
 
+        if self._chunk_tail_starts:
+            for row, (episode, idx, _) in enumerate(picks):
+                n_eff_by_row[row] = min(
+                    int(n_eff_by_row[row]), max(episode_len(episode) - idx, 1)
+                )
+
         # Stacked frames and action sequences are consecutive rows of the
         # episode arrays, so away from episode edges each is one contiguous
         # slice copied straight into its batch row (single memcpy, no
@@ -2010,9 +2029,7 @@ class UniformReplayBuffer(ReplayBuffer):
                     )
                 else:
                     episode, global_index = self._sample_episode()
-                min_idx, max_idx = 0, np.maximum(
-                    episode_len(episode) - self._nstep + 1, 1
-                )
+                min_idx, max_idx = 0, self._max_start(episode_len(episode))
                 idx = np.random.randint(min_idx, max_idx)
                 global_index += idx
             else:

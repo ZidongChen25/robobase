@@ -273,6 +273,7 @@ def _validate_rl_action_sequence(cfg: DictConfig) -> None:
         "cqn_as_official",
         "cqn_flow",
         "q_chunking",
+        "q_chunking_c2f",
         "djcqn",
         # One-file-per-research-line CQN-AS variants (R2 refactor); all
         # subclass the pristine CQNAS and inherit its chunk rollout.
@@ -578,6 +579,7 @@ def _create_default_replay_buffer(
         ),
         auxiliary_nstep=cfg.replay.get("auxiliary_nstep", None),
         nstep_explore_truncate=cfg.replay.get("nstep_explore_truncate", False),
+        chunk_tail_starts=bool(cfg.replay.get("chunk_tail_starts", False)),
         multiprocessing_context=multiprocessing_context,
         transition_uniform_sampling=bool(
             cfg.replay.get("transition_uniform_sampling", False)
