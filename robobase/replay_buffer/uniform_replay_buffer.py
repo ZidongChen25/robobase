@@ -1509,6 +1509,8 @@ class UniformReplayBuffer(ReplayBuffer):
                 parts.append(action_seq)
                 if post_pad:
                     parts.append(np.repeat(action_seq[-1:], post_pad, axis=0))
+                    if self._chunk_tail_starts:
+                        action_pad_mask[-post_pad:] = True  # repeated actions are not labels
                 action_seq = np.concatenate(parts, axis=0)
             else:
                 parts = []
@@ -1821,6 +1823,7 @@ class UniformReplayBuffer(ReplayBuffer):
                         n_eff_by_row[row] = j
                         break
 
+        tail_spans = np.full((batch_size,), seq_len, dtype=np.int64)
         if self._chunk_tail_starts:
             for row, (episode, idx, _) in enumerate(picks):
                 n_eff_by_row[row] = min(
@@ -1873,6 +1876,7 @@ class UniformReplayBuffer(ReplayBuffer):
                 span = max(ep_len - 1 - idx, 0)
                 action_out[row, :span] = episode[ACTION][idx : idx + span]
                 action_out[row, span:] = episode[ACTION][max(ep_len - 1, 0)]
+                tail_spans[row] = max(ep_len - idx, 0)  # real actions; the boundary row repeats a real one
             if self._include_next_action:
                 next_action_out = batch[ACTION_TP1]
                 next_action_start = idx + int(n_eff_by_row[row])
@@ -1994,6 +1998,8 @@ class UniformReplayBuffer(ReplayBuffer):
                 )
 
         batch[ACTION_PAD_MASK] = np.zeros((batch_size, seq_len), dtype=np.bool_)
+        if self._chunk_tail_starts:
+            batch[ACTION_PAD_MASK] = np.arange(seq_len)[None, :] >= tail_spans[:, None]
         batch[INDICES] = np.stack([pick[2] for pick in picks])
         batch[DISCOUNT] = np.stack(
             [self._gamma ** int(n) for n in n_eff_by_row]
