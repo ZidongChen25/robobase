@@ -442,6 +442,11 @@ class RobomimicRobosuiteEnv(gym.Env):
             use_camera_obs=pixels,
             render_gpu_device_id=render_gpu_device_id,
         )
+        # A hard reset rebuilds the MuJoCo model, and MuJoCo 3.1.5 never closes the
+        # ~50 OBJ mesh files it reads, so long online runs die with "Too many open
+        # files". A soft reset gives bit-identical observations, states and rewards
+        # for the same seed and actions (checked over 10 seeds x 60 steps).
+        kwargs.setdefault("hard_reset", False)
         if pixels:
             kwargs["camera_names"] = cameras
             kwargs["camera_heights"] = int(visual_observation_shape[0])
