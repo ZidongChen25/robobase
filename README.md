@@ -3,7 +3,7 @@
 This checkout is a JAX-only robot-learning stack. The installed
 `robobase` package does not import or install PyTorch. Historical Hydra files
 for removed methods may still be readable. The runtime factory supports BC,
-ACT, Diffusion, Flow Matching, PPO, SAC, CQN, CQN-AS, CQN-Flow, and
+ACT, Diffusion, Flow Matching, PPO, SAC, RLPD, CQN, CQN-AS, CQN-Flow, and
 Q-Chunking.
 
 Top Features of RoboBase:
@@ -96,6 +96,7 @@ not the current runtime.
 |--------|-----------|---------|----------------|
 | [ppo](robobase/cfgs/method/ppo.yaml) | [Proximal Policy Optimization](https://arxiv.org/abs/1707.06347) | On-policy clipped objective with GAE, timeout bootstrapping, value clipping, and KL stopping. | JAX implementation, experimental |
 | [sac](robobase/cfgs/method/sac.yaml) | [Soft Actor-Critic](https://arxiv.org/abs/1801.01290) | Squashed Gaussian actor, twin Q targets, and learned entropy temperature. | JAX implementation, experimental |
+| [rlpd](robobase/cfgs/method/rlpd.yaml) | [Efficient Online RL with Offline Data](https://arxiv.org/abs/2302.02948) | SAC with 50/50 online/offline batches, 10 LayerNorm critics with random min-subsets, UTD 20. | JAX, state-based; reproduces the paper's D4RL AntMaze-UMaze curve (10 seeds) |
 | [cqn](robobase/cfgs/method/cqn.yaml) | [Coarse-to-fine Q-Network](https://younggyo.me/cqn/) | Distributional continuous-control Q-network with multi-level action zoom-in. | JAX port of RoboBase CQN, experimental |
 | [cqn_as](robobase/cfgs/method/cqn_as.yaml) | [CQN with Action Sequence](https://younggyo.me/cqn-as/) | Factorized coarse-to-fine Q heads over action chunks with per-stream GRUs and one-step replanning. | JAX implementation, experimental |
 | [cqn_flow](robobase/cfgs/method/cqn_flow.yaml) | [CQN-AS](https://younggyo.me/cqn-as/) + value Flow Matching | Conditional categorical-logit or scalar value flow over every action bin, with CQN-AS chunk rollout. | JAX research implementation, experimental |
@@ -128,6 +129,18 @@ CQN-AS, CQN-Flow, and Q-Chunking use the standard replay path. PPO, SAC, and
 CQN require `action_sequence=1`; CQN-AS, CQN-Flow, and Q-Chunking require
 `action_sequence>=2` and `execution_length=1`. Q-Chunking executes one sampled
 chunk open loop and uses `replay.nstep=action_sequence`.
+
+RLPD runs through its own workspace (`train_rlpd.py`, `robobase/workspace_rlpd.py`):
+the offline dataset and online replay live on the GPU and every environment
+step is one fused XLA program (insert + 20 critic steps + actor/temperature),
+overlapped with the simulator; evaluation runs in background CPU workers.
+The original D4RL AntMaze needs the gym-era stack
+(`scripts/setup_legacy_d4rl_overlay.sh <overlay>`):
+
+```commandline
+source <overlay>/env.sh && python3 train_rlpd.py launch=rlpd_d4rl_antmaze seed=0
+bash scripts/run_rlpd_seeds.sh rlpd_d4rl_antmaze exp_local/rlpd/<name> "0 1 2 3" "0 1 2 3"
+```
 
 CQN-AS demo-driven launches are available for BiGym and RLBench. They preserve
 the sequence-Q tensor, replay, rollout, and objective contracts while adapting

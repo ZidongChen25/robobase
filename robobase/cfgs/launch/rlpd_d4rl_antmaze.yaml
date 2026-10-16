@@ -1,0 +1,77 @@
+# @package _global_
+
+# RLPD on the original D4RL AntMaze (gym 0.23 + mujoco-py 2.1 + d4rl), matching
+# the official README command:
+#   train_finetuning.py --env_name=antmaze-umaze-v2 --utd_ratio=20
+#     --start_training 5000 --max_steps 300000 --config=configs/rlpd_config.py
+#     --config.backup_entropy=False --config.hidden_dims="(256, 256, 256)"
+#     --config.num_min_qs=1
+# plus `rewards -= 1` for antmaze, applied to both halves at sample time.
+# The paper (App. B.1) scores AntMaze as the success rate over 100 trials;
+# the env terminates on success, so 100 * mean return is that rate.
+#
+# Needs gym==0.23.1, mujoco-py==2.1.2.14 (MuJoCo 2.1) and d4rl importable,
+# e.g. from an overlay directory on PYTHONPATH with LD_LIBRARY_PATH including
+# ~/.mujoco/mujoco210/bin:
+#   python train_rlpd.py launch=rlpd_d4rl_antmaze seed=0
+# Other mazes: env.task_name=antmaze-{umaze-diverse,medium-play,medium-diverse,
+# large-play,large-diverse}-v2 with env.episode_length=999.
+defaults:
+  - ../env: d4rl/antmaze
+  - ../method: rlpd
+
+env:
+  task_name: antmaze-umaze-v2
+  # RoboBase's gym-era D4RL convention: max_episode_steps - 1 (asserted).
+  episode_length: 699
+  eval_seed_start: 400
+
+seed: 0
+# RLPDWorkspace reads d4rl.qlearning_dataset directly (legacy_d4rl_rows), so
+# RoboBase's trajectory/demo conversion is skipped.
+demos: 0
+num_pretrain_steps: 0
+num_explore_steps: 5000
+num_train_frames: 300000
+replay_size_before_train: 5000
+eval_every_steps: 5000
+num_eval_episodes: 100
+num_train_envs: 1
+num_eval_envs: 1
+log_every: 1000
+save_csv: true
+save_snapshot: false
+log_eval_video: false
+
+pixels: false
+frame_stack: 1
+action_repeat: 1
+action_sequence: 1
+execution_length: 1
+temporal_ensemble: false
+use_min_max_normalization: false
+use_standardization: false
+norm_obs: false
+is_imitation_learning: false
+
+# RoboBase's episode replay is unused by RLPDWorkspace; keep it tiny.
+replay:
+  nstep: 1
+  size: 1000
+  num_workers: 0
+  include_tp1: true
+lazy_replay:
+  use: false
+wandb:
+  use: false
+
+method:
+  hidden_dims: [256, 256, 256]
+  num_min_qs: 1
+  backup_entropy: false
+  reward_bias: -1.0
+  eval_ref_scores: [0.0, 1.0]
+
+hydra:
+  run:
+    dir: ./exp_local/rlpd_d4rl/${env.task_name}_seed${seed}_${now:%Y%m%d%H%M%S}

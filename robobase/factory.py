@@ -49,6 +49,7 @@ def method_name_from_cfg(cfg: DictConfig) -> str:
         "robobase.method.q_chunking.QChunking": "q_chunking",
         "robobase.method.q_chunking_c2f.QChunkingC2F": "q_chunking_c2f",
         "robobase.method.sac.SAC": "sac",
+        "robobase.method.rlpd.RLPD": "rlpd",
         "robobase.method.alix.ALIX": "alix",
         "robobase.method.cqn_research.CQN": "cqn",
         "robobase.method.cqn_as_research.CQNAS": "cqn_as",
@@ -199,6 +200,17 @@ def create_agent(
             critic_grad_clip=spec.critic_grad_clip,
             weight_decay=spec.weight_decay,
             model=spec.model,
+            jit=jit,
+            platform=platform,
+            seed=int(cfg.seed),
+            **common_kwargs,
+        )
+
+    if method_name == "rlpd":
+        from robobase.method.rlpd import RLPD, rlpd_spec_from_cfg
+
+        return RLPD(
+            spec=rlpd_spec_from_cfg(cfg),
             jit=jit,
             platform=platform,
             seed=int(cfg.seed),

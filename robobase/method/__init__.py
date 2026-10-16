@@ -3,6 +3,10 @@ def __getattr__(name):
         from robobase.method.a2a import A2A
 
         return A2A
+    if name == "RLPD":
+        from robobase.method.rlpd import RLPD
+
+        return RLPD
     if name == "ACT":
         from robobase.method.act import ACT
 
@@ -106,4 +110,5 @@ __all__ = [
     "FlowMatching",
     "Legato",
     "QChunking",
+    "RLPD",
 ]

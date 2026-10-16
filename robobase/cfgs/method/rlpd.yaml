@@ -1,0 +1,37 @@
+# @package _global_
+
+# RLPD (Ball et al., ICML 2023). Defaults = official configs/rlpd_config.py
+# (SAC + 10 LayerNorm critics, min over a random pair, UTD 20, 128 online +
+# 128 offline per gradient step). Run with train_rlpd.py (RLPDWorkspace).
+method:
+  name: rlpd
+  _target_: robobase.method.rlpd.RLPD
+  is_rl: true
+  num_explore_steps: ${num_explore_steps}  # reference --start_training
+  actor_lr: 3e-4
+  critic_lr: 3e-4
+  temp_lr: 3e-4
+  discount: 0.99
+  tau: 0.005
+  hidden_dims: [256, 256]
+  num_qs: 10
+  num_min_qs: 2
+  critic_layer_norm: true
+  init_temperature: 1.0
+  target_entropy: null  # null -> -|A| / 2
+  backup_entropy: true
+  utd_ratio: 20
+  online_batch_size: 128
+  offline_batch_size: 128
+  reward_scale: 1.0
+  reward_bias: 0.0
+  log_std_min: -20.0
+  log_std_max: 2.0
+  offline_action_clip_eps: 1e-5
+  online_buffer_size: null  # null -> num_train_frames (reference capacity = max_steps)
+  # The utd critic steps run as one lax.scan; >1 unrolls it (slower compile).
+  scan_unroll: 1
+  # RLPDWorkspace options
+  overlap_env_step: true
+  eval_workers: 10
+  eval_ref_scores: null  # [min, max] -> logs a D4RL-style normalized_score
